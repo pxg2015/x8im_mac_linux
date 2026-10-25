@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-away-notice"
+description = "Enables the away_notice command without any pre-configured scope."
+commands.allow = ["away_notice"]
+
+[[permission]]
+identifier = "deny-away-notice"
+description = "Denies the away_notice command without any pre-configured scope."
+commands.deny = ["away_notice"]

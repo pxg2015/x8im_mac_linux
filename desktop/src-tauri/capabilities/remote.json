@@ -1,0 +1,59 @@
+{
+  "identifier": "remote-x8im",
+  "description": "允许 im.x8fde.com 页面调用 X8.IM 客户端本地命令",
+  "windows": [
+    "main",
+    "fde-float",
+    "fde-upd"
+  ],
+  "remote": {
+    "urls": [
+      "https://im.x8fde.com/*"
+    ]
+  },
+  "permissions": [
+    "core:default",
+    "core:window:allow-set-title",
+    "core:window:allow-is-decorated",
+    "core:window:allow-is-maximized",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-maximize",
+    "core:window:allow-unmaximize",
+    "core:window:allow-close",
+    "core:window:allow-start-dragging",
+    "core:window:allow-internal-toggle-maximize",
+    "core:window:allow-show",
+    "core:window:allow-unminimize",
+    "core:window:allow-set-focus",
+    "allow-get-rustdesk-id",
+    "allow-open-rustdesk",
+    "allow-close-rustdesk",
+    "allow-ensure-rustdesk",
+    "allow-assist-idle-reap",
+    "allow-install-rustdesk",
+    "allow-open-workbench",
+    "allow-open-in-browser",
+    "allow-download-file",
+    "allow-save-bytes",
+    "allow-screen-clip-grab",
+    "allow-reveal-file",
+    "allow-notify-unread",
+    "allow-away-notice",
+    "allow-detect-wechat",
+    "allow-win-is-focused",
+    "allow-win-auto-update",
+    "allow-win-patch-update",
+    "allow-fde-float-show",
+    "allow-fde-float-hide",
+    "allow-fde-float-click",
+    "allow-upd-float-show",
+    "allow-upd-float-hide",
+    "allow-drag-begin",
+    "updater:default",
+    "process:allow-restart",
+    "allow-ext-open-window",
+    "allow-ext-close-window",
+    "allow-ext-focus-window"
+  ]
+}

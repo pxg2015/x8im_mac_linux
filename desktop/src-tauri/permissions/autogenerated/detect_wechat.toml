@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-detect-wechat"
+description = "Enables the detect_wechat command without any pre-configured scope."
+commands.allow = ["detect_wechat"]
+
+[[permission]]
+identifier = "deny-detect-wechat"
+description = "Denies the detect_wechat command without any pre-configured scope."
+commands.deny = ["detect_wechat"]

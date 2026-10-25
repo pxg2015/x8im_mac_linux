@@ -1,0 +1,194 @@
+name: build-linux
+
+# X8.IM 桌面客户端 — Linux 构建（deb / rpm / AppImage，x86_64 + arm64 双架构）
+# 触发：手动（Actions 页面点 Run workflow）或推送 v* 标签
+# 产物：
+#   x86_64 → X8.IM-linux.deb / .rpm / .AppImage
+#   arm64  → X8.IM-linux-arm64.deb / .rpm / .AppImage   （飞腾 / 鲲鹏 / 麒麟 / UOS 国产化机器）
+# 说明：与 macOS 同策略，产物不由 CI 直传服务器，由本地下载后 scp 至 /opt/x8im/linux/
+# 架构走 GitHub 原生 arm64 runner（私有仓可用，2 vCPU），不做交叉编译
+#
+# 仓库结构约定：git 仓根 = im/，桌面端在 desktop/ 子目录。
+# ⚠️ run: 步骤靠 defaults.run.working-directory: desktop 切目录；
+#    uses: 步骤（upload-artifact 的 path）不受其影响，必须写 desktop/ 前缀。
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+concurrency:
+  group: build-linux-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: desktop
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            label: x86_64
+            suffix: ""
+          - runner: ubuntu-22.04-arm
+            label: aarch64
+            suffix: "-arm64"
+    env:
+      RUST_BACKTRACE: "1"
+      # 自建 RustDesk 服务器地址/公钥，由仓库 Settings→Secrets 注入（不写死在源码）。
+      # 未配置则远程协助不可用（不影响构建与其它功能）。
+      RD_SERVER: ${{ secrets.RD_SERVER }}
+      RD_SERVER_KEY: ${{ secrets.RD_SERVER_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Tauri Linux build deps
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            patchelf \
+            libfuse2 \
+            xdg-utils \
+            rpm \
+            build-essential \
+            curl \
+            wget \
+            file
+          echo "构建架构：$(uname -m)"
+
+      # 提前确认打包工具链在位。deb 走 dpkg-deb，rpm 走 rpmbuild —— 后者 ubuntu
+      # 镜像默认不装（需 apt 的 rpm 包），缺了要等 cargo 编译完才报，白等十分钟。
+      - name: Verify bundler toolchain
+        run: |
+          set -euo pipefail
+          MISSING=0
+          for cmd in dpkg-deb rpmbuild file patchelf; do
+            if command -v "$cmd" >/dev/null 2>&1; then
+              echo "  ✓ $cmd -> $(command -v "$cmd")"
+            else
+              echo "::error::$cmd 未安装（deb/rpm 打包需要）"
+              MISSING=1
+            fi
+          done
+          [ "$MISSING" = 0 ] || exit 1
+          if pkg-config --exists webkit2gtk-4.1; then
+            echo "  ✓ webkit2gtk-4.1 $(pkg-config --modversion webkit2gtk-4.1)"
+          else
+            echo "::error::pkg-config 找不到 webkit2gtk-4.1（libwebkit2gtk-4.1-dev 未装好）"
+            exit 1
+          fi
+          echo "工具链校验通过"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          # workspaces 相对仓库根，需带 desktop/ 前缀
+          workspaces: desktop/src-tauri
+          key: linux-${{ matrix.label }}
+
+      # 一次性把环境与必需文件打全并断言，失败点前移到「秒级可见」
+      - name: Preflight
+        run: |
+          set -euo pipefail
+          echo "== runner =="; uname -a
+          echo "== node =="; node -v; npm -v
+          echo "== rust =="; rustc -V; cargo -V
+          echo "== disk =="; df -h / | tail -1
+          for f in package.json package-lock.json \
+                   src-tauri/Cargo.toml src-tauri/build.rs \
+                   src-tauri/tauri.conf.json src-tauri/tauri.linux.conf.json \
+                   src-tauri/icons/128x128.png src-tauri/icons/icon.png \
+                   src-tauri/linux/x8im.desktop.hbs; do
+            if [ -f "$f" ]; then echo "  ✓ $f"; else echo "::error::缺少必需文件 $f"; exit 1; fi
+          done
+          echo "preflight ok"
+
+      - name: Install deps
+        run: npm ci
+
+      # 主窗口加载的是远端 https://im.x8fde.com/app/，本地 frontendDist 仅为满足
+      # Tauri 打包要求（路径必须存在），放一个占位页即可，不参与实际运行
+      - name: Prepare frontendDist placeholder
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          printf '%s\n' '<!doctype html><meta charset="utf-8"><title>X8.IM</title>' > dist/index.html
+
+      - name: Build deb + rpm
+        run: npx tauri build --bundles deb,rpm
+
+      # AppImage 依赖 linuxdeploy，非 x86_64 架构不一定有预编译包 → 尽力而为，失败不阻塞
+      - name: Build AppImage (best-effort)
+        continue-on-error: true
+        run: npx tauri build --bundles appimage
+
+      # 🩸 桌面入口门禁（2026-10-18 立）：1.5.21 及之前的 deb 里 `.desktop` 的
+      # `Categories=` 是空的（bundle.category 未配 → tauri-bundler 生成空值），
+      # GNOME / KDE / UOS / 麒麟 的启动器无法归类 → 用户装完在应用列表里找不到图标。
+      # 这里在出包前强制校验，禁止再发出「装了像没装」的包。
+      - name: Verify desktop entry + package metadata
+        run: |
+          set -euo pipefail
+          B=src-tauri/target/release/bundle
+          test -d "$B/deb" || { echo "::error::没有 deb 目录，Build deb + rpm 未产出安装包"; ls -la "$B" 2>/dev/null || true; exit 1; }
+          D=$(mktemp -d)
+          dpkg-deb -x "$B"/deb/*.deb "$D"
+          DESK=$(find "$D" -name '*.desktop' | head -1)
+          echo "=== $DESK ==="
+          cat "$DESK"
+          CAT=$(sed -n 's/^Categories=//p' "$DESK" | head -1)
+          [ -n "$CAT" ] || { echo "::error::.desktop 的 Categories 为空（启动器无法归类）"; exit 1; }
+          DESC=$(dpkg-deb -f "$B"/deb/*.deb Description | head -1)
+          echo "Description: $DESC"
+          [ -n "$DESC" ] || { echo "::error::deb Description 缺失"; exit 1; }
+          case "$DESC" in "(none)"*) echo "::error::deb Description 为 (none)"; exit 1;; esac
+          DEPS=$(dpkg-deb -f "$B"/deb/*.deb Depends)
+          echo "Depends: $DEPS"
+          DUP=$(printf '%s' "$DEPS" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | sort | uniq -d)
+          [ -z "$DUP" ] || { echo "::error::Depends 有重复项: $DUP"; exit 1; }
+          echo "metadata OK"
+
+      - name: Collect artifacts
+        run: |
+          set -euo pipefail
+          B=src-tauri/target/release/bundle
+          mkdir -p out
+          ls -lh "$B/deb" "$B/rpm" || true
+          cp "$B"/deb/*.deb "out/X8.IM-linux${{ matrix.suffix }}.deb"
+          cp "$B"/rpm/*.rpm "out/X8.IM-linux${{ matrix.suffix }}.rpm"
+          [ -f "$B"/appimage/*.AppImage ] && cp "$B"/appimage/*.AppImage "out/X8.IM-linux${{ matrix.suffix }}.AppImage" || echo "::warning::AppImage 未生成，跳过"
+          ls -lh out
+
+      # 失败时把关键现场打出来，省得再去翻几十兆日志
+      - name: Dump diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== bundle 目录 ==="; find src-tauri/target/release/bundle -maxdepth 2 2>/dev/null | head -30 || true
+          echo "=== 已安装包工具 ==="; command -v rpmbuild dpkg-deb patchelf file 2>/dev/null || true
+          echo "=== disk ==="; df -h / | tail -1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: x8im-linux-${{ matrix.label }}
+          # ⚠️ uses 步骤不受 defaults.run.working-directory 影响，路径相对仓库根
+          path: desktop/out/*
+          if-no-files-found: error
+
+      # 说明：产物不由 CI 直接回传服务器（避免把服务器密钥放进 GitHub）。
+      # 由本地下载 artifact 后再 scp 至 /opt/x8im/linux/。

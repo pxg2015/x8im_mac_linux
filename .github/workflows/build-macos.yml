@@ -1,0 +1,219 @@
+name: build-macos
+
+# X8.IM 桌面客户端 — macOS 构建（Apple Silicon + Intel 双架构）
+# 触发：手动（Actions 页面点 Run workflow）或推送 v* 标签
+# 产物：X8.IM-apple-silicon.dmg / X8.IM-intel.dmg（未签名，内部使用）
+#
+# 仓库结构约定：git 仓根 = im/，桌面端在 desktop/ 子目录。
+# GitHub Actions 只读取【仓库根】的 .github/workflows/，故本文件放在 im/.github/workflows/。
+#
+# ⚠️ 两个必须同时遵守的路径规则（踩过坑）：
+#   1) `run:` 步骤统一用 defaults.run.working-directory: desktop 切到桌面端目录；
+#   2) `uses:` 步骤（尤其 actions/upload-artifact 的 path）【不受】working-directory 影响，
+#      路径相对仓库根，必须显式带 desktop/ 前缀。
+#      早期写成 out/*.dmg 时，构建成功也会因「找不到产物」在最后一步报错。
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+concurrency:
+  group: build-macos-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: macos-14
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: desktop
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            label: apple-silicon
+            rustdesk: rustdesk-1.5.0-aarch64.dmg
+          - target: x86_64-apple-darwin
+            label: intel
+            rustdesk: rustdesk-1.5.0-x86_64.dmg
+    env:
+      RUST_BACKTRACE: "1"
+      # 自建 RustDesk 服务器地址/公钥，由仓库 Settings→Secrets 注入（不写死在源码）。
+      # 未配置则远程协助不可用（不影响构建与其它功能）。
+      RD_SERVER: ${{ secrets.RD_SERVER }}
+      RD_SERVER_KEY: ${{ secrets.RD_SERVER_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          # workspaces 相对仓库根，需带 desktop/ 前缀
+          workspaces: desktop/src-tauri
+          key: macos-${{ matrix.label }}
+
+      # 先把「环境是否就绪」一次性打出来并断言。任何一步缺失都在这里秒挂，
+      # 而不是等 Rust 编译十分钟后才报一句看不懂的错。
+      - name: Preflight
+        run: |
+          set -euo pipefail
+          echo "== runner =="; sw_vers; uname -m
+          echo "== node =="; node -v; npm -v
+          echo "== rust =="; rustc -V; cargo -V
+          echo "== installed targets =="; rustup target list --installed | tr '\n' ' '; echo
+          echo "== xcode =="; xcode-select -p
+          echo "== disk =="; df -h / | tail -1
+          for f in package.json package-lock.json \
+                   src-tauri/Cargo.toml src-tauri/build.rs \
+                   src-tauri/tauri.conf.json src-tauri/tauri.macos.conf.json \
+                   src-tauri/icons/icon.icns; do
+            if [ -f "$f" ]; then echo "  ✓ $f"; else echo "::error::缺少必需文件 $f"; exit 1; fi
+          done
+          echo "preflight ok"
+
+      # 内置 RustDesk（远程协助依赖）：从官方 release 取对应架构 dmg，
+      # 挂载后原样拷出 .app bundle（ditto 保留官方签名），供 bundle.resources 打包
+      - name: Fetch bundled RustDesk
+        run: |
+          set -euo pipefail
+          URL="https://github.com/rustdesk/rustdesk/releases/download/1.5.0/${{ matrix.rustdesk }}"
+          echo "下载 $URL"
+          # 记录 HTTP 状态，避免 404/限流被笼统报成「下载失败」
+          CODE=$(curl -sSL --retry 3 --retry-all-errors --retry-delay 2 \
+                   -o /tmp/rd.dmg -w '%{http_code}' "$URL")
+          echo "HTTP ${CODE}，大小 $(ls -lh /tmp/rd.dmg 2>/dev/null | awk '{print $5}')"
+          if [ "$CODE" != "200" ]; then
+            echo "::error::RustDesk dmg 下载失败（HTTP ${CODE}）。该 release 的资源名可能已变更，请核对："
+            curl -sSL "https://api.github.com/repos/rustdesk/rustdesk/releases/tags/1.5.0" \
+              | grep -o '"name": *"[^"]*\.dmg"' | head -20 || true
+            exit 1
+          fi
+          file /tmp/rd.dmg
+          MNT=$(mktemp -d)
+          hdiutil attach /tmp/rd.dmg -mountpoint "$MNT" -nobrowse -quiet
+          APP=$(find "$MNT" -maxdepth 1 -name "*.app" | head -1)
+          test -n "$APP" || { echo "::error::dmg 内未找到 .app"; ls -la "$MNT"; exit 1; }
+          mkdir -p src-tauri/bin/mac
+          ditto "$APP" src-tauri/bin/mac/RustDesk.app
+          hdiutil detach "$MNT" -quiet
+          echo "RustDesk 二进制："
+          ls -la src-tauri/bin/mac/RustDesk.app/Contents/MacOS/
+
+      - name: Install deps
+        run: npm ci
+
+      # 主窗口加载的是远端 https://im.x8fde.com/app/，本地 frontendDist 仅为满足
+      # Tauri 打包要求（路径必须存在），放一个占位页即可，不参与实际运行
+      - name: Prepare frontendDist placeholder
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          printf '%s\n' '<!doctype html><meta charset="utf-8"><title>X8.IM</title>' > dist/index.html
+
+      - name: Build dmg
+        run: npx tauri build --target ${{ matrix.target }}
+
+      # 🩸 根因修复（甘 2026-10-18 真机排查）：Tauri 把 bin/mac/RustDesk.app 作为
+      # bundle.resources 塞进 X8.IM.app 时，其内部复制会解引用符号链接、并丢弃
+      # RustDesk.app 自带的 _CodeSignature 目录，导致 19/19 框架丢失 Versions/Current、
+      # 根级二进制变实体 → Flutter 找不到 flutter_assets、启动 1s 即崩；同时因内嵌
+      # RustDesk 的签名被破坏，浏览器下载经 Gatekeeper 校验会弹「已损坏」。
+      # 构建初期的纯净副本（Fetch bundled RustDesk 用 ditto 取得，符号链接与 _CodeSignature
+      # 均完好）仍在，先 ditto 覆盖回磁盘上的 .app，再用 ditto 写入可读写镜像后转压缩
+      # 重打包 dmg（CI 产物未签名，mac-install.sh 会 xattr -rd 清除隔离标记绕过 Gatekeeper；
+      # 此步严禁用会解引用链接的方式拷贝，否则前功尽弃），从根上修好。
+      - name: Fix RustDesk.framework symlinks in bundle
+        run: |
+          set -euo pipefail
+          SRC=src-tauri/bin/mac/RustDesk.app
+          APP=src-tauri/target/${{ matrix.target }}/release/bundle/macos/X8.IM.app
+          DST="$APP/Contents/Resources/bin/mac/RustDesk.app"
+          DMGDIR=src-tauri/target/${{ matrix.target }}/release/bundle/dmg
+          test -d "$SRC" || { echo "::error::纯净 RustDesk 副本缺失（Fetch bundled RustDesk 步骤应已生成）"; exit 1; }
+          test -d "$APP" || {
+            echo "::error::未找到构建产物 $APP —— 说明 Build dmg 没真正产出 .app"
+            echo "--- target 目录现状 ---"
+            find src-tauri/target -maxdepth 4 -type d -name '*.app' 2>/dev/null | head -20 || true
+            ls -la src-tauri/target 2>/dev/null || true
+            exit 1
+          }
+          # 1) 修磁盘上的 .app（ditto 保留符号链接）
+          rm -rf "$DST"
+          /usr/bin/ditto "$SRC" "$DST"
+          # 2) 重打包 dmg：用 ditto 写入「可读写镜像」再转压缩，确保框架符号链接与
+          #    _CodeSignature 在重打包过程中不被丢弃（直接 hdiutil create -srcfolder
+          #    在某些 macOS 版本会解引用符号链接，绝不能走那条路）。
+          for DMG in "$DMGDIR"/*.dmg; do
+            [ -e "$DMG" ] || continue
+            # 直接从【已修好的磁盘 .app】重新生成 dmg（绝不从原 dmg 挂载再拷，
+            # 否则拷回来的还是坏件），ditto 保证框架符号链接与 _CodeSignature 一并保留。
+            TMP=$(mktemp -d)
+            RWDMG="$TMP/rw.dmg"
+            hdiutil create -volname "X8.IM" -fs APFS -size 1000m -ov "$RWDMG" >/dev/null
+            M2=$(mktemp -d)
+            hdiutil attach "$RWDMG" -mountpoint "$M2" -nobrowse -quiet
+            /usr/bin/ditto "$APP" "$M2/X8.IM.app"
+            hdiutil detach "$M2" -quiet
+            rm -f "$DMG"
+            hdiutil convert "$RWDMG" -format UDZO -o "$DMG" >/dev/null
+            rm -rf "$TMP"
+          done
+          # 3) 校验【磁盘 .app】与【重打包后的 dmg 内 .app】两处都必须保留符号链接，
+          #    任一处缺失即让 CI 失败，避免再次发出坏包（甘 2026-10-18 前车之鉴）。
+          BAD=0
+          check_links() {
+            local base="$1"
+            for FW in "$base/Contents/Frameworks"/*.framework; do
+              [ -d "$FW/Versions/A" ] || continue
+              [ -L "$FW/Versions/Current" ] || { echo "  仍缺 Current: $FW"; BAD=1; }
+            done
+          }
+          check_links "$DST"
+          for DMG in "$DMGDIR"/*.dmg; do
+            [ -e "$DMG" ] || continue
+            MNT=$(mktemp -d)
+            hdiutil attach "$DMG" -mountpoint "$MNT" -nobrowse -quiet
+            check_links "$MNT/X8.IM.app/Contents/Resources/bin/mac/RustDesk.app"
+            hdiutil detach "$MNT" -quiet
+            rm -rf "$MNT"
+          done
+          [ "$BAD" = 0 ] || { echo "::error::RustDesk 框架符号链接修复不完整（磁盘或 dmg 内仍缺失）"; exit 1; }
+          echo "RustDesk 框架符号链接已用 ditto 修复并校验（磁盘 + dmg 两处均保留 Versions/Current）:"
+          ls -la "$DST/Contents/Frameworks/FlutterMacOS.framework/Versions/"
+
+      - name: Collect artifacts
+        run: |
+          set -euo pipefail
+          B=src-tauri/target/${{ matrix.target }}/release/bundle
+          mkdir -p out
+          ls -lh "$B/dmg" || { echo "::error::没有 dmg 目录，构建未产出安装包"; exit 1; }
+          cp "$B"/dmg/*.dmg "out/X8.IM-${{ matrix.label }}.dmg"
+          ls -lh out
+
+      # 失败时把关键现场打出来，省得再去翻几十兆日志
+      - name: Dump diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== src-tauri/bin/mac ==="; ls -la src-tauri/bin/mac 2>/dev/null || true
+          echo "=== bundle 目录 ==="; find src-tauri/target -maxdepth 5 \( -name '*.app' -o -name '*.dmg' \) 2>/dev/null | head -20 || true
+          echo "=== 内嵌 RustDesk 框架 ==="; ls src-tauri/target/*/release/bundle/macos/X8.IM.app/Contents/Resources/bin/mac/RustDesk.app/Contents/Frameworks 2>/dev/null | head -5 || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: x8im-macos-${{ matrix.label }}
+          # ⚠️ uses 步骤不受 defaults.run.working-directory 影响，路径相对仓库根
+          path: desktop/out/*.dmg
+          if-no-files-found: error
+
+      # 说明：产物不由 CI 直接回传服务器（避免把服务器密钥放进 GitHub）。
+      # 由本地用 API 下载 artifact 后再 scp 至 /opt/x8im/mac/。

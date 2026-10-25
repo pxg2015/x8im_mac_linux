@@ -1,0 +1,47 @@
+{
+  "productName": "X8.IM",
+  "version": "1.5.53",
+  "identifier": "com.x8fde.im",
+  "build": {
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "X8.IM v1.5.53",
+        "width": 1180,
+        "height": 800,
+        "minWidth": 800,
+        "minHeight": 600,
+        "decorations": false,
+        "url": "https://im.x8fde.com/app/?v=1.5.53"
+      }
+    ],
+    "security": { "csp": null }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": ["icons/icon.ico"],
+    "category": "SocialNetworking",
+    "shortDescription": "X8.IM 企业即时通讯与协同办公客户端",
+    "longDescription": "X8.IM 是面向企业的一体化协同客户端，提供即时通讯、群组协作、远程协助与工作台能力。",
+    "resources": ["bin/X8Assist/**/*", "post-update.cmd"],
+    "createUpdaterArtifacts": true,
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine",
+        "installerHooks": "installer.nsh",
+        "languages": ["SimpChinese"]
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDAwNjcwRUE2MkE5QTYxNTEKUldSUllab3FwZzVuQU1SOHhtaGR0SmdTWDRCb0dVcmpyVlBEbTBEMmd2Q292bkFvdjl0SmpUbzgK",
+      "endpoints": ["https://im.x8fde.com/app/latest.json"],
+      "windows": { "installMode": "quiet" }
+    }
+  }
+}

@@ -1,0 +1,55 @@
+[package]
+name = "x8im"
+version = "1.0.0"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+# schemars(经 tauri-build→tauri-utils 引入) 依赖 indexmap 1.x 的默认 S 泛型参数，
+# resolver v2 下 build-deps 的 feature 独立解析，必须在此单独启用 std
+indexmap = { version = "1.9", features = ["std"] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+# EnsureOut 返回值序列化（tauri command 返回结构体必需）
+serde = { version = "1", features = ["derive"] }
+# 单实例锁：同一台机器只允许一个 X8.IM 实例（第二次启动聚焦已有窗口后退出）
+tauri-plugin-single-instance = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+# 2026-10-23：聊天文件下载弃用系统 curl（部分 Windows 机器上
+# `curl: (6) getaddrinfo() thread failed to start` → 域名解析失败，且控制台程序带黑窗），
+# 改为进程内 blocking HTTP。reqwest 本就是 tauri 的传递依赖，这里显式声明 + 开 blocking。
+reqwest = { version = "0.13", features = ["blocking"] }
+# 2026-10-24 稳定性：给自动升级下载加超时看门狗（tokio::time::timeout），
+# 断流卡死时判失败而不是永久挂起（前端小窗会一直停在「正在升级」）。
+# tokio 本就是 tauri/reqwest 的传递依赖，显式声明 + 开 time 特性即可，版本自动统一到 tauri 所用那版。
+tokio = { version = "1", features = ["time"] }
+# generate_context! 宏（plugins 配置）生成代码直接引用 serde_json
+serde_json = "1"
+# 组件式静默升级：验签 portable zip（与 tauri 同一把 minisign 密钥）
+minisign-verify = "0.2"
+# 修复 indexmap 未启用 std feature 导致 IndexMap 缺省泛型参数丢失（schemars 编译失败）
+indexmap = { version = "1.9", features = ["std"] }
+# 2026-10-23 托盘亮色图标：编译期内嵌 icons/tray.png，需解码 PNG→RGBA 供 Image::new_owned。
+# 只开 png feature，避免把 jpeg/webp 等解码器全拉进来。
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# 2026-10-16 老8 诉求：X8Assist 主窗口（你的桌面/控制远程桌面）不要盖在 X8.IM 上。
+# 方案 = 启动后 EnumWindows 找 X8Assist 的可见窗口 ShowWindow(SW_HIDE)。
+# 2026-10-19 追加：Win32_UI_Shell —— 托盘气泡提示（Shell_NotifyIconW + NIF_INFO）。
+[target.'cfg(windows)'.dependencies]
+# 2026-10-24 追加 Win32_UI_Input_KeyboardAndMouse：标题栏原生拖动（drag_begin 用
+# GetAsyncKeyState 判左键是否仍按下），根治 RDP/虚拟机下系统移动循环抢不到按下状态。
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_System_Threading", "Win32_Security", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Ole", "Win32_Graphics_Dwm", "Win32_UI_Input_KeyboardAndMouse"] }
+
+# ── 2026-10-23 体积优化（安装包瘦身 50MB → 约 31MB）──
+# 实测：未加本段时 x8im.exe = 38.7MB（release 默认 opt-level=3 + lto=false + strip=false）。
+# opt-level="z" 体积优先；lto 跨 crate 内联+死代码消除；codegen-units=1 让 LTO 吃满；
+# strip 去掉符号表（Rust release 默认保留，是 38.7MB 的主要来源之一）。
+# ⚠️ 刻意不设 panic="abort"：只省不到 1MB，但会让崩溃时丢失栈展开，排障变盲。
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true

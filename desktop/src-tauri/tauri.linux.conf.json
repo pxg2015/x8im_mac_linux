@@ -1,0 +1,33 @@
+{
+  "app": {
+    "windows": [
+      {
+        "title": "X8.IM v1.5.46",
+        "width": 1180,
+        "height": 800,
+        "minWidth": 800,
+        "minHeight": 600,
+        "decorations": true,
+        "url": "https://im.x8fde.com/app/?v=1.5.48"
+      }
+    ]
+  },
+  "bundle": {
+    "targets": ["deb", "rpm", "appimage"],
+    "icon": ["icons/128x128.png", "icons/icon.png"],
+    "resources": [],
+    "createUpdaterArtifacts": false,
+    "linux": {
+      "deb": {
+        "depends": ["wmctrl"],
+        "section": "net",
+        "desktopTemplate": "linux/x8im.desktop.hbs"
+      },
+      "rpm": {
+        "depends": ["wmctrl"],
+        "epoch": 0,
+        "desktopTemplate": "linux/x8im.desktop.hbs"
+      }
+    }
+  }
+}

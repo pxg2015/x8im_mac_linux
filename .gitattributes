@@ -1,0 +1,8 @@
+# 统一以 LF 存储文本文件，避免 Windows CRLF 在 *nix CI 上引发问题
+* text=auto eol=lf
+
+# 二进制资源，禁止行尾归一化
+*.png binary
+*.icns binary
+*.ico binary
+*.o binary

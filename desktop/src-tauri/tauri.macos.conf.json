@@ -1,0 +1,24 @@
+{
+  "app": {
+    "windows": [
+      {
+        "title": "X8.IM v1.5.46",
+        "width": 1180,
+        "height": 800,
+        "minWidth": 800,
+        "minHeight": 600,
+        "decorations": true,
+        "url": "https://im.x8fde.com/app/?v=1.5.48"
+      }
+    ]
+  },
+  "bundle": {
+    "targets": ["app", "dmg"],
+    "icon": ["icons/icon.icns"],
+    "resources": ["bin/mac/RustDesk.app"],
+    "createUpdaterArtifacts": false,
+    "macOS": {
+      "minimumSystemVersion": "10.15"
+    }
+  }
+}

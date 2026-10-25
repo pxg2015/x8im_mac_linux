@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-close-rustdesk"
+description = "Enables the close_rustdesk command without any pre-configured scope."
+commands.allow = ["close_rustdesk"]
+
+[[permission]]
+identifier = "deny-close-rustdesk"
+description = "Denies the close_rustdesk command without any pre-configured scope."
+commands.deny = ["close_rustdesk"]

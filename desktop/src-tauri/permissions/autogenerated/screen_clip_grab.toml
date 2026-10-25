@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-screen-clip-grab"
+description = "Enables the screen_clip_grab command without any pre-configured scope."
+commands.allow = ["screen_clip_grab"]
+
+[[permission]]
+identifier = "deny-screen-clip-grab"
+description = "Denies the screen_clip_grab command without any pre-configured scope."
+commands.deny = ["screen_clip_grab"]

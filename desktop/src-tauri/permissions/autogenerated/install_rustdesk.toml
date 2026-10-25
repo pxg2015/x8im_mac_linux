@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-install-rustdesk"
+description = "Enables the install_rustdesk command without any pre-configured scope."
+commands.allow = ["install_rustdesk"]
+
+[[permission]]
+identifier = "deny-install-rustdesk"
+description = "Denies the install_rustdesk command without any pre-configured scope."
+commands.deny = ["install_rustdesk"]

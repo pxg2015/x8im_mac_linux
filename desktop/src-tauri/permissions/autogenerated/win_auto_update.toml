@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-win-auto-update"
+description = "Enables the win_auto_update command without any pre-configured scope."
+commands.allow = ["win_auto_update"]
+
+[[permission]]
+identifier = "deny-win-auto-update"
+description = "Denies the win_auto_update command without any pre-configured scope."
+commands.deny = ["win_auto_update"]

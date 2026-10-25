@@ -1,0 +1,59 @@
+# ===== X8.IM 桌面端 · macOS / Linux 开源构建仓 =====
+# 本仓只含「未签名」构建所需的源码与 CI 配置。
+# 私钥 / 密码 / 服务器凭据 / 用户数据 一律不入库（见下方 🔒 强忽略规则）。
+
+# --- 依赖 / 构建产物 / 产物 ---
+node_modules/
+dist/
+desktop/dist/
+desktop/node_modules/
+desktop/src-tauri/target/
+desktop/src-tauri/target2/
+desktop/src-tauri/gen/
+desktop/out/
+out/
+
+# --- 安装包 / 打包产物（CI 运行时生成，不入库）---
+*.dmg
+*.deb
+*.rpm
+*.AppImage
+*.exe
+*.msi
+*.nsi
+
+# 🔒 私钥 / 密码 / 凭据：永不入库（即使误放入也会被忽略）
+keys/
+desktop/keys/
+*.key
+*.pem
+*.pfx
+*.p12
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+*.p8
+.env
+.env.*
+*.env
+secrets*
+# X8.IM Tauri 更新签名私钥（历史曾误提交，强制屏蔽）
+x8im.key
+x8im.key.pub
+
+# --- 图标生成 / 校验临时产物 ---
+desktop/src-tauri/icons/_bak_*/
+desktop/src-tauri/icons/_verify_*.png
+desktop/src-tauri/icons/_iconset_final.png
+
+# --- 系统 / 编辑器 / 临时 ---
+.DS_Store
+Thumbs.db
+*.log
+__pycache__/
+*.py[cod]
+*.bak
+*.bak_*
+*.crswap
+*.swp
