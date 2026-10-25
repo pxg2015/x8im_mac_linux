@@ -78,6 +78,12 @@ fn main() {
             "upd_float_hide",
             // 2026-10-24 标题栏原生拖动（RDP/虚拟机下 startDragging 的 IPC 延迟兜底）
             "drag_begin",
+            // 2026-10-25 标题栏窗控（min/max/close/is_maximized）：绕开运行时不可用的
+            // window.__TAURI__.window 命名空间，改走服务端命令 + core.invoke 通道
+            "win_minimize",
+            "win_toggle_maximize",
+            "win_close",
+            "win_is_maximized",
             // 2026-10-22 「打开着的会话最小化也不闪」：当前会话来消息时窗口已失焦也要闪托盘+弹气泡
             "away_notice",
         ]),
