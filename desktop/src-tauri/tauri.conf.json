@@ -1,6 +1,6 @@
 {
   "productName": "X8.IM",
-  "version": "1.5.56",
+  "version": "1.5.57",
   "identifier": "com.x8fde.im",
   "build": {
     "frontendDist": "../dist"
@@ -9,13 +9,14 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "X8.IM v1.5.56",
+        "title": "X8.IM v1.5.57",
         "width": 1180,
         "height": 800,
         "minWidth": 800,
         "minHeight": 600,
-        "decorations": false,
-        "url": "https://im.x8fde.com/app/?v=1.5.56"
+        "decorations": true,
+        "theme": "Dark",
+        "url": "https://im.x8fde.com/app/?v=1.5.57"
       }
     ],
     "security": { "csp": null }
