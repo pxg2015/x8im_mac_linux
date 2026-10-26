@@ -205,7 +205,7 @@ jobs:
           EXPECT_VER=$(python3 -c "import json;print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
           GOT_VER=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")
           [ "$GOT_VER" = "$EXPECT_VER" ] || {
-            echo "::error::版本不一致 —— 包内=$GOT_VER，tauri.conf.json=$EXPECT_VER"
+            echo "::error::版本不一致 —— 包内=${GOT_VER}，tauri.conf.json=${EXPECT_VER}"
             exit 1
           }
           echo "  ✓ 版本：$GOT_VER"
@@ -236,7 +236,7 @@ jobs:
                 echo "::error::dmg 内缺 $K"; hdiutil detach "$MNT" -quiet; exit 1
               }
             done
-            echo "  ✓ dmg 内 Info.plist 齐全（$(basename "$DMG")，版本 $DV）"
+            echo "  ✓ dmg 内 Info.plist 齐全（$(basename "$DMG")，版本 ${DV}）"
             hdiutil detach "$MNT" -quiet
             rm -rf "$MNT"
           done
