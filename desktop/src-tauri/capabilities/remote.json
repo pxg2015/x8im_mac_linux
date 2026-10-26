@@ -32,6 +32,7 @@
     "allow-ensure-rustdesk",
     "allow-assist-idle-reap",
     "allow-install-rustdesk",
+    "allow-linux-self-update",
     "allow-open-workbench",
     "allow-open-in-browser",
     "allow-download-file",

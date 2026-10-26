@@ -1565,6 +1565,92 @@ fn linux_install_rustdesk() -> Result<String, String> {
     Ok("installed".into())
 }
 
+// 2026-10-26 Linux 应用内升级（1.6.39）：复用 install_rustdesk 已实证的 pkexec 模式，
+// 把「下载安装包 + 手动双击」收敛成一次点击。Windows/mac 不走这条（恒返回错误由前端忽略）。
+//
+// 约束与踩坑预防：
+//   · 只对包管理器安装生效：AppImage 跑在临时挂载点，装包覆盖不到它 → 直接报错让用户下 AppImage
+//   · 包名／架构口径与七牛对象名一致（x8im_dl.php 已放行），走中转不用直链
+//   · 全流程是阻塞调用（curl + pkexec），必须 spawn_blocking，否则整窗未响应（AppHang 老账）
+#[tauri::command]
+async fn linux_self_update(app: tauri::AppHandle) -> Result<String, String> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = app;
+        Err("应用内升级仅在 Linux 版支持".to_string())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = app;
+        // spawn_blocking 的 JoinHandle 输出就是闭包返回值（tauri::async_runtime 包装 tokio），
+        // 故直接 await 拿 Result<String,String>，不要再 map_err 成 JoinError（与 ensure_rustdesk 同款）。
+        tauri::async_runtime::spawn_blocking(linux_self_update_blocking).await
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_self_update_blocking() -> Result<String, String> {
+    // AppImage：程序本体在 /tmp/.mount_xxx 里，装 deb/rpm 覆盖不到，也不该在运行中替换
+    if std::env::var("APPIMAGE").is_ok() {
+        return Err("当前是 AppImage 版，请下载新的 AppImage 替换即可".to_string());
+    }
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "",
+        "aarch64" => "-arm64",
+        other => return Err(format!("暂不支持的 CPU 架构：{other}")),
+    };
+    let fam = linux_pkg_family()
+        .ok_or_else(|| "未能识别当前 Linux 发行版，请到下载页手动下载安装".to_string())?;
+    let file = format!("BangXin-linux{arch}.{fam}");
+    let url = format!("https://im.x8fde.com/x8/x8im_dl.php?f={file}");
+    let dest = format!("/tmp/{file}");
+    let _ = std::fs::remove_file(&dest);
+    linux_download(&url, &dest)?;
+    if !std::path::Path::new(&dest).is_file() {
+        return Err("安装包下载失败（文件未落盘），请重试".to_string());
+    }
+    let log = "/tmp/x8im-self-update.log";
+    let inst = if fam == "deb" {
+        format!("DEBIAN_FRONTEND=noninteractive apt-get install -y '{dest}'")
+    } else {
+        // rpm 系：dnf 失败（老系统）再兜 rpm -Uvh --replacepkgs
+        format!("(dnf install -y '{dest}' || yum install -y '{dest}' || rpm -Uvh --replacepkgs '{dest}')")
+    };
+    let script = format!("{inst} >{log} 2>&1");
+    let out = Command::new("pkexec")
+        .args(["sh", "-c", script.as_str()])
+        .output()
+        .map_err(|e| format!("提权执行失败（缺 pkexec？）: {e}"))?;
+    let _ = std::fs::remove_file(&dest);
+    if !out.status.success() {
+        let tail: String = std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .rev()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(" / ");
+        return Err(format!("安装未完成（可能取消了系统授权）：{tail}"));
+    }
+    // 装完自动重启：新二进制已落盘，先脱离当前进程再拉起（setsid 断开父子关系，避免一起被回收）
+    let exe = if std::path::Path::new("/usr/bin/x8im").exists() {
+        "/usr/bin/x8im".to_string()
+    } else {
+        std::env::current_exe()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "x8im".to_string())
+    };
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let _ = Command::new("sh")
+            .args(["-c", &format!("sleep 1; setsid '{exe}' >/dev/null 2>&1 &")])
+            .spawn();
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    // 前端此时不会收到返回值（进程已退出重启）；成功路径靠「界面重开且版本号变了」验收。
+    std::process::exit(0);
+}
+
 #[derive(serde::Serialize)]
 struct EnsureOut {
     id: String,
@@ -4578,6 +4664,8 @@ fn main() {
             ensure_rustdesk,
             // 2026-10-17：Linux 缺远程协助组件时一键安装（Windows/mac 恒返回 already）
             install_rustdesk,
+            // 2026-10-26 Linux 应用内升级（下载本架构 deb/rpm → pkexec 安装 → 自动重启）
+            linux_self_update,
             open_workbench,
             // 扩展面板（2026-10-24）：小程序独立内嵌窗口单例 ext-<appId>
             ext_open_window,

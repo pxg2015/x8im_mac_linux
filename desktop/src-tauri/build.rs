@@ -61,6 +61,8 @@ fn main() {
             // 2026-10-17 三端对齐：Linux 版不内置 RustDesk，缺组件时一键安装
             // （Windows/mac 包内自带，命令恒返回 already，只为统一前端调用路径）
             "install_rustdesk",
+            // 2026-10-26 Linux 应用内升级（同款 pkexec 链路；Windows/mac 恒返回错误）
+            "linux_self_update",
             // 2026-10-17 微信快捷登录：检测本机微信是否在线，前端据此切换「PC 微信确认 / 手机扫码」文案
             "detect_wechat",
             // 2026-10-23 已读回执授权：OS 级窗口焦点，与 notify_unread 同源
