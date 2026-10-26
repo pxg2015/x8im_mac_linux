@@ -56,19 +56,8 @@ mod updater {
 fn rustdesk_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     #[cfg(target_os = "linux")]
     {
-        let _ = app; // Linux 走系统 PATH，不读 resource_dir
-        if let Ok(path) = std::env::var("PATH") {
-            for dir in path.split(':') {
-                if dir.is_empty() {
-                    continue;
-                }
-                let p = std::path::Path::new(dir).join("rustdesk");
-                if p.is_file() {
-                    return Some(p);
-                }
-            }
-        }
-        return None;
+        let _ = app; // Linux 走系统安装（PATH + 常见位置），不读 resource_dir
+        return linux_rustdesk_find();
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -1410,18 +1399,43 @@ async fn install_rustdesk() -> Result<String, String> {
     .map_err(|e| format!("远程协助组件安装线程异常：{e}"))?
 }
 
-/// Linux：PATH 里是否已有可执行的 rustdesk（与 rustdesk_path() 同判据）。
-/// 注意这是实时扫目录、不是进程启动时的缓存，所以刚装完立刻调用也能发现。
+/// Linux：定位系统安装的 rustdesk 可执行文件（rustdesk_path / 安装后校验共用同一判据）。
+/// 实时扫目录、不是启动时缓存，所以刚装完立刻调用也能发现。
+/// 🩸 2026-10-26：原来只扫 PATH。实测（老8 那台 rpm 系机器）包其实已经装上、
+/// dnf 输出「已完成 / 无需任何处理」，但 GUI 会话的 PATH 里没有 /usr/bin，
+/// 判据直接判死 → 报「安装后仍未找到 rustdesk」。改为 PATH 优先 + 常见安装位置兜底。
 #[cfg(target_os = "linux")]
-fn linux_rustdesk_in_path() -> bool {
+fn linux_rustdesk_find() -> Option<std::path::PathBuf> {
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
     if let Ok(path) = std::env::var("PATH") {
         for dir in path.split(':') {
-            if !dir.is_empty() && std::path::Path::new(dir).join("rustdesk").is_file() {
-                return true;
+            if !dir.is_empty() {
+                dirs.push(std::path::PathBuf::from(dir));
             }
         }
     }
-    false
+    // 兜底目录：桌面会话启动的进程 PATH 常缺 /usr/sbin、/opt 之类
+    for d in [
+        "/usr/bin",
+        "/usr/local/bin",
+        "/bin",
+        "/opt/rustdesk",
+        "/usr/lib/rustdesk",
+    ] {
+        dirs.push(std::path::PathBuf::from(d));
+    }
+    for dir in dirs {
+        let p = dir.join("rustdesk");
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn linux_rustdesk_in_path() -> bool {
+    linux_rustdesk_find().is_some()
 }
 
 /// Linux：判定包管理器家族（deb / rpm）。
@@ -1560,7 +1574,16 @@ fn linux_install_rustdesk() -> Result<String, String> {
         // apt 报错但退出码为 0 的极少见；附日志尾部便于排查
         let log = std::fs::read_to_string("/tmp/x8im-rd-install.log").unwrap_or_default();
         let tail: String = log.lines().rev().take(3).collect::<Vec<_>>().join(" / ");
-        return Err(format!("安装后仍未找到 rustdesk，请重试或手动安装（{tail}）"));
+        // 附上诊断信息：PATH 与固定位置探测结果，下次不用再让用户手工跑 which
+        let path_env = std::env::var("PATH").unwrap_or_else(|_| "-".into());
+        let hits: Vec<&str> = ["/usr/bin/rustdesk", "/usr/local/bin/rustdesk", "/usr/lib/rustdesk/rustdesk"]
+            .into_iter()
+            .filter(|p| std::path::Path::new(*p).exists())
+            .collect();
+        let hit_txt = if hits.is_empty() { "无".to_string() } else { hits.join(",") };
+        return Err(format!(
+            "安装后仍未找到 rustdesk（PATH={path_env}；固定位置={hit_txt}）（{tail}）"
+        ));
     }
     Ok("installed".into())
 }
