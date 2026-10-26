@@ -25,6 +25,29 @@ mod updater;
 #[cfg(windows)]
 mod upd_ui;
 
+// 非 Windows：mac/linux 的升级走「下载新包手动装 / 系统包管理器」，
+// 不参与这套 Windows 自主升级状态机（它依赖 schtasks / NSIS / Win32 原生窗）。
+// 这里提供**同名同签名**的空实现，让 generate_handler! 的命令表三端完全一致
+// （前端不必按平台分支改调用），调用即返回 disabled。
+#[cfg(not(windows))]
+mod updater {
+    use tauri::AppHandle;
+
+    pub fn legacy_forward(_app: &AppHandle, _tag: &str) -> Result<String, String> {
+        Ok("updater: not supported on this platform".into())
+    }
+
+    pub fn spawn_scheduler(_app: AppHandle) {}
+
+    #[tauri::command]
+    pub fn win_upd_start(_app: AppHandle) -> Result<String, String> {
+        Ok("updater: not supported on this platform".into())
+    }
+
+    #[tauri::command]
+    pub fn win_upd_snooze(_hours: Option<u32>) {}
+}
+
 /// 内置 RustDesk 路径（bundle.resources 捆绑，安装后随包分发）
 /// - Windows: `bin/rustdesk.exe`（便携单文件）
 /// - macOS:   `bin/mac/RustDesk.app/Contents/MacOS/rustdesk`（官方 dmg 内的 app bundle，保留签名）
