@@ -191,6 +191,56 @@ jobs:
           echo "RustDesk 框架符号链接已用 ditto 修复并校验（磁盘 + dmg 两处均保留 Versions/Current）:"
           ls -la "$DST/Contents/Frameworks/FlutterMacOS.framework/Versions/"
 
+      # 🩸 没有 mac 真机可测 → 用 CI 兜住「声明没进包 / 版本号不一致」这类静默故障。
+      # 2026-10-26：Info.plist 的三条隐私用途声明是会议（麦克风/摄像头）与远程协助藏窗
+      # （osascript → System Events 的 AppleEvent）的硬前提，缺了 macOS 不是弹框拒绝，
+      # 而是 TCC 直接终止进程。此处逐条断言，缺失即让构建失败，避免又发一个"看着装好、
+      # 一开会议就崩"的包。
+      - name: Assert Info.plist & version in bundle
+        run: |
+          set -euo pipefail
+          APP=src-tauri/target/${{ matrix.target }}/release/bundle/macos/BangXin.app
+          PLIST="$APP/Contents/Info.plist"
+          test -f "$PLIST" || { echo "::error::bundle 内找不到 Info.plist"; exit 1; }
+          EXPECT_VER=$(python3 -c "import json;print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
+          GOT_VER=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")
+          [ "$GOT_VER" = "$EXPECT_VER" ] || {
+            echo "::error::版本不一致 —— 包内=$GOT_VER，tauri.conf.json=$EXPECT_VER"
+            exit 1
+          }
+          echo "  ✓ 版本：$GOT_VER"
+          BAD=0
+          for K in NSMicrophoneUsageDescription NSCameraUsageDescription NSAppleEventsUsageDescription; do
+            V=$(/usr/libexec/PlistBuddy -c "Print :$K" "$PLIST" 2>/dev/null || true)
+            if [ -n "$V" ]; then echo "  ✓ $K = $V"; else echo "  ✗ 缺 $K"; BAD=1; fi
+          done
+          [ "$BAD" = 0 ] || {
+            echo "::error::Info.plist 隐私用途声明缺失 —— 会议/藏窗会在 macOS 上被 TCC 终止进程"
+            exit 1
+          }
+          BIN=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$PLIST")
+          EXE="$APP/Contents/MacOS/$BIN"
+          test -x "$EXE" || { echo "::error::CFBundleExecutable 缺失或不可执行：$EXE"; exit 1; }
+          echo "  ✓ 主程序可执行：$EXE ($(/usr/bin/du -h "$EXE" | cut -f1))"
+          # dmg 内是用户真正拿到的那份，再对 dmg 验一次（挂载只读，不改内容）
+          for DMG in src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg; do
+            [ -e "$DMG" ] || continue
+            MNT=$(mktemp -d)
+            hdiutil attach "$DMG" -mountpoint "$MNT" -nobrowse -quiet
+            DPLIST="$MNT/BangXin.app/Contents/Info.plist"
+            test -f "$DPLIST" || { echo "::error::dmg 内找不到 Info.plist"; hdiutil detach "$MNT" -quiet; exit 1; }
+            DV=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$DPLIST")
+            [ "$DV" = "$EXPECT_VER" ] || { echo "::error::dmg 内版本不一致：$DV != $EXPECT_VER"; hdiutil detach "$MNT" -quiet; exit 1; }
+            for K in NSMicrophoneUsageDescription NSCameraUsageDescription NSAppleEventsUsageDescription; do
+              /usr/libexec/PlistBuddy -c "Print :$K" "$DPLIST" >/dev/null 2>&1 || {
+                echo "::error::dmg 内缺 $K"; hdiutil detach "$MNT" -quiet; exit 1
+              }
+            done
+            echo "  ✓ dmg 内 Info.plist 齐全（$(basename "$DMG")，版本 $DV）"
+            hdiutil detach "$MNT" -quiet
+            rm -rf "$MNT"
+          done
+
       - name: Collect artifacts
         run: |
           set -euo pipefail
