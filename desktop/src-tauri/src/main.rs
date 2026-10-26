@@ -1636,6 +1636,13 @@ fn linux_self_update_blocking() -> Result<String, String> {
         return Err(format!("安装未完成（可能取消了系统授权）：{tail}"));
     }
     // 装完自动重启：新二进制已落盘，先脱离当前进程再拉起（setsid 断开父子关系，避免一起被回收）
+    //
+    // 2026-10-26 二改（老8 反馈「装完要能自动跑起新版」）：上一版用 600ms 后 spawn 一个
+    // `sh -c "sleep 1; setsid ..."` 再 exit(0)，实测有时新进程不出现，排查下来是三个软点：
+    //   ① apt/dpkg 装完还要刷 desktop 数据库，1 秒不够 → 延到 3 秒；
+    //   ② 只用 setsid，若极简系统缺 util-linux 就整条命令失败且无声 → 加 nohup 直接起做兜底；
+    //   ③ 无日志，出了问题无从判断 → 统一追加到 /tmp/x8im-restart.log（含时间戳与退出码）。
+    // 另外把子进程三件套都指向 null，父进程退出时不会因为管道断开而连坐。
     let exe = if std::path::Path::new("/usr/bin/x8im").exists() {
         "/usr/bin/x8im".to_string()
     } else {
@@ -1643,13 +1650,24 @@ fn linux_self_update_blocking() -> Result<String, String> {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| "x8im".to_string())
     };
+    let rlog = "/tmp/x8im-restart.log";
+    let script = format!(
+        "echo \"[restart] $(date '+%F %T') exe={exe} disp=$DISPLAY wayl=$WAYLAND_DISPLAY\" >>{rlog}; \
+         ( setsid '{exe}' >>{rlog} 2>&1 </dev/null & ) \
+         || ( nohup '{exe}' >>{rlog} 2>&1 </dev/null & ) ; \
+         echo \"[restart] launched rc=$?\" >>{rlog}"
+    );
     std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(600));
+        std::thread::sleep(std::time::Duration::from_millis(300));
         let _ = Command::new("sh")
-            .args(["-c", &format!("sleep 1; setsid '{exe}' >/dev/null 2>&1 &")])
+            .arg("-c")
+            .arg(format!("sleep 3; {script}"))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn();
     });
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    std::thread::sleep(std::time::Duration::from_millis(500));
     // 前端此时不会收到返回值（进程已退出重启）；成功路径靠「界面重开且版本号变了」验收。
     std::process::exit(0);
 }

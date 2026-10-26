@@ -1,6 +1,6 @@
 {
   "productName": "BangXin",
-  "version": "1.6.40",
+  "version": "1.6.41",
   "identifier": "com.x8fde.im",
   "build": {
     "frontendDist": "../dist"
@@ -16,7 +16,7 @@
         "minHeight": 600,
         "decorations": true,
         "theme": "Dark",
-        "url": "https://im.x8fde.com/app/?v=1.6.40"
+        "url": "https://im.x8fde.com/app/?v=1.6.41"
       }
     ],
     "security": { "csp": null }
