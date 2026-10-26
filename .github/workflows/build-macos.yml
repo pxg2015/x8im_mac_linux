@@ -136,7 +136,7 @@ jobs:
         run: |
           set -euo pipefail
           SRC=src-tauri/bin/mac/RustDesk.app
-          APP=src-tauri/target/${{ matrix.target }}/release/bundle/macos/X8.IM.app
+          APP=src-tauri/target/${{ matrix.target }}/release/bundle/macos/BangXin.app
           DST="$APP/Contents/Resources/bin/mac/RustDesk.app"
           DMGDIR=src-tauri/target/${{ matrix.target }}/release/bundle/dmg
           test -d "$SRC" || { echo "::error::纯净 RustDesk 副本缺失（Fetch bundled RustDesk 步骤应已生成）"; exit 1; }
@@ -159,10 +159,10 @@ jobs:
             # 否则拷回来的还是坏件），ditto 保证框架符号链接与 _CodeSignature 一并保留。
             TMP=$(mktemp -d)
             RWDMG="$TMP/rw.dmg"
-            hdiutil create -volname "X8.IM" -fs APFS -size 1000m -ov "$RWDMG" >/dev/null
+            hdiutil create -volname "BangXin" -fs APFS -size 1000m -ov "$RWDMG" >/dev/null
             M2=$(mktemp -d)
             hdiutil attach "$RWDMG" -mountpoint "$M2" -nobrowse -quiet
-            /usr/bin/ditto "$APP" "$M2/X8.IM.app"
+            /usr/bin/ditto "$APP" "$M2/BangXin.app"
             hdiutil detach "$M2" -quiet
             rm -f "$DMG"
             hdiutil convert "$RWDMG" -format UDZO -o "$DMG" >/dev/null
@@ -183,7 +183,7 @@ jobs:
             [ -e "$DMG" ] || continue
             MNT=$(mktemp -d)
             hdiutil attach "$DMG" -mountpoint "$MNT" -nobrowse -quiet
-            check_links "$MNT/X8.IM.app/Contents/Resources/bin/mac/RustDesk.app"
+            check_links "$MNT/BangXin.app/Contents/Resources/bin/mac/RustDesk.app"
             hdiutil detach "$MNT" -quiet
             rm -rf "$MNT"
           done
@@ -206,7 +206,7 @@ jobs:
         run: |
           echo "=== src-tauri/bin/mac ==="; ls -la src-tauri/bin/mac 2>/dev/null || true
           echo "=== bundle 目录 ==="; find src-tauri/target -maxdepth 5 \( -name '*.app' -o -name '*.dmg' \) 2>/dev/null | head -20 || true
-          echo "=== 内嵌 RustDesk 框架 ==="; ls src-tauri/target/*/release/bundle/macos/X8.IM.app/Contents/Resources/bin/mac/RustDesk.app/Contents/Frameworks 2>/dev/null | head -5 || true
+          echo "=== 内嵌 RustDesk 框架 ==="; ls src-tauri/target/*/release/bundle/macos/BangXin.app/Contents/Resources/bin/mac/RustDesk.app/Contents/Frameworks 2>/dev/null | head -5 || true
 
       - uses: actions/upload-artifact@v4
         with:
