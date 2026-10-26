@@ -1582,9 +1582,12 @@ async fn linux_self_update(app: tauri::AppHandle) -> Result<String, String> {
     #[cfg(target_os = "linux")]
     {
         let _ = app;
-        // spawn_blocking 的 JoinHandle 输出就是闭包返回值（tauri::async_runtime 包装 tokio），
-        // 故直接 await 拿 Result<String,String>，不要再 map_err 成 JoinError（与 ensure_rustdesk 同款）。
-        tauri::async_runtime::spawn_blocking(linux_self_update_blocking).await
+        // tauri 2 的 spawn_blocking 返回 JoinHandle<Result<T, tauri::Error>>（1.6.39 首轮 CI 实测：
+        // 直接 .await 得到 Result<Result<String,String>, tauri::Error>，mismatched types）。
+        // 故先 map_err 成 String 再 ? 拆一层，与命令签名 Result<String, String> 对齐。
+        tauri::async_runtime::spawn_blocking(linux_self_update_blocking)
+            .await
+            .map_err(|e| format!("升级线程异常: {e}"))?
     }
 }
 
