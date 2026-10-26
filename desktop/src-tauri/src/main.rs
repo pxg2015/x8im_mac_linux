@@ -1424,12 +1424,44 @@ fn linux_rustdesk_in_path() -> bool {
     false
 }
 
-/// Linux：判定包管理器家族（deb / rpm）。读 /etc/os-release（全小写后匹配）。
-/// 先看 ID_LIKE（银河麒麟桌面版 ID=kylin 但 ID_LIKE=debian，服务器版 ID_LIKE=rhel），
-/// 再退到 ID —— 只按 ID 字面匹配会把麒麟判反。
+/// Linux：判定包管理器家族（deb / rpm）。
+/// 🩸 2026-10-26 重写（老8 点头）：**命令探测优先**，os-release 只作兜底。
+///   原实现只按 /etc/os-release 的 ID / ID_LIKE 名单匹配（debian/ubuntu/kylin/uos…），
+///   名单天生漏 —— 不在名单里的发行版（openKylin、各类国产衍生版、精简系统）直接判死，
+///   用户看到「未能识别当前 Linux 发行版」且远程协助组件永远装不上，功能完全不可用。
+///   install.sh 早已是「以包管理器是否存在为准」的口径（比 ID_LIKE 可靠：麒麟/UOS 的
+///   ID_LIKE 并不统一），客户端与之对齐。os-release 名单保留为最后兜底（极简系统）。
 #[cfg(target_os = "linux")]
 fn linux_pkg_family() -> Option<&'static str> {
-    let raw = std::fs::read_to_string("/etc/os-release").unwrap_or_default().to_lowercase();
+    // ---- 1) 包管理器存在性（能装包才算数，与发行版叫什么无关） ----
+    // 用扫 PATH 而非 `sh -c command -v`：无 shell 依赖、无进程开销，
+    // 与 linux_rustdesk_in_path() 同款写法。另补两个标准系统目录 ——
+    // 部分桌面会话的 PATH 不含 /usr/sbin。
+    let has_bin = |bin: &str| {
+        if let Ok(path) = std::env::var("PATH") {
+            for dir in path.split(':') {
+                if !dir.is_empty() && std::path::Path::new(dir).join(bin).is_file() {
+                    return true;
+                }
+            }
+        }
+        ["/usr/bin", "/usr/sbin", "/bin", "/sbin"]
+            .iter()
+            .any(|d| std::path::Path::new(d).join(bin).is_file())
+    };
+    if has_bin("apt-get") || has_bin("dpkg") {
+        return Some("deb");
+    }
+    if has_bin("dnf") || has_bin("yum") || has_bin("zypper") || has_bin("rpm") {
+        return Some("rpm");
+    }
+
+    // ---- 2) 兜底：os-release 名单 ----
+    // 个别精简系统 / 容器里 /etc/os-release 缺失，只放 /usr/lib/os-release，两处都试。
+    let raw = std::fs::read_to_string("/etc/os-release")
+        .or_else(|_| std::fs::read_to_string("/usr/lib/os-release"))
+        .unwrap_or_default()
+        .to_lowercase();
     let mut id = String::new();
     let mut like = String::new();
     for line in raw.lines() {
@@ -1440,8 +1472,14 @@ fn linux_pkg_family() -> Option<&'static str> {
         }
     }
     let has = |s: &str, w: &str| s.split_whitespace().any(|x| x == w);
-    let deb_words = ["debian", "ubuntu", "deepin", "uos", "kali", "mint", "kylin", "uniontech"];
-    let rpm_words = ["rhel", "fedora", "centos", "openeuler", "anolis", "rocky", "almalinux", "suse", "opensuse"];
+    let deb_words = [
+        "debian", "ubuntu", "deepin", "uos", "kali", "mint", "kylin", "uniontech", "openkylin",
+        "neokylin", "bclinux",
+    ];
+    let rpm_words = [
+        "rhel", "fedora", "centos", "openeuler", "anolis", "rocky", "almalinux", "suse",
+        "opensuse", "tencentos", "alios", "euleros", "bclinux-for-euler",
+    ];
     if deb_words.iter().any(|w| has(&like, w) || id == *w) {
         return Some("deb");
     }
