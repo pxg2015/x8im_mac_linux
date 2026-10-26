@@ -69,6 +69,14 @@ fn main() {
             "win_auto_update",
             // 2026-10-25 B 方案：组件式静默升级（不跑 setup.exe，下载签名 portable zip 就地覆盖 + 重拉）
             "win_patch_update",
+            // 2026-10-25 无进度通道兜底版：前端构造不出 Channel 时改调这两个，
+            // 避免必需 Channel 参数反序列化失败导致命令体一行不执行（假进度事故根因）
+            "win_patch_update_nc",
+            "win_auto_update_nc",
+            // 2026-10-25 Rust 自主升级：前端确认后即返，真实升级在后台线程跑
+            "win_upd_start",
+            // 2026-10-26 重写：用户点「稍后提醒」→ 落盘静默截止时间，自动复查期间不打扰
+            "win_upd_snooze",
             // 2026-10-22 右下角卡通 FDE 浮窗（微信式新消息头像提醒）
             "fde_float_show",
             "fde_float_hide",

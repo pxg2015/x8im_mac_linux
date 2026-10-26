@@ -41,7 +41,9 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 [target.'cfg(windows)'.dependencies]
 # 2026-10-24 追加 Win32_UI_Input_KeyboardAndMouse：标题栏原生拖动（drag_begin 用
 # GetAsyncKeyState 判左键是否仍按下），根治 RDP/虚拟机下系统移动循环抢不到按下状态。
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_System_Threading", "Win32_Security", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Ole", "Win32_Graphics_Dwm", "Win32_UI_Input_KeyboardAndMouse"] }
+# 2026-10-26 追加 Win32_Graphics_Gdi / Win32_System_LibraryLoader：升级的原生确认框
+# 与下载进度窗（src/upd_ui.rs，CreateFontW / GetModuleHandleW）用。
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_System_Threading", "Win32_Security", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Ole", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_UI_Input_KeyboardAndMouse"] }
 
 # ── 2026-10-23 体积优化（安装包瘦身 50MB → 约 31MB）──
 # 实测：未加本段时 x8im.exe = 38.7MB（release 默认 opt-level=3 + lto=false + strip=false）。

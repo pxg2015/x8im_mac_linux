@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-win-auto-update-nc"
+description = "Enables the win_auto_update_nc command without any pre-configured scope."
+commands.allow = ["win_auto_update_nc"]
+
+[[permission]]
+identifier = "deny-win-auto-update-nc"
+description = "Denies the win_auto_update_nc command without any pre-configured scope."
+commands.deny = ["win_auto_update_nc"]

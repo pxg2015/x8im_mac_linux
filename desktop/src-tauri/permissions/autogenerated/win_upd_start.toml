@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-win-upd-start"
+description = "Enables the win_upd_start command without any pre-configured scope."
+commands.allow = ["win_upd_start"]
+
+[[permission]]
+identifier = "deny-win-upd-start"
+description = "Denies the win_upd_start command without any pre-configured scope."
+commands.deny = ["win_upd_start"]

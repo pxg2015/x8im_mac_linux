@@ -2,13 +2,13 @@
   "app": {
     "windows": [
       {
-        "title": "X8.IM v1.5.57",
+        "title": "邦信",
         "width": 1180,
         "height": 800,
         "minWidth": 800,
         "minHeight": 600,
         "decorations": true,
-        "url": "https://im.x8fde.com/app/?v=1.5.57"
+        "url": "https://im.x8fde.com/app/?v=1.6.37"
       }
     ]
   },

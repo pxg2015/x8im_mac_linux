@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-win-patch-update-nc"
+description = "Enables the win_patch_update_nc command without any pre-configured scope."
+commands.allow = ["win_patch_update_nc"]
+
+[[permission]]
+identifier = "deny-win-patch-update-nc"
+description = "Denies the win_patch_update_nc command without any pre-configured scope."
+commands.deny = ["win_patch_update_nc"]

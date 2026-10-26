@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-win-upd-snooze"
+description = "Enables the win_upd_snooze command without any pre-configured scope."
+commands.allow = ["win_upd_snooze"]
+
+[[permission]]
+identifier = "deny-win-upd-snooze"
+description = "Denies the win_upd_snooze command without any pre-configured scope."
+commands.deny = ["win_upd_snooze"]

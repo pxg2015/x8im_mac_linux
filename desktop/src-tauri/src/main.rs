@@ -1,4 +1,4 @@
-// X8.IM Tauri 壳：原生托盘 + 关闭藏托盘
+// 邦信 Tauri 壳：原生托盘 + 关闭藏托盘
 // 2026-10-12：加 windows_subsystem（去 DOS 窗）、tray-icon（右下角图标/菜单/双击）
 // 2026-10-14：加 target_os 限定 + macOS 跨平台分支，使同一份源码可在两平台构建
 #![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
@@ -11,6 +11,19 @@ use tauri::{
     tray::{TrayIconBuilder, TrayIconEvent},
     Emitter, Manager, UserAttentionType,
 };
+
+// 2026-10-26 重写：自动升级收敛为独立模块。
+// 此前 main.rs 里并存五套「检查→下载→验签→触发」实现（win_auto_update / _nc /
+// win_patch_update / _nc / win_upd_start），改一处漏四处；且入口全绑前端 IPC，
+// 而主窗是远程页面（https://im.x8fde.com/app/）——远程域下 async 命令的 IPC 会
+// 永久 pending，用户点「立即升级」实际什么都没发生。详见 updater.rs 头部说明。
+#[cfg(windows)]
+mod updater;
+
+// 升级用的原生 Win32 UI（确认框 + 下载进度窗）：IPC 通道在远程域下不通，
+// 「必须让用户看见/点击」的交互只能走系统原生窗口。
+#[cfg(windows)]
+mod upd_ui;
 
 /// 内置 RustDesk 路径（bundle.resources 捆绑，安装后随包分发）
 /// - Windows: `bin/rustdesk.exe`（便携单文件）
@@ -128,7 +141,7 @@ async fn get_rustdesk_id(app: tauri::AppHandle) -> Result<String, String> {
         .map_err(|e| format!("取 RustDesk ID 线程异常：{e}"))?
 }
 
-/// 2026-10-15 老8 点头：远程协助统一走自建 RustDesk 服务器（hbbs/hbbr，
+/// 2026-10-15 老8 点头：远程协助统一走自建 RustDesk 服务器（101.37.151.8 hbbs/hbbr，
 /// 阿里云北京），摆脱官方公共节点（美国 rs-ny）国内注册不稳导致的「设备离线/连不上」。
 /// 把 ID/中继服务器 + Key 幂等写进用户级 RustDesk2.toml（路径随平台标准位置）。
 /// 返回是否发生了写入；写入前先结束在跑的 RustDesk，防止其退出时回写旧配置。
@@ -139,22 +152,10 @@ async fn get_rustdesk_id(app: tauri::AppHandle) -> Result<String, String> {
 /// 两个目录对应两个互不相干的实例；品牌目录里才有 `X8Assist_local.toml`/`peers/`/日志）。
 /// 原实现把三键写进 `%APPDATA%\RustDesk\config\X8Assist2.toml` → 无人读取，等于从未生效；
 /// 目前能连自建服务器靠的是 `librustdesk.dll` 里**编译期注入**的地址/Key（实测 dll 内
-/// 地址×3、key×1）—— 一旦换地址/换 Key 或换到未注入的包，就会失联。
+/// `101.37.151.8`×3、`key`×1）—— 一旦换地址/换 Key 或换到未注入的包，就会失联。
 /// mac/linux 仍是官方 RustDesk（无品牌包），目录与文件名保持 `RustDesk` / `RustDesk2.toml`。
-// 自建 RustDesk 服务器地址与连接公钥（公钥，非私钥）。
-// 由构建期通过环境变量注入，不写死在源码（保持开源仓库基础设施无关）：
-//   RD_SERVER      —— hbbs/hbbr 公网地址
-//   RD_SERVER_KEY  —— 客户端连接用的 RustDesk 公钥
-// 构建前需 export 这两个变量（CI 走 GitHub Secrets；本地 _build.sh 亦同）。
-// 未注入则为空串，远程协助静默不可用（不影响其它功能）。
-const RD_SERVER: &str = match option_env!("RD_SERVER") {
-    Some(v) => v,
-    None => "",
-};
-const RD_SERVER_KEY: &str = match option_env!("RD_SERVER_KEY") {
-    Some(v) => v,
-    None => "",
-};
+const RD_SERVER: &str = "101.37.151.8";
+const RD_SERVER_KEY: &str = "5xK1zlfxsLIeyHGTZFdeZQF7N2tNiIqkCs4iOrdBakY=";
 
 // 官方 RustDesk 用户级配置目录（mac/linux 用；Windows 走品牌 X8Assist 自己的目录，
 // 不经过此函数 —— 故加 not(windows) 门，避免 Windows 构建下被判死代码）。
@@ -206,7 +207,7 @@ fn ensure_rustdesk_server_config() -> bool {
         Some(d) => (d, "X8Assist2.toml"),
         None => return false,
     };
-    // mac/linux：X8.IM 内嵌/依赖的是官方 RustDesk（app-name = RustDesk）
+    // mac/linux：邦信内嵌/依赖的是官方 RustDesk（app-name = RustDesk）
     #[cfg(not(windows))]
     let (dir, fname) = match rustdesk_user_config_dir() {
         Some(d) => (d, "RustDesk2.toml"),
@@ -305,10 +306,10 @@ fn rustdesk_get_id(app: &tauri::AppHandle) -> Result<String, String> {
 /// 无限等用户点授权）。主线程被占死 → 窗口「未响应」、用户看到卡死也不知要授权；
 /// 卡死又导致 setid 上报没跑完 → 服务端 pwd_set 永远 false → 每次接受/发起
 /// 再弹一次提权链路，形成死循环（实测踩过）。
-/// 2026-10-16 A+ 方案（老8 定「融合进 X8.IM、一次性装好、好友间最少点击」）：
+/// 2026-10-16 A+ 方案（老8 定「融合进邦信、一次性装好、好友间最少点击」）：
 /// 安装期 installer.nsh（已管理员权限）经 `X8Assist.exe --password` 把每机随机密码写入
 /// X8Assist 自己的配置（RustDesk 1.5 为加密存储，外部拼串不可靠），并把该明文落盘到此文件。
-/// 运行时 X8.IM 只需读此文件即可拿到本机密码用于上报（零 UAC）。
+/// 运行时邦信只需读此文件即可拿到本机密码用于上报（零 UAC）。
 /// 2026-10-16 实测修正：落点改到 `C:\Program Files\X8Assist\x8pwd.txt` —— 该目录由 POSTINSTALL
 /// 的 robocopy 保证存在（普通用户对 Program Files 下文件默认可读）；改用 ProgramData 时
 /// POSTINSTALL 的 CreateDirectory 在安装上下文未生效，导致密码文件缺失。
@@ -419,7 +420,7 @@ fn x8assist_config_dir() -> Option<std::path::PathBuf> {
 /// 三个都是普通 `[options]` 项，写在品牌配置目录，无需重编 RustDesk。
 /// 代价：RustDesk 侧不再弹「点击接受」——IM 侧「接受」不受影响（A+ 走固定密码直连），
 /// 但**未就绪机器会失去点击回落**，故仅在密码已就绪（x8pwd.txt 有值）时才写。
-/// mac/linux：X8.IM 用的是官方 RustDesk（`is_custom_client()==false`）→ hide_cm 拿不到值，
+/// mac/linux：邦信用的是官方 RustDesk（`is_custom_client()==false`）→ hide_cm 拿不到值，
 /// 写了也没用，故非 Windows 直接返回 false，不动官方配置。
 #[cfg(windows)]
 fn ensure_hide_cm() -> bool {
@@ -736,14 +737,14 @@ fn macos_repair_bundle_symlinks(bundle: &std::path::Path) -> Result<(), String> 
     if macos_bundle_symlinks_ok(bundle) {
         Ok(())
     } else {
-        Err("远程协助组件框架符号链接修复后仍不完整，请重新安装或升级 X8.IM 客户端".into())
+        Err("远程协助组件框架符号链接修复后仍不完整，请重新安装或升级邦信客户端".into())
     }
 }
 
 /// mac：把「启动用的」和「`--password` 用的」统一成**同一个 bundle**（A 方案，2026-10-17 老8 定）。
 ///
-/// 🩸 事故链（甘真机 2026-10-17）：`rustdesk_path()` 返回 X8.IM 资源包里的
-/// `X8.IM.app/Contents/Resources/bin/mac/RustDesk.app/...`，而 `--password` 硬编码跑
+/// 🩸 事故链（甘真机 2026-10-17）：`rustdesk_path()` 返回邦信资源包里的
+/// `BangXin.app/Contents/Resources/bin/mac/RustDesk.app/...`，而 `--password` 硬编码跑
 /// `/Applications/RustDesk.app/...` —— 用户机器上两处**各有一份**（启动台里两个图标），
 /// 版本还可能不同；落位逻辑又是「已存在就跳过」，于是永远用 A 启动、拿 B 设密码。
 /// 跨版本 IPC 的 `Data::Config` 结构会变（ACK 是 1.5 才加的）→ 服务端反序列化失败 →
@@ -1150,7 +1151,7 @@ fn ensure_rustdesk_blocking(app: tauri::AppHandle, expected_rid: String, passwor
     let _ = &password;
         #[cfg(windows)]
         {
-            // 2026-10-16 A+ 方案（老8 定「融合进 X8.IM、一次性装好、好友间最少点击」）：
+            // 2026-10-16 A+ 方案（老8 定「融合进邦信、一次性装好、好友间最少点击」）：
             // 密码已由安装期 installer.nsh（管理员权限）经 `X8Assist.exe --password` 写入，
             // 明文落盘到 C:\Program Files\X8Assist\x8pwd.txt（每机随机、运行时零 UAC）。
             // 这里只读取该文件并连同 ID 返回前端上报，不再手写 toml —— RustDesk 1.5 改为
@@ -1158,13 +1159,13 @@ fn ensure_rustdesk_blocking(app: tauri::AppHandle, expected_rid: String, passwor
             // 目录是 %APPDATA%\X8Assist\config（非 RustDesk）。始终返回 x8pwd.txt 中的密码
             // （若文件存在），由前端幂等上报，避免「ID 一致就跳过」导致服务端永远缺密码。
             if installed_assist_path().is_none() {
-                return Err("远程协助组件未安装，请重新安装或升级 X8.IM 客户端".into());
+                return Err("远程协助组件未安装，请重新安装或升级邦信客户端".into());
             }
             let cur = match rustdesk_get_id(&app) {
                 Ok(id) => id,
                 Err(e) => {
                     // 2026-10-24 P2-RS-9：取 ID 失败不再静默吞掉，记日志后仍按空 id 上报（前端回落）。
-                    eprintln!("[X8.IM] 取 X8Assist ID 失败（按空 id 上报）: {e}");
+                    eprintln!("[BangXin] 取 X8Assist ID 失败（按空 id 上报）: {e}");
                     String::new()
                 }
             };
@@ -1201,17 +1202,32 @@ fn ensure_rustdesk_blocking(app: tauri::AppHandle, expected_rid: String, passwor
             if let Some(exe) = installed_assist_path() {
                 // 裸启动（主进程模式）而非 --server：实测 --server 会自我提升成管理员实例
                 //（普通权限杀不掉、残留），而裸启动 IPC 同样能处理 --password（本机实测 Done!）。
-                let spawned = Command::new(&exe)
+                let child = Command::new(&exe)
                     .creation_flags(0x0800_0000)
                     .spawn()
-                    .is_ok();
-                if spawned {
-                    // 2026-10-17 美化（老8 定）：兜底写密码期间 X8Assist 主窗可能一闪而过，
-                    // 后台线程高频隐藏（每 50ms×60≈3s）让窗口在绘制前就被藏住，肉眼不可见。
-                    std::thread::spawn(|| {
-                        for _ in 0..60 {
-                            hide_assist_windows();
-                            std::thread::sleep(std::time::Duration::from_millis(50));
+                    .ok();
+                if let Some(ch) = child {
+                    // 2026-10-26 根治闪窗（老8 实测仍会黑屏闪一下）：原来只做 SW_HIDE，
+                    // 输在时序 —— flutter runner 的 Show() 是硬编码 SW_SHOWNORMAL，
+                    // 我们的隐藏线程每 50ms 才扫一次，中间这帧照漏。
+                    // 现在从 spawn 起就按 child.id 每 10ms 把窗口挪到屏幕外 + 隐藏，
+                    // 位置移走是持久的（Show 不会改回来），抢不到那一帧也看不见。
+                    let pid = ch.id();
+                    std::thread::spawn(move || {
+                        use std::collections::HashSet;
+                        let mut set: HashSet<u32> = HashSet::new();
+                        set.insert(pid);
+                        for i in 0..260 {
+                            // 首轮补一次 PID 全集（刚 kill 过，此时只会有我们刚起的实例）
+                            if i == 0 {
+                                for s in assist_pids() {
+                                    if let Ok(p) = s.parse::<u32>() {
+                                        set.insert(p);
+                                    }
+                                }
+                            }
+                            park_pid_windows(&set);
+                            std::thread::sleep(std::time::Duration::from_millis(10));
                         }
                     });
                     // 轮询 IPC 就绪（最多 12s）：--get-id 走同一管道，能返回即就绪。
@@ -1263,7 +1279,7 @@ fn ensure_rustdesk_blocking(app: tauri::AppHandle, expected_rid: String, passwor
     #[cfg(not(windows))]
     {
         // A 方案（2026-10-17 老8 定）：先把「跑的那份」和「设密码那份」统一成同一个 bundle。
-        // 甘真机事故：机器上同时有 X8.IM 与一份独立 RustDesk（启动台两个图标），
+        // 甘真机事故：机器上同时有邦信与一份独立 RustDesk（启动台两个图标），
         // 旧实现用资源包那份启动、却用 /Applications 那份执行 --password，两份版本/路径都不同，
         // IPC 拿不到 ACK 只会报一句「未获得系统授权」。统一后两者必然同源。
         #[cfg(target_os = "macos")]
@@ -1322,7 +1338,7 @@ fn ensure_rustdesk_blocking(app: tauri::AppHandle, expected_rid: String, passwor
             kill_rustdesk_procs();
             return Err(if died {
                 "RustDesk 未能运行（疑似被系统安全策略拦截）。macOS：到「系统设置 → 隐私与安全性」\
-                 底部点「仍要打开」后再点一次；仍不行请重装 X8.IM"
+                 底部点「仍要打开」后再点一次；仍不行请重装邦信"
                     .into()
             } else {
                 "RustDesk 启动超时，远程协助暂未就绪".into()
@@ -1454,7 +1470,7 @@ fn linux_install_rustdesk() -> Result<String, String> {
     if !std::path::Path::new(&dest).is_file() {
         return Err("组件下载失败（文件未落盘），请重试".into());
     }
-    // 安装 + 关掉官方包自带的开机自启服务（X8.IM 沿用「按需启动、用完即 kill、不开机自启」口径）
+    // 安装 + 关掉官方包自带的开机自启服务（邦信沿用「按需启动、用完即 kill、不开机自启」口径）
     let inst = if fam == "deb" {
         "apt-get install -y"
     } else {
@@ -1564,7 +1580,7 @@ async fn open_rustdesk(app: tauri::AppHandle, target: String, password: Option<S
         //   · `--server` 会置 IS_SERVER=true，于是 `src/server/connection.rs:2836` 在连接建立时
         //     `run_as_user("--tray")` 拉起托盘进程 → 托盘出现 X8Assist 图标（老8 不要）。
         //   · 主进程模式 IS_SERVER=false → 不拉 `--tray`；本机实测（自连 255610226）进程数不增、
-        //     无托盘，且 IPC 管道 `X8Assist\query` 正常就绪（供 X8.IM 驱动），冷启动 `--get-id` 0.2s。
+        //     无托盘，且 IPC 管道 `X8Assist\query` 正常就绪（供邦信驱动），冷启动 `--get-id` 0.2s。
         // 窗口保持隐藏：hide_cm 三项（连接管理器窗口不出现）。
         // 2026-10-15 老8 要求：先结束已有实例再拉起，避免多实例并存（hbbs 注册互踩）
         kill_rustdesk_procs();
@@ -1577,7 +1593,7 @@ async fn open_rustdesk(app: tauri::AppHandle, target: String, password: Option<S
         Command::new(&exe)
             .spawn()
             .map_err(|e| format!("启动 RustDesk 失败: {e}"))?;
-        // 2026-10-16 老8：主窗（你的桌面）别盖在 X8.IM 上 —— 后台线程重试隐藏
+        // 2026-10-16 老8：主窗（你的桌面）别盖在邦信上 —— 后台线程重试隐藏
         hide_assist_windows_retried();
         // mac/linux：官方客户端无 hide_cm，对端连入时连接管理器仍会弹（无 Accept 按钮、
         // 3s 自最小化）—— 待控期间持续隐藏所有 rustdesk 窗口，视觉与 Windows 一致。
@@ -1606,7 +1622,7 @@ async fn open_rustdesk(app: tauri::AppHandle, target: String, password: Option<S
         // 2026-10-17 修复（老8 报「点了/对方接受/远程窗口没出来」）：控制端**绝不可**无差别隐藏
         // X8Assist 窗口。原 hide_assist_windows_retried() 在拉起后 6s 内把进程名下所有可见窗口
         // SW_HIDE —— 局域网/同公司网络打洞快，远程桌面「会话窗口」常在 6s 内弹出即被永久藏死，
-        // 用户眼前只剩 X8.IM、看不到对方屏幕（被控端那支保留隐藏，彼时还没有会话窗口）。
+        // 用户眼前只剩邦信、看不到对方屏幕（被控端那支保留隐藏，彼时还没有会话窗口）。
         // 连接管理器窗口（--cm）在密码已就绪机器上已由 ensure_hide_cm()（approve-mode=password）
         // 从配置层压掉，无需靠循环藏；会话窗口必须可见 —— 故此处不调 hide。
         Ok(())
@@ -1696,10 +1712,10 @@ fn assist_pids() -> Vec<String> {
         .collect()
 }
 
-/// 2026-10-16 老8 诉求：X8Assist 主窗口（「你的桌面/控制远程桌面」）不要盖在 X8.IM 上。
+/// 2026-10-16 老8 诉求：X8Assist 主窗口（「你的桌面/控制远程桌面」）不要盖在邦信上。
 /// 把 X8Assist 进程名下**所有可见顶层窗口** ShowWindow(SW_HIDE)。
 /// 只在「本机先 kill 全部实例 → 刚 spawn 新实例」的就绪/拉起窗口期调用（此时不存在
-/// 进行中的远程会话窗口，不会误藏会话画面；X8.IM 流程保证 spawn 前必 kill）。
+/// 进行中的远程会话窗口，不会误藏会话画面；邦信流程保证 spawn 前必 kill）。
 /// flutter 窗口异步创建，调用方需在 spawn 后多次重试（见 hide_assist_windows_retried）。
 #[cfg(windows)]
 fn hide_assist_windows() {
@@ -1731,8 +1747,52 @@ fn hide_assist_windows() {
     }
 }
 
+/// 2026-10-26 老8 报：安装后第一次启动邦信，X8Assist 窗口仍会黑屏闪一下。
+/// 根因：兜底写密码链路里 flutter 主窗先 Show 后我们才抢到 SW_HIDE，中间必然漏一帧
+/// （Show 是 Flutter runner 里硬编码的 SW_SHOWNORMAL，STARTUPINFO 的 SW_HIDE 管不住它）。
+/// 对策：把**窗口位置本身**挪到屏幕外（-32000,-32000），Flutter 的 Show 只改可见性、
+/// 不会把位置改回来 —— 位置一旦移走就永久生效，抢不到可见性也不会被看到。
+/// 只对指定 PID 集合生效（spawn 后拿 child.id 直接命中，不必反复 tasklist）。
+#[cfg(windows)]
+fn park_pid_windows(pids: &std::collections::HashSet<u32>) {
+    use windows_sys::Win32::Foundation::BOOL;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowThreadProcessId, IsWindowVisible, SetWindowPos, ShowWindow,
+        SWP_NOACTIVATE, SWP_NOZORDER, SWP_NOSIZE, SW_HIDE,
+    };
+    if pids.is_empty() {
+        return;
+    }
+    unsafe extern "system" fn enum_proc(hwnd: *mut std::ffi::c_void, lparam: isize) -> BOOL {
+        unsafe {
+            let pids = &*(lparam as *const std::collections::HashSet<u32>);
+            let mut pid: u32 = 0;
+            GetWindowThreadProcessId(hwnd, &mut pid);
+            if pids.contains(&pid) {
+                // 先挪出可见区域（幂等、可重复调用），再叠一次 SW_HIDE
+                SetWindowPos(
+                    hwnd,
+                    std::ptr::null_mut(),
+                    -32000,
+                    -32000,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                if IsWindowVisible(hwnd) != 0 {
+                    ShowWindow(hwnd, SW_HIDE);
+                }
+            }
+        }
+        1 // 继续枚举
+    }
+    unsafe {
+        EnumWindows(Some(enum_proc), pids as *const _ as isize);
+    }
+}
+
 /// mac/linux 对应实现：隐藏官方 RustDesk 的全部窗口（等价 Windows EnumWindows+SW_HIDE）。
-///   mac：osascript 让 System Events 把 rustdesk 进程的所有窗口设为不可见。需 X8.IM 在
+///   mac：osascript 让 System Events 把 rustdesk 进程的所有窗口设为不可见。需邦信在
 ///        「系统设置-隐私与安全性-辅助功能」获授权；未授权时静默失败（窗口照常显示，
 ///        远程功能本身不受影响）。
 ///   linux：wmctrl 可用时把 rustdesk 类窗口置 hidden（发行版未装 wmctrl 则跳过）。
@@ -1783,7 +1843,7 @@ fn hide_assist_windows_retried() {
 
 /// 被控端待控期间**持续**隐藏 RustDesk 窗口（仅 mac/linux）：官方客户端没有 hide_cm，
 /// 对端连入时连接管理器窗口会晚于启动期弹出（authorized 时无 Accept 按钮、3s 自最小化，
-/// 但为与 Windows「眼前只有 X8.IM」的体感一致，实例存活期间每 500ms 藏一次）。
+/// 但为与 Windows「眼前只有邦信」的体感一致，实例存活期间每 500ms 藏一次）。
 /// 控制端不能用任何 hide（会藏掉远程画面会话窗口）；控制端连接管理器由 ensure_hide_cm() 配置层压掉。
 /// 实例被回收（close_rustdesk / assist_idle_reap / 会话结束）后循环自行退出。
 #[cfg(not(windows))]
@@ -2353,7 +2413,7 @@ async fn open_workbench(app: tauri::AppHandle, url: String) -> Result<(), String
     }
     let parsed = url.parse().map_err(|e| format!("地址解析失败: {e}"))?;
     match tauri::WebviewWindowBuilder::new(&app, "workbench", tauri::WebviewUrl::External(parsed))
-        .title("FDE 工作台 — 关闭此窗口返回 X8.IM")
+        .title("FDE 工作台 — 关闭此窗口返回邦信")
         .inner_size(1280.0, 860.0)
         .min_inner_size(900.0, 600.0)
         .center()
@@ -2388,7 +2448,7 @@ async fn ext_open_window(app: tauri::AppHandle, app_id: String, url: String, w: 
     }
     let parsed = url.parse().map_err(|e| format!("地址解析失败: {e}"))?;
     match tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::External(parsed))
-        .title("小程序 — 关闭此窗口返回 X8.IM")
+        .title("小程序 — 关闭此窗口返回邦信")
         .inner_size(w, h)
         .min_inner_size(320.0, 240.0)
         .center()
@@ -2530,7 +2590,7 @@ fn tray_icon_handle() -> Option<(*mut std::ffi::c_void, u32)> {
 ///
 /// 🩸 实测坑（Win10 22H2 19045）：**自建隐藏托盘项**（NIS_HIDDEN）发气泡，NIM_MODIFY 返回 1
 /// 但屏幕什么都不出现、通知中心也无记录；换成**可见**托盘图标后同一段代码立刻弹成 toast
-/// （通知中心可见「X8.IM 新消息 / 李四：…」）。所以必须挂在 Tauri 自己的托盘图标上。
+/// （通知中心可见「邦信新消息 / 李四：…」）。所以必须挂在 Tauri 自己的托盘图标上。
 #[cfg(target_os = "windows")]
 fn win_tray_balloon(title: &str, body: &str) {
     use windows_sys::Win32::UI::Shell::{
@@ -2795,7 +2855,7 @@ fn fde_float_show_impl(app: &tauri::AppHandle, count: i64, tip: &str) {
             }
         };
         match tauri::WebviewWindowBuilder::new(app, "fde-float", tauri::WebviewUrl::External(parsed))
-            .title("X8.IM")
+            .title("邦信")
             .inner_size(FDE_FLOAT_W, FDE_FLOAT_H)
             .position(x, y)
             .decorations(false)
@@ -2907,6 +2967,12 @@ fn fde_upd_show_impl(
     got: u64,
     total: u64,
 ) {
+    // 记住目标版本：Rust 侧（无 Channel 的 _nc 模式）后续推阶段时带回去，标题不丢 vX.Y.Z
+    if !ver.is_empty() {
+        if let Ok(mut g) = UPD_VER.lock() {
+            *g = Some(ver.to_string());
+        }
+    }
     let (x, y) = fde_upd_pos(app);
 
     if let Some(w) = app.get_webview_window("fde-upd") {
@@ -2922,8 +2988,26 @@ fn fde_upd_show_impl(
             total
         );
         let _ = w.eval(&js);
-        let _ = w.set_position(tauri::LogicalPosition::new(x, y));
-        let _ = w.show();
+        // 🔴 2026-10-26 去抖（配合下载进度节流，双保险）：
+        // 旧实现每次调用都 set_position + show 各一次，属**窗口消息**；
+        // 下载期每秒上百次 → 窗口消息循环被打满，主窗口拖动直接卡死。
+        // 现在：坐标没变就不挪（拖动主窗口时浮窗才需要跟着挪），已可见就不再 show。
+        let key = (x.round() as i32, y.round() as i32);
+        let moved = UPD_FLAST_POS
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .map(|mut g| {
+                let changed = *g != Some(key);
+                *g = Some(key);
+                changed
+            })
+            .unwrap_or(true);
+        if moved {
+            let _ = w.set_position(tauri::LogicalPosition::new(x, y));
+        }
+        if !w.is_visible().unwrap_or(false) {
+            let _ = w.show();
+        }
         return;
     }
 
@@ -2946,7 +3030,7 @@ fn fde_upd_show_impl(
         "fde-upd",
         tauri::WebviewUrl::External(parsed),
     )
-    .title("X8.IM 升级中")
+    .title("邦信升级中")
     .inner_size(FDE_UPD_W, FDE_UPD_H)
     .position(x, y)
     .decorations(false)
@@ -2992,6 +3076,13 @@ fn upd_float_show(
 /// 前端接口：收起升级进度小窗（升级失败 / 已是最新 / 用户取消时调用）。
 #[tauri::command]
 fn upd_float_hide(app: tauri::AppHandle) {
+    // 浮窗下次再现时必须重新落位（去抖缓存作废），否则会停在旧坐标。
+    if let Ok(mut g) = UPD_FLAST_POS
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+    {
+        *g = None;
+    }
     if let Some(w) = app.get_webview_window("fde-upd") {
         let _ = w.hide();
     }
@@ -3026,13 +3117,15 @@ async fn drag_begin(window: tauri::WebviewWindow) -> Result<(), String> {
             Err(e) => return Err(e.to_string()),
         };
         std::thread::spawn(move || {
-            use windows_sys::Win32::Foundation::POINT;
+            use windows_sys::Win32::Foundation::{POINT, RECT};
             use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
             use windows_sys::Win32::UI::WindowsAndMessaging::{
-                GetCursorPos, GetSystemMetrics, SetWindowPos, SM_CXDRAG, SM_CYDRAG,
-                SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+                GetCursorPos, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, SetWindowPos,
+                ShowWindow, GWL_STYLE, SM_CXDRAG, SM_CYDRAG, SWP_NOACTIVATE, SWP_NOSIZE,
+                SWP_NOZORDER, SW_RESTORE, WS_MAXIMIZE,
             };
             unsafe {
+                let h = hwnd as *mut core::ffi::c_void;
                 // 拖拽阈值（系统级，通常 4px）：未超阈值不算拖动
                 let thr_x = GetSystemMetrics(SM_CXDRAG).max(4);
                 let thr_y = GetSystemMetrics(SM_CYDRAG).max(4);
@@ -3040,8 +3133,18 @@ async fn drag_begin(window: tauri::WebviewWindow) -> Result<(), String> {
                 if GetCursorPos(&mut p) == 0 {
                     return;
                 }
-                let (sx, sy) = (p.x, p.y);
-                if window.is_maximized().unwrap_or(false) {
+                let (mut lx, mut ly) = (p.x, p.y);
+                // 初始窗口位置：纯 Win32 GetWindowRect，避免子线程调 Tauri 窗口方法
+                // （is_maximized/unmaximize/outer_position 在 spawned 线程上不可靠，会挂起/失败）
+                let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+                if GetWindowRect(h, &mut rect) == 0 {
+                    return;
+                }
+                let (mut wx, mut wy) = (rect.left, rect.top);
+                // 是否最大化：读窗口样式（纯 Win32，子线程安全）
+                let style = GetWindowLongPtrW(h, GWL_STYLE) as u32;
+                let maximized = style & WS_MAXIMIZE != 0;
+                if maximized {
                     // 阈值门：等光标移出阈值（→ 还原并继续拖）或左键抬起（→ 原样退出，保持最大化）
                     loop {
                         if (GetAsyncKeyState(VK_LBUTTON as i32) as u16) & 0x8000 == 0 {
@@ -3051,25 +3154,23 @@ async fn drag_begin(window: tauri::WebviewWindow) -> Result<(), String> {
                         if GetCursorPos(&mut c) == 0 {
                             return;
                         }
-                        if (c.x - sx).abs() >= thr_x || (c.y - sy).abs() >= thr_y {
+                        if (c.x - lx).abs() >= thr_x || (c.y - ly).abs() >= thr_y {
                             break;
                         }
                         std::thread::sleep(std::time::Duration::from_millis(8));
                     }
-                    let _ = window.unmaximize();
+                    // 纯 Win32 还原（SW_RESTORE），不依赖 Tauri unmaximize（子线程会挂起/失败）
+                    ShowWindow(h, SW_RESTORE);
                     // 还原是异步的（窗口尺寸/位置在下一帧才生效），先让它落地再校准
                     std::thread::sleep(std::time::Duration::from_millis(90));
+                    let mut r2 = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+                    if GetWindowRect(h, &mut r2) != 0 {
+                        wx = r2.left;
+                        wy = r2.top;
+                        lx = p.x;
+                        ly = p.y;
+                    }
                 }
-                let mut p = POINT { x: 0, y: 0 };
-                if GetCursorPos(&mut p) == 0 {
-                    return;
-                }
-                let (mut lx, mut ly) = (p.x, p.y);
-                let Ok(pos) = window.outer_position() else {
-                    return;
-                };
-                let (mut wx, mut wy) = (pos.x, pos.y);
-                let h = hwnd as *mut core::ffi::c_void;
                 loop {
                     // 左键已抬起 → 结束（GetAsyncKeyState 高位为按下）
                     if (GetAsyncKeyState(VK_LBUTTON as i32) as u16) & 0x8000 == 0 {
@@ -3109,6 +3210,40 @@ async fn drag_begin(window: tauri::WebviewWindow) -> Result<(), String> {
     }
     #[cfg(windows)]
     Ok(())
+}
+
+/// 2026-10-25 标题栏窗控加固：原 WinTitleBar 直接调 `window.__TAURI__.window.getCurrentWindow()`
+/// 的 `.window` 全局命名空间做 minimize/maximize/close。实测该命名空间在部分构建的运行时不可用
+/// （`core` 可用、`window` 不可用），导致「app 其它功能正常、但标题栏放大/缩小/关闭全失效」。
+/// 改为经 Rust 命令 + 已验证可靠的 `core.invoke` 通道执行窗控，彻底绕开 `.window` 命名空间。
+#[tauri::command]
+fn win_minimize(app: tauri::AppHandle) -> Result<(), String> {
+    app.get_webview_window("main")
+        .map(|w| w.minimize().map_err(|e| e.to_string()))
+        .unwrap_or(Err("主窗口未找到".into()))
+}
+#[tauri::command]
+fn win_toggle_maximize(app: tauri::AppHandle) -> Result<(), String> {
+    let w = app.get_webview_window("main").ok_or("主窗口未找到".to_string())?;
+    // WebviewWindow 无 toggle_maximize 方法，手动判断后切换
+    let is_max = w.is_maximized().map_err(|e| e.to_string())?;
+    if is_max {
+        w.unmaximize().map_err(|e| e.to_string())
+    } else {
+        w.maximize().map_err(|e| e.to_string())
+    }
+}
+#[tauri::command]
+fn win_close(app: tauri::AppHandle) -> Result<(), String> {
+    app.get_webview_window("main")
+        .map(|w| w.close().map_err(|e| e.to_string()))
+        .unwrap_or(Err("主窗口未找到".into()))
+}
+#[tauri::command]
+fn win_is_maximized(app: tauri::AppHandle) -> Result<bool, String> {
+    app.get_webview_window("main")
+        .map(|w| w.is_maximized().map_err(|e| e.to_string()))
+        .unwrap_or(Err("主窗口未找到".into()))
 }
 
 /// 让主窗的任务栏按钮闪烁（Windows 原生，微信式：闪到用户点开窗口为止）。
@@ -3175,15 +3310,15 @@ fn flash_taskbar(w: &tauri::WebviewWindow) {
 
 /// 任务栏闪烁诊断日志（2026-10-23）：两路 API（Tauri 通道 + 原生 FlashWindowEx）都无观感
 /// 效果，必须把 API 现场落盘才能区分是「被系统忽略」还是「闪错了窗口」。
-/// 写到 %LOCALAPPDATA%\X8.IM\flash_debug.log，仅追加、不做轮转（诊断完即可撤掉）。
+/// 写到 %LOCALAPPDATA%\BangXin\flash_debug.log，仅追加、不做轮转（诊断完即可撤掉）。
 #[cfg(target_os = "windows")]
 fn log_flash(msg: &str) {
     let dir = match std::env::var("LOCALAPPDATA") {
         Ok(v) => std::path::PathBuf::from(v),
         Err(_) => return,
     };
-    let p = dir.join("X8.IM").join("flash_debug.log");
-    let _ = std::fs::create_dir_all(dir.join("X8.IM"));
+    let p = dir.join("BangXin").join("flash_debug.log");
+    let _ = std::fs::create_dir_all(dir.join("BangXin"));
     // 2026-10-24 P2-RS-3：照 si_log 范式加 32KB 上限，防止诊断日志无限增长
     if let Ok(md) = std::fs::metadata(&p) {
         if md.len() > 32 * 1024 {
@@ -3207,7 +3342,7 @@ fn log_flash(msg: &str) {
 /// 新消息提醒（2026-10-14 老8 定）：有消息时右下角要有提示。
 /// - 任务栏按钮持续闪烁：Windows 走 `FlashWindowEx(FLASHW_TIMER)`，**闪到窗口获得焦点为止**，
 ///   拿到焦点由系统自动停，无需手动取消；macOS 是 Dock 图标弹跳一次；Linux tao 未实现 → 自动降级为无动作。
-/// - 托盘 tooltip 顺带显示未读数：`X8.IM · 3 条未读`（count=0 时还原为默认文案）。
+/// - 托盘 tooltip 顺带显示未读数：`邦信 · 3 条未读`（count=0 时还原为默认文案）。
 /// - 托盘图标角标（2026-10-15 老8 定）：有未读时整个图标换成「红底 + 未读数」，
 ///   窗口藏进托盘后任务栏按钮都没了，闪烁看不见 —— 图标数字是唯一常驻可见的提醒。
 /// - 托盘图标闪烁（2026-10-22 老8 定）：有新消息且窗口不在前台时，图标每 500ms 在
@@ -3237,9 +3372,9 @@ fn notify_unread(
     let def_icon = Some(tray_icon_image());
     if let Some(tray) = app.tray_by_id("x8im-tray") {
         let tip = if n > 0 {
-            format!("X8.IM · {n} 条未读")
+            format!("邦信 · {n} 条未读")
         } else {
-            "X8.IM 即时通讯".to_string()
+            "邦信即时通讯".to_string()
         };
         let _ = tray.set_tooltip(Some(tip));
         if n > 0 {
@@ -3288,7 +3423,7 @@ fn notify_unread(
                         let t = title
                             .clone()
                             .filter(|s| !s.trim().is_empty())
-                            .unwrap_or_else(|| "X8.IM 新消息".to_string());
+                            .unwrap_or_else(|| "邦信新消息".to_string());
                         let b = body
                             .clone()
                             .filter(|s| !s.trim().is_empty())
@@ -3364,7 +3499,7 @@ fn away_notice(app: tauri::AppHandle, title: Option<String>, body: Option<String
     {
         let t = title
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "X8.IM 新消息".to_string());
+            .unwrap_or_else(|| "邦信新消息".to_string());
         let b = body
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| "收到一条新消息".to_string());
@@ -3427,9 +3562,9 @@ async fn detect_wechat() -> bool {
 ///
 /// 全链路（权限视角）：
 ///   app（普通/管理员态） updater.check() → download() 内部 minisign 验签（updater.rs
-///   verify_signature，拿到的字节即可信）→ 落盘 %LOCALAPPDATA%\X8.IM\updates\
-///   → schtasks /Run 触发安装期注册的计划任务 "X8.IM AutoUpdate"（普通权限即可触发
-///   自己名下的任务，不弹 UAC）→ 任务以最高权限跑 C:\ProgramData\X8.IM\updater-task.cmd
+///   verify_signature，拿到的字节即可信）→ 落盘 %LOCALAPPDATA%\BangXin\updates\
+///   → schtasks /Run 触发安装期注册的计划任务 "BangXin AutoUpdate"（普通权限即可触发
+///   自己名下的任务，不弹 UAC）→ 任务以最高权限跑 C:\ProgramData\BangXin\updater-task.cmd
 ///   → 安装器 /S /UPDATE /R：先 taskkill 本进程，装完经 explorer 中转重启 app
 ///   （explorer 以交互用户中等完整性令牌运行，重启的 app 拿回普通令牌，不常驻管理员态）。
 ///
@@ -3441,19 +3576,119 @@ async fn detect_wechat() -> bool {
 /// 老客户端没有该任务 → 预检直接 Err，前端回落手动通道，绝不白下几十 MB。
 ///
 /// 安全边界：.cmd 只执行「app 自己下载并验签后」放入 updates\ 的最新包；普通用户既不能
-/// 写 .cmd（C:\ProgramData\X8.IM 继承 ProgramData ACL，仅管理员可写）也不能触发任务
+/// 写 .cmd（C:\ProgramData\BangXin 继承 ProgramData ACL，仅管理员可写）也不能触发任务
 /// （任务属安装时那位管理员）。
 #[cfg(windows)]
-const X8_TASK_NAME: &str = "X8.IM AutoUpdate";
+const X8_TASK_NAME: &str = "BangXin AutoUpdate";
+/// 2026-10-25 品牌迁移前的旧任务名（老机器上可能还存在，仅作兜底探测）
+const LEGACY_TASK_NAME: &str = "X8.IM AutoUpdate";
 
-/// 更新暂存目录：%LOCALAPPDATA%\X8.IM\updates
+/// 更新暂存目录：%ProgramData%\BangXin\updates
+/// 🔴 2026-10-25 根因修复：原先用 %LOCALAPPDATA%\BangXin\updates，但计划任务以
+///   Highest 权限 + Interactive 登录类型运行时，%LOCALAPPDATA% 会被解析成
+///   C:\ProgramData（而非 C:\Users\<user>\AppData\Local）。结果 Rust 客户端（普通用户态）
+///   把包落到 C:\Users\<user>\AppData\Local\BangXin\updates\，而 updater-task.cmd
+///   （Highest 态）却去 C:\ProgramData\BangXin\updates\ 找包 —— 两边永远对不上，
+///   cmd 找不到包 → 升级静默失败（老8 真机「升级 10 多次一直不成功」的根因）。
+///   统一改用 %ProgramData%（任何上下文都稳定解析为 C:\ProgramData），Rust 落盘与
+///   cmd 读包用同一目录，路径一致。
 /// 刻意避开 main() setup 里 Windows 启动即删的 local_data_dir/app_data_dir
-/// （identifier com.x8fde.im 那两个目录）——用 X8.IM 这个独立目录，包才留得到安装器跑。
+/// （identifier com.x8fde.im 那两个目录）——用 BangXin 这个独立目录，包才留得到安装器跑。
 #[cfg(windows)]
-fn win_updates_dir() -> Result<std::path::PathBuf, String> {
-    let local = std::env::var("LOCALAPPDATA")
-        .map_err(|_| "LOCALAPPDATA 环境变量缺失，无法定位更新目录".to_string())?;
-    Ok(std::path::Path::new(&local).join("X8.IM").join("updates"))
+#[derive(Clone)]
+struct TaskCtx {
+    /// 计划任务名（触发用）
+    name: &'static str,
+    /// 更新暂存目录（.cmd 会从这里找包）
+    updates: std::path::PathBuf,
+    /// 包文件名前缀，须与 .cmd 的 glob 一致
+    prefix: &'static str,
+}
+
+/// 解析本机升级体系：新品牌（BangXin）优先；若机器上只有品牌迁移前的旧任务，
+/// 则整套回落到旧体系（旧任务 → 旧 .cmd → 旧目录 + 旧文件名）。
+/// 三种必须配套，只换一半就是「点了没反应」的静默失败。
+#[cfg(windows)]
+fn task_ctx() -> Result<TaskCtx, String> {
+    // 🔴 2026-10-25：改用 %ProgramData%（而非 LOCALAPPDATA），与 updater-task.cmd 的
+    //   %ProgramData% 展开结果一致，杜绝 Highest 权限计划任务上下文里路径错位。
+    let pd = std::env::var("ProgramData")
+        .map_err(|_| "ProgramData 环境变量缺失，无法定位更新目录".to_string())?;
+    let base = std::path::Path::new(&pd);
+    let fresh = TaskCtx {
+        name: X8_TASK_NAME,
+        updates: base.join("BangXin").join("updates"),
+        prefix: "BangXin",
+    };
+    let (c, _) = win_run_capture("schtasks", &["/Query", "/TN", X8_TASK_NAME, "/FO", "LIST"]);
+    if c == 0 {
+        return Ok(fresh);
+    }
+    let (c2, _) = win_run_capture("schtasks", &["/Query", "/TN", LEGACY_TASK_NAME, "/FO", "LIST"]);
+    if c2 == 0 {
+        return Ok(TaskCtx {
+            name: LEGACY_TASK_NAME,
+            updates: base.join("X8.IM").join("updates"),
+            prefix: "X8.IM",
+        });
+    }
+    Ok(fresh)
+}
+
+/// 触发「应用补丁」：优先 `schtasks /Run`（普通权限、零 UAC）；
+/// 失败则**降级为提权直跑** `updater-task.cmd`（弹一次 UAC，用户点「是」即可）。
+///
+/// 🔴 2026-10-26 老8 定（原 P1 建议落地）：此前「预检计划任务不存在 → 整条升级链路直接
+/// 放弃」，禁用 schtasks / 任务未注册的机器（企业管控机、品牌迁移前的老客户端）
+/// 100% 升不了级，表现＝发版了但客户端永远停在老版本。
+/// 现在预检失败**只降级、不放弃**：包照样下载、验签、落盘；最后一公里改用提权直跑，
+/// 最差情况也只是弹一次 UAC，而不是白下几十 MB 后报「请手动更新」。
+#[cfg(windows)]
+fn apply_patch_task(ctx: &TaskCtx) -> Result<(), String> {
+    let (code, out) = win_run_capture("schtasks", &["/Run", "/TN", ctx.name]);
+    upd_log(&format!("触发补丁应用: schtasks /Run code={code} out={out}"));
+    if code == 0 {
+        return Ok(());
+    }
+    // 降级通道：提权直跑 updater-task.cmd（内容与计划任务的 /TR 等价，只是这次要 UAC）
+    let script = match ctx.updates.parent() {
+        Some(p) => p.join("updater-task.cmd"),
+        None => return Err(format!("触发自动升级任务失败: {out}")),
+    };
+    if !script.exists() {
+        return Err(format!(
+            "自动升级组件未就绪（计划任务缺失且 {} 不存在），请手动重装最新版：{out}",
+            script.display()
+        ));
+    }
+    // 优先用随包自带的 elevate.exe 提权无窗启动 updater-task.cmd（SW_HIDE，不弹黑窗）；
+    // 仅当该工具缺失（极老版本没带上）时，才回退到 PowerShell Start-Process -WindowStyle Hidden。
+    let elevate = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|p| p.join("elevate.exe")))
+        .unwrap_or_else(|| std::path::PathBuf::from("elevate.exe"));
+    let (c2, o2) = if elevate.exists() {
+        win_run_capture(
+            &elevate.to_string_lossy(),
+            &["cmd.exe", "/c", &script.display().to_string()],
+        )
+    } else {
+        let ps = format!(
+            "Start-Process -FilePath 'cmd.exe' -ArgumentList '/c','\"{}\"' -Verb RunAs -WindowStyle Hidden",
+            script.display()
+        );
+        win_run_capture(
+            "powershell",
+            &["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps],
+        )
+    };
+    upd_log(&format!("触发补丁应用(提权兜底): code={c2} out={o2}"));
+    if c2 != 0 {
+        return Err(format!(
+            "触发自动升级失败（计划任务与提权通道均不可用）：{out} | {o2}"
+        ));
+    }
+    Ok(())
 }
 
 /// 跑一个 Windows 命令并捕获输出（CREATE_NO_WINDOW，不弹黑窗）。
@@ -3536,33 +3771,123 @@ fn win_run_capture_to(program: &str, args: &[&str], secs: u64) -> (i32, String) 
 /// 2026-10-23 老8：升级不能只显示一句「正在自动升级」——长时间无进度让人以为卡死。
 /// 阶段经 IPC Channel 逐个推给前端：checking → downloading(got/total) →
 /// downloaded → installing → waiting（触发计划任务）→ started（安装器真的起来了）。
-fn upd_emit(ch: &std::sync::Arc<Option<tauri::ipc::Channel<serde_json::Value>>>, stage: &str, got: u64, total: u64) {
+/// 升级进度：有 Channel 就发事件（老通道）；**没有 Channel（_nc 命令）就直接把阶段推给浮窗**。
+///
+/// 🔴 2026-10-25 20:0x 事故定论：远程页面（https://im.x8fde.com/app/）上带 Channel 参数的
+/// 命令**根本不进函数体**——`__CHANNEL__:<id>` 在远程域下反序列化永久挂住，既不执行也不报错，
+/// 前端进度靠本地时间线演满 → 「看着升完了、其实什么都没发生」，进程随后被用户/系统收掉。
+/// 所以 1.5.61 起前端一律走 `_nc`，进度改由这里直接 eval 到浮窗，彻底不依赖 IPC Channel。
+/// 首次建窗仍由前端 `upd_float_show` 负责（这里只在窗口已存在时更新，绝不在后台线程建窗）。
+fn upd_emit(
+    app: &tauri::AppHandle,
+    ch: &std::sync::Arc<Option<tauri::ipc::Channel<serde_json::Value>>>,
+    stage: &str,
+    got: u64,
+    total: u64,
+) {
     if let Some(c) = ch.as_ref() {
         let _ = c.send(serde_json::json!({ "stage": stage, "got": got, "total": total }));
+        return;
     }
+    // 无 Channel：下载阶段每秒刷新「已用 N 秒」，其它阶段（含结束/失败）立刻停掉
+    if stage == "downloading" {
+        upd_dl_tick_start(app.clone());
+    } else {
+        upd_dl_tick_stop();
+    }
+    upd_float_stage(app, stage, got, total);
+}
+
+/// 升级起始时间戳（秒），用于浮窗显示「已用 N 秒」。
+static UPD_T0: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 最近一次前端传进来的目标版本号（Rust 侧推阶段时带回去，浮窗标题才不会丢版本）。
+static UPD_VER: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// 下载中每秒刷新的开关。
+static UPD_DL_TICK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 升级浮窗上次落位坐标（去抖用：坐标没变就不再发 set_position，避免窗口消息风暴）。
+static UPD_FLAST_POS: std::sync::OnceLock<std::sync::Mutex<Option<(i32, i32)>>> =
+    std::sync::OnceLock::new();
+
+/// 无 Channel 模式下把当前阶段直接推给升级浮窗（仅在浮窗已存在时更新）。
+fn upd_float_stage(app: &tauri::AppHandle, stage: &str, got: u64, total: u64) {
+    use std::sync::atomic::Ordering;
+    if app.get_webview_window("fde-upd").is_none() {
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if stage == "checking" {
+        UPD_T0.store(now, Ordering::Relaxed);
+    }
+    let t0 = UPD_T0.load(Ordering::Relaxed);
+    let el = if t0 > 0 && now > t0 { now - t0 } else { 0 };
+    let pct = if total > 0 {
+        (((got as f64 / total as f64) * 100.0).min(99.0)) as u32
+    } else {
+        0
+    };
+    let ver = UPD_VER
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .unwrap_or_default();
+    fde_upd_show_impl(app, stage, pct, el, -1, &ver, got, total);
+}
+
+/// 下载阶段每秒刷新一次「已用 N 秒」，直到 `UPD_DL_TICK` 被关掉。
+/// 只在无 Channel 模式用；此时窗口已由前端建好，这里只有 eval，不涉建窗。
+fn upd_dl_tick_start(app: tauri::AppHandle) {
+    use std::sync::atomic::Ordering;
+    if UPD_DL_TICK.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    std::thread::spawn(move || {
+        while UPD_DL_TICK.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            if !UPD_DL_TICK.load(Ordering::Relaxed) {
+                break;
+            }
+            upd_float_stage(&app, "downloading", 0, 0);
+        }
+    });
+}
+
+fn upd_dl_tick_stop() {
+    UPD_DL_TICK.store(false, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// 2026-10-24：升级链路现场日志。静默升级一旦失败，前端通常只收到一句 Err，
 /// 真正卡在哪一步（预检/检查/下载/落盘/触发/轮询）无法事后查证——1.5.44「只更新
 /// latest.json 没传包 → 客户端点升级静默失败」正是缺现场日志才难定位。
-/// 写 LOCALAPPDATA\X8.IM\update.log，照抄 si_log 的 32KB 截断防无限增长。
+/// 写 LOCALAPPDATA\BangXin\update.log，照抄 si_log 的 32KB 截断防无限增长。
 #[cfg(windows)]
 fn upd_log(msg: &str) {
     use std::io::Write;
+    // 2026-10-25：双写。只写 LOCALAPPDATA 时，一旦进程跑在计划任务/提权上下文
+    // （LOCALAPPDATA 可能是 C:\ProgramData 或 systemprofile），日志就"消失"，
+    // 现场无法定位（1.5.52/1.5.58/1.5.59 三次「代码有日志、磁盘上没文件」都是这种）。
+    // 现在固定再写一份 C:\ProgramData\BangXin\update.log 作地面真值。
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
     if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        let dir = std::path::Path::new(&local).join("X8.IM");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("update.log");
+        paths.push(std::path::Path::new(&local).join("BangXin").join("update.log"));
+    }
+    paths.push(std::path::PathBuf::from(r"C:\ProgramData\BangXin\update.log"));
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    for path in paths {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
         if let Ok(md) = std::fs::metadata(&path) {
             if md.len() > 32 * 1024 {
                 let _ = std::fs::remove_file(&path);
             }
         }
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-            let secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
             let _ = writeln!(f, "[{secs}] {msg}");
         }
     }
@@ -3613,18 +3938,19 @@ async fn win_auto_update_inner(
     {
         use tauri_plugin_updater::UpdaterExt;
 
-        // ① 预检计划任务：老客户端（1.5.28 之前安装）没注册 → 直接 Err，不浪费带宽。
+        // ① 预检计划任务（2026-10-26 起**只降级不放弃**：缺失/被禁也照样下载验签，
+        //    最后一公里由 apply_patch_task() 改用提权直跑 updater-task.cmd）
         //    schtasks /Query 对不存在任务返回非 0（ERROR: The system cannot find the file specified）。
         // 2026-10-24 23:0x：日志必须写在调用**之前**——这一步正是真机挂死点，
         // 之前日志在调用之后，导致「一条日志都没有」查不出卡在哪。
         upd_log("[①] 开始预检计划任务");
-        let (code, out) =
-            win_run_capture("schtasks", &["/Query", "/TN", X8_TASK_NAME, "/FO", "LIST"]);
-        upd_log(&format!("①预检计划任务 code={code} out={out}"));
+        let ctx = task_ctx()?;
+        let (code, out) = win_run_capture("schtasks", &["/Query", "/TN", ctx.name, "/FO", "LIST"]);
+        upd_log(&format!("①预检计划任务 name={} code={code} out={out}", ctx.name));
         if code != 0 {
-            return Err(format!("自动升级组件未就绪（计划任务缺失，可能是旧版本安装），请手动更新：{out}"));
+            upd_log("①预检未通过（任务缺失/schtasks 被禁）：降级为提权直跑，继续流程");
         }
-        upd_emit(&prog, "checking", 0, 0);
+        upd_emit(&app, &prog, "checking", 0, 0);
 
         // ② 检查更新（版本比较由插件的 VersionComparator 负责，默认「大于当前版本」）
         // 2026-10-24：加 20s 超时。此前 check() 无超时，DNS/TLS 卡住即永久挂起，
@@ -3650,12 +3976,14 @@ async fn win_auto_update_inner(
         // 2026-10-23：回调改为把进度推给前端（老前端 on_event=None 时 upd_emit 空转，行为不变）；
         // 闭包要求 'static + Send，故先 clone 一份 Arc 进闭包。
         let prog_dl = prog.clone();
+        // 闭包要 'static + Send，app 也要 clone 一份；否则下面的 upd_emit(&app, ...) 会借用已 move 的值
+        let app_dl = app.clone();
         upd_log("③开始下载更新包(看门狗 900s)");
         // 2026-10-24：给下载加 900s 超时看门狗。此前 download 无任何超时，断流即永久挂起，
         // 前端小窗一直停在「正在升级」→ 用户观感「没反应、关不掉」。
         let dl = update.download(
             move |got, total| {
-                upd_emit(&prog_dl, "downloading", got as u64, total.unwrap_or(0));
+                upd_emit(&app_dl, &prog_dl, "downloading", got as u64, total.unwrap_or(0));
             },
             || {},
         );
@@ -3664,14 +3992,15 @@ async fn win_auto_update_inner(
             Err(_) => return Err("下载更新包超时（15 分钟无进展），请稍后重试或手动更新".into()),
         };
         upd_log(&format!("③下载完成 bytes={}", bytes.len()));
-        upd_emit(&prog, "downloaded", bytes.len() as u64, bytes.len() as u64);
+        upd_emit(&app, &prog, "downloaded", bytes.len() as u64, bytes.len() as u64);
 
-        // ④ 落盘 updates\：先写 .part 再改名，避免半包被 .cmd 的 X8.IM_*_x64-setup.exe
+        // ④ 落盘 updates\：先写 .part 再改名，避免半包被 .cmd 的 BangXin_*_x64-setup.exe
         //    glob 命中；顺手清掉更早的旧包（dir /b /o-d 也是最新优先，双保险）
-        let dir = win_updates_dir()?;
+        let ctx = task_ctx()?;
+    let dir = ctx.updates.clone();
         std::fs::create_dir_all(&dir).map_err(|e| format!("创建更新目录失败: {e}"))?;
-        let final_path = dir.join(format!("X8.IM_{ver}_x64-setup.exe"));
-        let part_path = dir.join(format!("X8.IM_{ver}_x64-setup.exe.part"));
+        let final_path = dir.join(format!("{}_{ver}_x64-setup.exe", ctx.prefix));
+        let part_path = dir.join(format!("{}_{ver}_x64-setup.exe.part", ctx.prefix));
         std::fs::write(&part_path, &bytes).map_err(|e| format!("写入更新包失败: {e}"))?;
         std::fs::rename(&part_path, &final_path).map_err(|e| format!("更新包就位失败: {e}"))?;
         upd_log(&format!("④更新包就位 {}", final_path.display()));
@@ -3685,7 +4014,7 @@ async fn win_auto_update_inner(
                     .file_name()
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_default();
-                if name.starts_with("X8.IM_") && name.ends_with("_x64-setup.exe") {
+                if name.starts_with(ctx.prefix) && name.ends_with("_x64-setup.exe") {
                     let _ = std::fs::remove_file(&p);
                 }
             }
@@ -3693,13 +4022,10 @@ async fn win_auto_update_inner(
         // 删掉上一轮的启动标记，保证下面轮询读到的是本次任务写的
         let _ = std::fs::remove_file(dir.join("task-started.txt"));
 
-        // ⑤ 触发计划任务（普通权限即可触发，不弹 UAC）
-        upd_emit(&prog, "installing", 0, 0);
-        let (code, out) = win_run_capture("schtasks", &["/Run", "/TN", X8_TASK_NAME]);
-        upd_log(&format!("⑤触发计划任务 code={code} out={out}"));
-        if code != 0 {
-            return Err(format!("触发自动升级任务失败: {out}"));
-        }
+        // ⑤ 触发计划任务（普通权限即可，不弹 UAC）；任务以最高权限运行安装器 /S /UPDATE /R
+        upd_emit(&app, &prog, "installing", 0, 0);
+        apply_patch_task(&ctx)?;
+        upd_log("⑤已触发补丁应用（schtasks 或提权兜底）");
 
         // ⑥ 轮询任务启动标记（.cmd 第一件事就是写 task-started.txt），最多 30s。
         //    任务一旦启动，安装器很快会 taskkill 本进程——轮询等不到「自然结束」
@@ -3715,7 +4041,7 @@ async fn win_auto_update_inner(
             .ok();
             if dir.join("task-started.txt").exists() {
                 upd_log("⑥已见 task-started.txt，安装器接管");
-                upd_emit(&prog, "started", 0, 0);
+                upd_emit(&app, &prog, "started", 0, 0);
                 return Ok(format!("installing:{ver}"));
             }
         }
@@ -3726,7 +4052,7 @@ async fn win_auto_update_inner(
 
 /// Windows 组件式静默升级（B 方案：不跑 setup.exe）。
 /// 拉 latest.json 的 portable 段 → 下载签名 zip → minisign 验签 → 落 updates\ →
-/// 触发计划任务解压覆盖 %INSTDIR% 并重拉 X8.IM。全程无安装向导，升级完自动打开，
+/// 触发计划任务解压覆盖 %INSTDIR% 并重拉邦信。全程无安装向导，升级完自动打开，
 /// 比「跑 NSIS 安装器」观感更专业、融合度更高。
 #[tauri::command]
 async fn win_patch_update(
@@ -3753,20 +4079,56 @@ async fn win_patch_update(
     }
 }
 
+// ============ 无进度通道兜底版本（2026-10-25 假进度事故修复） ============
+// 背景：上面两个命令的 on_event 是**必需**的 Channel 参数。前端 tauriChannel() 构造失败
+// （拿不到 __TAURI__.core.Channel 且 __TAURI_INTERNALS__.transformCallback 也不可用）时会传 {}，
+// IPC 参数反序列化在进入函数体**之前**就失败 → 命令体一行不执行 → update.log 连入口行都没有，
+// 前端只看到 Promise 不 resolve，表现成「进度条走完却没升级」。
+// 这里提供不带 Channel 的同名逻辑（_nc = no channel）：前端检测到通道不可用时改调它，
+// 升级照常执行，只是没有实时进度回调。
+#[tauri::command]
+fn win_patch_update_nc(app: tauri::AppHandle) -> Result<String, String> {
+    // 2026-10-26 重写：不再自带一套升级逻辑，统一转发给 updater。
+    // 同时 async → 同步（远程域下 async 命令的 IPC 会永久 pending）。
+    #[cfg(windows)]
+    {
+        updater::legacy_forward(&app, "win_patch_update_nc")
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = app;
+        Err("组件式静默升级仅 Windows 可用".into())
+    }
+}
+
+#[tauri::command]
+fn win_auto_update_nc(app: tauri::AppHandle) -> Result<String, String> {
+    // 2026-10-26 重写：统一转发给 updater（async → 同步，规避远程域 IPC pending）。
+    #[cfg(windows)]
+    {
+        updater::legacy_forward(&app, "win_auto_update_nc")
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = app;
+        Err("一键静默升级仅 Windows 可用".into())
+    }
+}
+
 #[cfg(windows)]
 async fn win_patch_update_inner(
-    _app: tauri::AppHandle,
+    app: tauri::AppHandle,
     prog: std::sync::Arc<Option<tauri::ipc::Channel<serde_json::Value>>>,
 ) -> Result<String, String> {
-    // ① 预检计划任务（与 win_auto_update 同源；缺失即老客户端，回落手动通道）
+    // ① 预检计划任务（与 win_auto_update 同源；2026-10-26 起缺失只降级、不放弃）
     upd_log("[①] 预检计划任务");
-    let (code, out) =
-        win_run_capture("schtasks", &["/Query", "/TN", X8_TASK_NAME, "/FO", "LIST"]);
-    upd_log(&format!("①预检计划任务 code={code} out={out}"));
+    let ctx = task_ctx()?;
+    let (code, out) = win_run_capture("schtasks", &["/Query", "/TN", ctx.name, "/FO", "LIST"]);
+    upd_log(&format!("①预检计划任务 name={} code={code} out={out}", ctx.name));
     if code != 0 {
-        return Err(format!("自动升级组件未就绪（计划任务缺失），请手动更新：{out}"));
+        upd_log("①预检未通过（任务缺失/schtasks 被禁）：降级为提权直跑，继续流程");
     }
-    upd_emit(&prog, "checking", 0, 0);
+    upd_emit(&app, &prog, "checking", 0, 0);
 
     // ② 拉 latest.json，取 portable 段（url + 内联 signature）；blocking 包进 spawn_blocking
     upd_log("②拉取 latest.json 取 portable 段");
@@ -3822,17 +4184,18 @@ async fn win_patch_update_inner(
     .map_err(|e| format!("下载线程异常: {e}"))?;
     let (bytes, sig, ver) = fetched?;
     upd_log(&format!("②portable ver={ver} bytes={}", bytes.len()));
-    upd_emit(&prog, "downloading", 0, 0);
+    upd_emit(&app, &prog, "downloading", 0, 0);
 
     // ③ 验签（与 tauri 同一把 minisign 公钥，杜绝传输/CDN 被篡改）
     upd_log("③minisign 验签组件包");
     verify_portable(&bytes, &sig).map_err(|e| format!("组件包验签失败: {e}"))?;
 
     // ④ 落盘 updates\（.part → rename 原子；清理更早的旧包）
-    let dir = win_updates_dir()?;
+    let ctx = task_ctx()?;
+    let dir = ctx.updates.clone();
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建更新目录失败: {e}"))?;
-    let final_path = dir.join(format!("X8.IM_{ver}_x64-portable.zip"));
-    let part_path = dir.join(format!("X8.IM_{ver}_x64-portable.zip.part"));
+    let final_path = dir.join(format!("{}_{ver}_x64-portable.zip", ctx.prefix));
+    let part_path = dir.join(format!("{}_{ver}_x64-portable.zip.part", ctx.prefix));
     std::fs::write(&part_path, &bytes).map_err(|e| format!("写入组件包失败: {e}"))?;
     std::fs::rename(&part_path, &final_path).map_err(|e| format!("组件包就位失败: {e}"))?;
     upd_log(&format!("④组件包就位 {}", final_path.display()));
@@ -3846,20 +4209,17 @@ async fn win_patch_update_inner(
                 .file_name()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_default();
-            if name.starts_with("X8.IM_") && name.ends_with("_x64-portable.zip") {
+            if name.starts_with(ctx.prefix) && name.ends_with("_x64-portable.zip") {
                 let _ = std::fs::remove_file(&p);
             }
         }
     }
     let _ = std::fs::remove_file(dir.join("task-started.txt"));
 
-    // ⑤ 触发计划任务（普通权限即可，不弹 UAC）；任务以最高权限解压覆盖 + 重拉
-    upd_emit(&prog, "installing", 0, 0);
-    let (code, out) = win_run_capture("schtasks", &["/Run", "/TN", X8_TASK_NAME]);
-    upd_log(&format!("⑤触发计划任务 code={code} out={out}"));
-    if code != 0 {
-        return Err(format!("触发自动升级任务失败: {out}"));
-    }
+        // ⑤ 触发计划任务（普通权限即可，不弹 UAC）；任务以最高权限解压覆盖 + 重拉
+        upd_emit(&app, &prog, "installing", 0, 0);
+        apply_patch_task(&ctx)?;
+        upd_log("⑤已触发补丁应用（schtasks 或提权兜底）");
 
     // ⑥ 轮询 task-started.txt（计划任务接管后即返回成功；本进程随后被 taskkill）
     for _ in 0..60 {
@@ -3868,7 +4228,7 @@ async fn win_patch_update_inner(
             .ok();
         if dir.join("task-started.txt").exists() {
             upd_log("⑥已见 task-started.txt，计划任务接管");
-            upd_emit(&prog, "started", 0, 0);
+            upd_emit(&app, &prog, "started", 0, 0);
             return Ok(format!("installing:{ver}"));
         }
     }
@@ -3877,15 +4237,84 @@ async fn win_patch_update_inner(
 }
 
 /// 用与 tauri 同一把 minisign 公钥验签组件包（portable zip）。
+///
+/// 🔴 2026-10-25 23:2x 实测根治（本机 1.6.5 客户端日志实证）：
+///   [启动自检] 发现新版 1.6.6，开始后台自主升级
+///   ③自主升级 minisign 验签
+///   [启动自检] 升级失败: 组件包验签失败: 签名解析失败: Invalid encoding in minisign data
+/// 病根：latest.json 的 signature 存的是 **.sig 文件的内容**（tauri 惯例：base64 一行），
+///       而 minisign_verify::Signature::decode 要的是 **解码后的 4 行签名原文**
+///       （untrusted comment / base64 sig / trusted comment / global sig）。
+///       把 base64 一行直接喂给 decode → 首行不是 "untrusted comment" → Invalid encoding。
+///       结果：每台机器都下载完 38MB 组件包，却在验签这一步永远失败 ⇒ 全员卡在旧版本。
+/// 修法：验签前先 base64 解码；已解码（以 untrusted comment 开头）的原样放行，两种格式通吃。
 #[cfg(windows)]
 fn verify_portable(bytes: &[u8], sig_text: &str) -> Result<(), String> {
     use minisign_verify::{PublicKey, Signature};
     const PK: &str = "RWRRYZoqpg5nAMR8xmhdtJgSX4BoGUrjrVPDm0D2gvCovnAov9tJjTo8";
     let pk = PublicKey::from_base64(PK).map_err(|e| format!("公钥解析失败: {e}"))?;
-    let sig = Signature::decode(sig_text).map_err(|e| format!("签名解析失败: {e}"))?;
+    let raw = decode_sig_text(sig_text)?;
+    let sig = Signature::decode(&raw).map_err(|e| format!("签名解析失败: {e}"))?;
     // 第三参 allow_legacy=false：仅接受标准（非 legacy）minisign 签名，与 tauri 同源
     pk.verify(bytes, &sig, false).map_err(|e| format!("验签未通过: {e}"))
 }
+
+/// 把 latest.json 的 signature 还原成 minisign 签名原文。
+/// 输入两种都接受：① .sig 文件内容（base64 一行，tauri 生成器产出）② 已解码的 4 行原文。
+#[cfg(windows)]
+fn decode_sig_text(s: &str) -> Result<String, String> {
+    let t = s.trim();
+    if t.starts_with("untrusted comment") {
+        return Ok(t.to_string());
+    }
+    let bytes = b64_decode(t).map_err(|e| format!("签名 base64 解码失败: {e}"))?;
+    String::from_utf8(bytes).map_err(|e| format!("签名不是合法 UTF-8: {e}"))
+}
+
+/// 最小 base64 解码：复用上方已有的 b64_decode（1943 行，标准字母表、带体积上限），
+/// 这里不再重复实现，避免同名冲突。
+
+// ============================================================================
+// Rust 自主升级（2026-10-25 根治「点了没反应」）
+// ----------------------------------------------------------------------------
+// 背景：此前升级触发是「远程页 → IPC invoke → 异步下载」长链路。1.5.52/58/59/60/61
+// 连续复发同一现场：前端 invoke 已发出、Rust 命令体首行 upd_log 都没写、前端
+// setInterval（3 分钟轮询 / 120 秒看门狗）全部停摆 —— 即「远程域 IPC 调用在特定
+// 条件下永久 pending」，且把前端主线程一起拖死。_nc（无 Channel）只绕开了 Channel
+// 反序列化，绕不开这个更底层的 IPC pending。
+// 根治：把「检查 + 下载 + 验签 + 落盘 + 触发计划任务」整体搬到 Rust 主进程自主执行，
+// 前端退化为纯显示器（只收 app.emit 事件画进度），升级链路不再经过任何远程页 IPC。
+// ============================================================================
+
+/// 前端确认后调用的「即返」命令：只记目标版本号并 spawn 一个独立线程执行真实升级。
+/// 命令体立刻返回 Ok（不阻塞、不下载），真实升级在后台线程自主跑，
+/// 阶段经 `x8-upd-stage` 事件推给前端。这样即使前端 JS / WebView2 抽风，升级照跑。
+// win_upd_start 已迁移到 updater 模块（同步 fn，见 updater.rs）
+
+
+/// 版本号比较：把 "1.6.3" / "1.6.10" 拆成数字段逐段比。
+/// 返回 Ordering；无法解析的段按 0 处理（"1.6.x" 之类）。
+#[cfg(windows)]
+fn cmp_ver(a: &str, b: &str) -> std::cmp::Ordering {
+    let seg = |s: &str| -> Vec<u64> {
+        s.split(|c: char| !c.is_ascii_digit())
+            .filter(|x| !x.is_empty())
+            .map(|x| x.parse::<u64>().unwrap_or(0))
+            .collect()
+    };
+    let sa = seg(a);
+    let sb = seg(b);
+    for i in 0..sa.len().max(sb.len()) {
+        let x = sa.get(i).copied().unwrap_or(0);
+        let y = sb.get(i).copied().unwrap_or(0);
+        match x.cmp(&y) {
+            std::cmp::Ordering::Equal => continue,
+            o => return o,
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
 
 fn show_main(app: &tauri::AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
@@ -3899,7 +4328,7 @@ fn show_main(app: &tauri::AppHandle) {
     // 右下角 FDE 浮窗同步收起（点浮窗 / 从托盘唤起都会走到这里）
     fde_float_close(app);
     if let Some(tray) = app.tray_by_id("x8im-tray") {
-        let _ = tray.set_tooltip(Some("X8.IM 即时通讯"));
+        let _ = tray.set_tooltip(Some("邦信即时通讯"));
         let _ = tray.set_icon(Some(tray_icon_image()));
     }
 }
@@ -3966,15 +4395,15 @@ fn wake_existing_instance_window() -> bool {
     static FOUND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     unsafe extern "system" fn cb(hwnd: HWND, _l: LPARAM) -> i32 {
-        // ⚠️ 只认主窗：标题形如 "X8.IM v1.5.38"。浮窗（fde-float 的 "X8.IM"、
-        // fde-upd 的 "X8.IM 升级中"）也含 "X8.IM"，不加 "v" 会把 320x108 的小浮窗唤出来。
+        // ⚠️ 只认主窗：标题形如 "邦信 v1.5.38"。浮窗（fde-float 的 "邦信"、
+        // fde-upd 的 "邦信升级中"）也含 "邦信"，不加 "v" 会把 320x108 的小浮窗唤出来。
         let mut buf = [0u16; 256];
         let n = unsafe { GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
         if n <= 0 {
             return 1;
         }
         let title = String::from_utf16_lossy(&buf[..n as usize]);
-        if title.contains("X8.IM v") {
+        if title.contains("邦信 v") {
             // 不看 IsWindowVisible：藏进托盘的窗口也要能还原出来（实测 ShowWindow 对隐藏窗有效）
             unsafe {
                 ShowWindow(hwnd, SW_RESTORE);
@@ -3997,7 +4426,7 @@ fn si_log(msg: &str) {
     // 「第二次双击没反应 / 反而把第一个踢死」只能靠它定位（2026-10-23 实测需要）。
     use std::io::Write;
     if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        let dir = std::path::Path::new(&local).join("X8.IM");
+        let dir = std::path::Path::new(&local).join("BangXin");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("single.log");
         if let Ok(md) = std::fs::metadata(&path) {
@@ -4108,6 +4537,19 @@ fn main() {
             upd_float_hide,
             // 2026-10-24 标题栏原生拖动（RDP/虚拟机下 IPC 延迟导致 startDragging 失效的根治）
             drag_begin,
+            // 2026-10-25 标题栏窗控加固：min/max/close/is_maximized 经 core.invoke 通道，
+            // 绕开不可靠的 .window 全局命名空间（见 win_minimize 等命令注释）
+            win_minimize,
+            win_toggle_maximize,
+            win_close,
+            win_is_maximized,
+            // 2026-10-25 升级命令的无进度通道兜底版（前端 Channel 构造失败时改调）
+            win_patch_update_nc,
+            win_auto_update_nc,
+            // 2026-10-26 重写：唯一升级入口（同步 fn）+ 稍后提醒静默。
+            // 见 updater.rs：五套并行实现已收敛成一套状态机。
+            updater::win_upd_start,
+            updater::win_upd_snooze,
             detect_wechat,
             // 2026-10-23 已读回执授权：OS 级窗口焦点，与 notify_unread 同源（四处同步）
             win_is_focused,
@@ -4124,7 +4566,7 @@ fn main() {
             //   会把先启动实例的 WebView2 数据目录整个删掉 → 先启动的立刻崩溃退出，
             //   表现为「开第二个，第一个自己没了」「双击图标一会儿有新窗口一会儿又消失」。
             //   改成只在**版本号变化**（刚升级完）时清一次：既保住升级后清缓存的目的，
-            //   又不会让同版本的重复启动互相残杀。版本戳存在 %LOCALAPPDATA%\X8.IM\ 下
+            //   又不会让同版本的重复启动互相残杀。版本戳存在 %LOCALAPPDATA%\BangXin\ 下
             //   （那是独立目录，不在被删的 com.x8fde.im 里）。
             // 仅 Windows 需要（WebView2 缓存问题）；mac/linux 的 app data 目录存登录态与配置，
             // 每启清理会导致用户每次启动被登出，故用 cfg(windows) 隔离，跟发 mac/linux 时不携带。
@@ -4132,7 +4574,7 @@ fn main() {
             {
                 let ver = app.package_info().version.to_string();
                 let base = std::env::var("LOCALAPPDATA").unwrap_or_default();
-                let stamp = std::path::Path::new(&base).join("X8.IM").join("webcache_ver.txt");
+                let stamp = std::path::Path::new(&base).join("BangXin").join("webcache_ver.txt");
                 let prev = std::fs::read_to_string(&stamp).unwrap_or_default();
                 if prev.trim() != ver {
                     if let Ok(local_data) = app.path().local_data_dir() {
@@ -4148,7 +4590,7 @@ fn main() {
                 }
             }
 
-            let open = MenuItem::with_id(app, "open", "打开 X8.IM", true, None::<&str>)?;
+            let open = MenuItem::with_id(app, "open", "打开邦信", true, None::<&str>)?;
             // 2026-10-23 托盘菜单完善（A）：加「检查更新」+ 版本只读标签 + 分隔线，与微信式托盘一致
             let check_updates = MenuItem::with_id(app, "check_updates", "检查更新", true, None::<&str>)?;
             let ver_label = MenuItem::with_id(
@@ -4159,7 +4601,7 @@ fn main() {
             let menu = Menu::with_items(app, &[&open, &check_updates, &ver_label, &sep, &quit])?;
             TrayIconBuilder::with_id("x8im-tray")
                 .icon(tray_icon_image())
-                .tooltip("X8.IM 即时通讯")
+                .tooltip("邦信即时通讯")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
@@ -4235,12 +4677,16 @@ fn main() {
             let _ = tauri::async_runtime::spawn(async {
                 let _ = assist_idle_reap().await;
             });
+            // 2026-10-26 重写：升级调度交给 updater 模块——启动 8 秒首检，之后每 15 分钟复查。
+            // 完全不经过前端 IPC，IPC 全挂也能升上去（前端点按钮只是「立刻跑一次」的加速器）。
+            #[cfg(windows)]
+            updater::spawn_scheduler(app.handle().clone());
             Ok(())
         })
         .on_window_event(|window, event| {
             // 点 ✕ 的语义分两种（2026-10-14 老8 定）：
             //   main      → 不退出，藏到托盘（IM 常规行为）
-            //   workbench → 真关闭，并把主窗 X8.IM 唤到前台（关闭 = 返回 IM）
+            //   workbench → 真关闭，并把主窗邦信唤到前台（关闭 = 返回 IM）
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
                     let _ = window.hide();
@@ -4253,7 +4699,7 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|_app, event| {
-            // 2026-10-16 老8 定「用完就 kill」的兜底：X8.IM 退出时把按需拉起的 X8Assist
+            // 2026-10-16 老8 定「用完就 kill」的兜底：邦信退出时把按需拉起的 X8Assist
             // 一并收掉。必要性：前端的空闲回收心跳随窗口/进程一起消失，若用户会话结束后
             // 没点「结束」就直接退出客户端，X8Assist 会残留（长任务无重载）。
             match event {
@@ -4261,7 +4707,7 @@ fn main() {
                 // 2026-10-19 修「窗口最小化后无法恢复」：macOS 点 Dock 图标 / LaunchServices
                 // 激活会向已运行实例发 reopen 事件，此前无人处理 → 最小化的窗口永远回不来，
                 // 用户只剩杀进程重启一条路（本机 Dock 不可见，连重启都得敲命令）。
-                // 复用托盘「打开 X8.IM」同款 show_main（show + unminimize + set_focus，
+                // 复用托盘「打开邦信」同款 show_main（show + unminimize + set_focus，
                 // 注意 show() 不会还原最小化，unminimize() 是关键一步）。
                 // Reopen 在 Tauri 2 里仅 mac 编译，故 match arm 按平台 cfg，防 Windows/Linux 构建报错。
                 #[cfg(target_os = "macos")]

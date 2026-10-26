@@ -1,6 +1,6 @@
 {
-  "productName": "X8.IM",
-  "version": "1.5.57",
+  "productName": "BangXin",
+  "version": "1.6.37",
   "identifier": "com.x8fde.im",
   "build": {
     "frontendDist": "../dist"
@@ -9,14 +9,14 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "X8.IM v1.5.57",
+        "title": "邦信 v1.6.37",
         "width": 1180,
         "height": 800,
         "minWidth": 800,
         "minHeight": 600,
         "decorations": true,
         "theme": "Dark",
-        "url": "https://im.x8fde.com/app/?v=1.5.57"
+        "url": "https://im.x8fde.com/app/?v=1.6.37"
       }
     ],
     "security": { "csp": null }
@@ -26,14 +26,15 @@
     "targets": ["nsis"],
     "icon": ["icons/icon.ico"],
     "category": "SocialNetworking",
-    "shortDescription": "X8.IM 企业即时通讯与协同办公客户端",
-    "longDescription": "X8.IM 是面向企业的一体化协同客户端，提供即时通讯、群组协作、远程协助与工作台能力。",
-    "resources": ["bin/X8Assist/**/*", "post-update.cmd"],
+    "shortDescription": "邦信 企业即时通讯与协同办公客户端",
+    "longDescription": "邦信是面向企业的一体化协同客户端，提供即时通讯、群组协作、远程协助与工作台能力。",
+    "resources": ["bin/X8Assist/**/*", "post-update.cmd", "icons/icon.ico", "elevate.exe"],
     "createUpdaterArtifacts": true,
     "windows": {
       "nsis": {
         "installMode": "perMachine",
         "installerHooks": "installer.nsh",
+        "template": "nsis/installer.nsi",
         "languages": ["SimpChinese"]
       }
     }
