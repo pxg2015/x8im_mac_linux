@@ -141,7 +141,7 @@ async fn get_rustdesk_id(app: tauri::AppHandle) -> Result<String, String> {
         .map_err(|e| format!("取 RustDesk ID 线程异常：{e}"))?
 }
 
-/// 2026-10-15 老8 点头：远程协助统一走自建 RustDesk 服务器（101.37.151.8 hbbs/hbbr，
+/// 2026-10-15 老8 点头：远程协助统一走自建 RustDesk 服务器（地址见构建期注入的 RD_SERVER，
 /// 阿里云北京），摆脱官方公共节点（美国 rs-ny）国内注册不稳导致的「设备离线/连不上」。
 /// 把 ID/中继服务器 + Key 幂等写进用户级 RustDesk2.toml（路径随平台标准位置）。
 /// 返回是否发生了写入；写入前先结束在跑的 RustDesk，防止其退出时回写旧配置。
@@ -152,10 +152,14 @@ async fn get_rustdesk_id(app: tauri::AppHandle) -> Result<String, String> {
 /// 两个目录对应两个互不相干的实例；品牌目录里才有 `X8Assist_local.toml`/`peers/`/日志）。
 /// 原实现把三键写进 `%APPDATA%\RustDesk\config\X8Assist2.toml` → 无人读取，等于从未生效；
 /// 目前能连自建服务器靠的是 `librustdesk.dll` 里**编译期注入**的地址/Key（实测 dll 内
-/// `101.37.151.8`×3、`key`×1）—— 一旦换地址/换 Key 或换到未注入的包，就会失联。
+/// 内置地址与 key 各若干处）—— 一旦换地址/换 Key 或换到未注入的包，就会失联。
 /// mac/linux 仍是官方 RustDesk（无品牌包），目录与文件名保持 `RustDesk` / `RustDesk2.toml`。
-const RD_SERVER: &str = "101.37.151.8";
-const RD_SERVER_KEY: &str = "5xK1zlfxsLIeyHGTZFdeZQF7N2tNiIqkCs4iOrdBakY=";
+// 🔴 2026-10-26：改回**构建期环境变量注入**，不再硬编码 —— mac/linux 开源构建仓
+//    （pxg2015/x8im_mac_linux，public）会把本文件原样公开，写死等于把基础设施地址外泄。
+//    RD_SERVER / RD_SERVER_KEY 由 CI 的 GitHub Secrets 或本地 _build.sh 注入；
+//    漏配 → 远程协助静默不可用（其它功能不受影响）。
+const RD_SERVER: &str = match option_env!("RD_SERVER") { Some(v) => v, None => "" };
+const RD_SERVER_KEY: &str = match option_env!("RD_SERVER_KEY") { Some(v) => v, None => "" };
 
 // 官方 RustDesk 用户级配置目录（mac/linux 用；Windows 走品牌 X8Assist 自己的目录，
 // 不经过此函数 —— 故加 not(windows) 门，避免 Windows 构建下被判死代码）。
