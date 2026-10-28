@@ -1,6 +1,6 @@
 {
   "productName": "BangXin",
-  "version": "1.6.41",
+  "version": "1.6.42",
   "identifier": "com.x8fde.im",
   "build": {
     "frontendDist": "../dist"
@@ -9,14 +9,14 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "邦信 v1.6.37",
+        "title": "邦信 v1.6.42",
         "width": 1180,
         "height": 800,
         "minWidth": 800,
         "minHeight": 600,
         "decorations": true,
         "theme": "Dark",
-        "url": "https://im.x8fde.com/app/?v=1.6.41"
+        "url": "https://im.x8fde.com/app/?v=1.6.42"
       }
     ],
     "security": { "csp": null }
