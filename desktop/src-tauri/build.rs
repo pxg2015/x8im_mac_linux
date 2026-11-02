@@ -96,6 +96,8 @@ fn main() {
             "win_is_maximized",
             // 2026-10-22 「打开着的会话最小化也不闪」：当前会话来消息时窗口已失焦也要闪托盘+弹气泡
             "away_notice",
+            // 2026-10-28 「重启邦信」点了没反应：改用自有命令自重启（不走 process 插件 ACL）
+            "x8_restart",
         ]),
     );
     if let Err(e) = tauri_build::try_build(attrs) {

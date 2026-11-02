@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-linux-self-update"
+description = "Enables the linux_self_update command without any pre-configured scope."
+commands.allow = ["linux_self_update"]
+
+[[permission]]
+identifier = "deny-linux-self-update"
+description = "Denies the linux_self_update command without any pre-configured scope."
+commands.deny = ["linux_self_update"]

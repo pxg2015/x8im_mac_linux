@@ -63,6 +63,7 @@
     "process:allow-restart",
     "allow-ext-open-window",
     "allow-ext-close-window",
-    "allow-ext-focus-window"
+    "allow-ext-focus-window",
+    "allow-x8-restart"
   ]
 }

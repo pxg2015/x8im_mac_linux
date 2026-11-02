@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-x8-restart"
+description = "Enables the x8_restart command without any pre-configured scope."
+commands.allow = ["x8_restart"]
+
+[[permission]]
+identifier = "deny-x8-restart"
+description = "Denies the x8_restart command without any pre-configured scope."
+commands.deny = ["x8_restart"]

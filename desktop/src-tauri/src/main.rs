@@ -1399,8 +1399,9 @@ async fn install_rustdesk() -> Result<String, String> {
     .map_err(|e| format!("远程协助组件安装线程异常：{e}"))?
 }
 
-/// Linux：定位系统安装的 rustdesk 可执行文件（rustdesk_path / 安装后校验共用同一判据）。
-/// 实时扫目录、不是启动时缓存，所以刚装完立刻调用也能发现。
+/// Linux：PATH 里是否已有可执行的 rustdesk（与 rustdesk_path() 同判据）。
+/// 注意这是实时扫目录、不是进程启动时的缓存，所以刚装完立刻调用也能发现。
+#[cfg(target_os = "linux")]
 /// 🩸 2026-10-26：原来只扫 PATH。实测（老8 那台 rpm 系机器）包其实已经装上、
 /// dnf 输出「已完成 / 无需任何处理」，但 GUI 会话的 PATH 里没有 /usr/bin，
 /// 判据直接判死 → 报「安装后仍未找到 rustdesk」。改为 PATH 优先 + 常见安装位置兜底。
@@ -1578,7 +1579,7 @@ fn linux_install_rustdesk() -> Result<String, String> {
         let path_env = std::env::var("PATH").unwrap_or_else(|_| "-".into());
         let hits: Vec<&str> = ["/usr/bin/rustdesk", "/usr/local/bin/rustdesk", "/usr/lib/rustdesk/rustdesk"]
             .into_iter()
-            .filter(|p| std::path::Path::new(*p).exists())
+            .filter(|p| std::path::Path::new(p).exists())
             .collect();
         let hit_txt = if hits.is_empty() { "无".to_string() } else { hits.join(",") };
         return Err(format!(
@@ -4511,10 +4512,32 @@ fn cmp_ver(a: &str, b: &str) -> std::cmp::Ordering {
 }
 
 
+/// 2026-11-02 白屏自愈：WebView2 长挂机 / 系统睡眠后渲染上下文丢失，
+/// 主窗客户区变白板（标题栏是系统画的所以照常显示）。唯一稳定恢复手段是 reload 远程页。
+/// 前端已做 token 落盘（localStorage `x8_token`）+ 冷启动静默续登（verifySavedToken），
+/// 故 reload 不丢登录。两道触发：① 睡眠检测线程发现系统睡过 → 置位；② 主窗隐藏超阈值。
+static MAIN_HIDDEN_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+static RESUME_RELOAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 主窗隐藏超过此时长（秒）再次唤起即 reload（兜底非睡眠类长挂机白屏）
+const MAIN_IDLE_RELOAD_SECS: u64 = 3600;
+
 fn show_main(app: &tauri::AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
+        // 是否需要 reload：隐藏过久 或 系统唤醒后置位
+        let need_reload = {
+            let mut g = MAIN_HIDDEN_AT.lock().unwrap();
+            let idle = match *g {
+                Some(t) => t.elapsed().as_secs() >= MAIN_IDLE_RELOAD_SECS,
+                None => false,
+            };
+            *g = None; // 消费掉，下次隐藏再记
+            idle || RESUME_RELOAD.swap(false, std::sync::atomic::Ordering::SeqCst)
+        };
         let _ = w.show();
         let _ = w.unminimize();
+        if need_reload {
+            let _ = w.eval("location.reload()");
+        }
         let _ = w.set_focus();
     }
     // 回到前台即视为已读：停掉托盘图标闪烁 + tooltip 还原 + 角标图标还原成默认 logo
@@ -4645,6 +4668,18 @@ fn enforce_single_instance() {
     use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
     use windows_sys::Win32::System::Threading::CreateMutexW;
 
+    // 2026-10-28 老8：「重启邦信」点了没反应。重启由 x8_restart 派生新进程实现，
+    // 新进程带 `--x8-restart`：此时老进程还没退完、互斥体仍被占用，若照常走下面的
+    // 「已有实例」分支，它会先唤醒老窗口再自杀，等于重启彻底落空。这里必须直接放行。
+    if std::env::args().any(|a| a == "--x8-restart") {
+        si_log("restart-child -> skip single-instance");
+        // 老进程此刻还在退出：400ms 后 app.exit(0)，最迟 1.2s 硬退兜底。
+        // 两个进程同时开 WebView2 会抢同一个用户数据目录（EBWebView）→ 新进程白屏，
+        // 所以这里先等老进程彻底让出 UDF，再往下建窗口。只影响重启路径，不拖慢正常启动。
+        std::thread::sleep(std::time::Duration::from_millis(1700));
+        return;
+    }
+
     let name: Vec<u16> = std::ffi::OsStr::new("com.x8fde.im-x8im-onlyone")
         .encode_wide()
         .chain(std::iter::once(0))
@@ -4675,6 +4710,56 @@ fn enforce_single_instance() {
     // 首个实例（或对方是僵尸）：句柄故意不关闭，进程存活期间由系统持锁。
     // （HANDLE 是 Copy 类型，无需 forget；只要不调 CloseHandle 就不会提前释放锁。）
     let _ = h;
+}
+
+/// 在应用内真正重启自己（2026-10-28 老8：「重启邦信」点了没反应）。
+///
+/// 原先前端直接调 `plugin:process|restart`（Rust 侧 `app.request_restart()` →
+/// `request_exit` → 事件循环 `Exit` → `process::restart`）。本机会话实测：点完之后
+/// `x8im.exe` 的 PID 三个半小时不变，前台只多出一条不会消失的 toast —— 请求根本没
+/// 让进程退出去，而前端 `.catch(() => {})` 把 reject 吞了，连原因都看不到。
+///
+/// 这里改成完全自控的链路，不依赖事件循环的退出握手：
+///   ① 直接 spawn 自己（继承原参数 + 追加 `--x8-restart`，新进程据此跳过单实例锁）
+///   ② 等 600ms 让新进程把窗口/WebView 建起来
+///   ③ `app.exit(0)` 正常退出；若事件循环照旧吞掉退出请求，2 秒后硬退兜底
+///
+/// 返回值只是给前端确认「命令进到函数体了」，真正成功与否看进程有没有退出。
+#[tauri::command]
+async fn x8_restart(app: tauri::AppHandle) -> Result<String, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let mut cmd = std::process::Command::new(&exe);
+    for a in std::env::args_os().skip(1) {
+        // 之前就是被 --x8-restart 拉起来的，别把旧标记复制过去（否则越滚越多）
+        if a == "--x8-restart" {
+            continue;
+        }
+        cmd.arg(a);
+    }
+    cmd.arg("--x8-restart");
+    // 脱离父进程的控制台/进程组，避免老进程退出时把新进程一起带走
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+    cmd.spawn().map_err(|e| format!("spawn: {e}"))?;
+
+    // 两个进程短暂并存：给新进程时间把 WebView2 用户数据目录接管好
+    let _ = tauri::async_runtime::spawn_blocking(|| {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+    })
+    .await;
+
+    app.exit(0);
+    // 兜底：今天这个毛病就是「退出请求发出去了但事件循环没退」，1.2 秒还没走掉就硬退
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        std::process::exit(0);
+    });
+    Ok("restarting".into())
 }
 
 fn main() {
@@ -4754,7 +4839,9 @@ fn main() {
             // 即调用；失败时前端回落到 plugin:updater|download_and_install 手动通道。
             // 四处同步见 build.rs / capabilities/remote.json / permissions/autogenerated/。
             win_auto_update,
-            win_patch_update
+            win_patch_update,
+            // 2026-10-28 应用内自重启（替代不可靠的 plugin:process|restart）
+            x8_restart
         ])
         .setup(|app| {
             // 2026-10-17 关键修复：升级后清理 WebView2 user data 目录，防止旧版本 bundle 缓存
@@ -4809,14 +4896,15 @@ fn main() {
                     // 同步调用 —— 退出时要销毁托盘（含正在响应的这个菜单对象），在 muda 的
                     // 菜单消息处理中重入，退出请求被吞掉，进程与托盘图标都留着。
                     // 改到独立线程：先让菜单回调返回、菜单关闭，再走正常退出；
-                    // 若 2 秒后仍未退（Exit 分支的 taskkill 被拖住 / 事件循环卡住），强制结束兜底。
+                    // 若 600ms 后仍未退（Exit 分支的 taskkill 被拖住 / 事件循环卡住），强制结束兜底。
+                    // 2026-10-27 老8 定：兜底 2000ms → 600ms（正常退出 <500ms 足够；2 秒纯属白等）
                     "quit" => {
                         let h = app.clone();
                         std::thread::spawn(move || {
                             std::thread::sleep(std::time::Duration::from_millis(120));
                             kill_rustdesk_procs();
                             h.exit(0);
-                            std::thread::sleep(std::time::Duration::from_millis(2000));
+                            std::thread::sleep(std::time::Duration::from_millis(600));
                             std::process::exit(0);
                         });
                     }
@@ -4878,6 +4966,31 @@ fn main() {
             // 完全不经过前端 IPC，IPC 全挂也能升上去（前端点按钮只是「立刻跑一次」的加速器）。
             #[cfg(windows)]
             updater::spawn_scheduler(app.handle().clone());
+            // 2026-11-02 白屏自愈：后台线程每 30s 探一次系统是否睡过（墙钟前进远超轮询间隔 =
+            // sleep/hibernate，Instant 不可靠故只用 SystemTime）。唤醒后置位 RESUME_RELOAD；
+            // 主窗当时正显示则立即 reload 恢复白屏，否则留给下次 show_main（托盘双击/菜单打开）。
+            // reload 走前端静默续登，不丢登录。NTP 大跳变可能误触发一次 reload，无害。
+            {
+                let h = app.handle().clone();
+                std::thread::spawn(move || {
+                    let mut last_wall = std::time::SystemTime::now();
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(30));
+                        let now_wall = std::time::SystemTime::now();
+                        if let Ok(d) = now_wall.duration_since(last_wall) {
+                            if d.as_secs() > 90 {
+                                RESUME_RELOAD.store(true, std::sync::atomic::Ordering::SeqCst);
+                                if let Some(w) = h.get_webview_window("main") {
+                                    if w.is_visible().unwrap_or(false) {
+                                        let _ = w.eval("location.reload()");
+                                    }
+                                }
+                            }
+                        }
+                        last_wall = now_wall;
+                    }
+                });
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -4887,6 +5000,8 @@ fn main() {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
                     let _ = window.hide();
+                    // 2026-11-02 白屏自愈：记下藏入托盘的时刻，show_main 据此判断是否需要 reload
+                    *MAIN_HIDDEN_AT.lock().unwrap() = Some(std::time::Instant::now());
                     api.prevent_close();
                 } else {
                     show_main(window.app_handle());
