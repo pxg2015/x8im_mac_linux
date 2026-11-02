@@ -8,7 +8,7 @@
         "minWidth": 800,
         "minHeight": 600,
         "decorations": true,
-        "url": "https://im.x8fde.com/app/?v=1.6.44"
+        "url": "https://im.x8fde.com/app/?v=1.6.45"
       }
     ]
   },
@@ -19,6 +19,11 @@
     "createUpdaterArtifacts": false,
     "macOS": {
       "minimumSystemVersion": "10.15"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": ["https://im.x8fde.com/app/latest-mac.json"]
     }
   }
 }

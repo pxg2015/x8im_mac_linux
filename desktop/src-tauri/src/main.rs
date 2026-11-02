@@ -48,6 +48,12 @@ mod updater {
     pub fn win_upd_snooze(_hours: Option<u32>) {}
 }
 
+/// macOS 静默升级（2026-11-02 恢复）：见 mac_updater.rs 头部说明。
+/// 与 Windows 的 updater 模块彻底隔离 —— 端点（latest-mac.json）、version 口径
+/// （顶层 version 归 Windows）、平台配置（tauri.macos.conf.json）三处都独立，
+/// Windows 侧一个字都不动。
+mod mac_updater;
+
 /// 内置 RustDesk 路径（bundle.resources 捆绑，安装后随包分发）
 /// - Windows: `bin/rustdesk.exe`（便携单文件）
 /// - macOS:   `bin/mac/RustDesk.app/Contents/MacOS/rustdesk`（官方 dmg 内的 app bundle，保留签名）
@@ -4795,6 +4801,9 @@ fn main() {
             install_rustdesk,
             // 2026-10-26 Linux 应用内升级（下载本架构 deb/rpm → pkexec 安装 → 自动重启）
             linux_self_update,
+            // 2026-11-02 macOS 静默升级：Rust 进程内调 tauri-plugin-updater 的原生通道
+            //（远程域下前端 async 插件命令 IPC 永久 pending，取不到 rid，故必须走 Rust 侧）
+            mac_self_update,
             open_workbench,
             // 扩展面板（2026-10-24）：小程序独立内嵌窗口单例 ext-<appId>
             ext_open_window,
@@ -4966,6 +4975,10 @@ fn main() {
             // 完全不经过前端 IPC，IPC 全挂也能升上去（前端点按钮只是「立刻跑一次」的加速器）。
             #[cfg(windows)]
             updater::spawn_scheduler(app.handle().clone());
+            // 2026-11-02 macOS：同一套静默口径（启动 60s 首检 + 15 分钟复查），
+            // 但走的是独立端点 latest-mac.json，与 Windows 的升级状态机互不干扰。
+            #[cfg(target_os = "macos")]
+            mac_updater::spawn_scheduler(app.handle().clone());
             // 2026-11-02 白屏自愈：后台线程每 30s 探一次系统是否睡过（墙钟前进远超轮询间隔 =
             // sleep/hibernate，Instant 不可靠故只用 SystemTime）。唤醒后置位 RESUME_RELOAD；
             // 主窗当时正显示则立即 reload 恢复白屏，否则留给下次 show_main（托盘双击/菜单打开）。

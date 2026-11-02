@@ -248,6 +248,21 @@ jobs:
           mkdir -p out
           ls -lh "$B/dmg" || { echo "::error::没有 dmg 目录，构建未产出安装包"; exit 1; }
           cp "$B"/dmg/*.dmg "out/X8.IM-${{ matrix.label }}.dmg"
+          # 2026-11-02 mac 静默升级：tauri-plugin-updater 的更新包格式是 .app.tar.gz
+          #（内含 .app bundle，插件按 tar 顶层条目=.app 解包后原地替换 /Applications 下的 app）。
+          # 从**修好符号链接后的最终 dmg** 里取 .app 原样打包 —— 绝不能用 ditto（会解引用链接、
+          # 丢掉 _CodeSignature），否则装上去的 RustDesk 又会崩。
+          # COPYFILE_DISABLE=1 防止 bsdtar 塞 ._AppleDouble 文件；--no-xattrs 不写扩展属性。
+          MNT=$(mktemp -d)
+          hdiutil attach "$B"/dmg/*.dmg -mountpoint "$MNT" -nobrowse -quiet
+          APP=$(find "$MNT" -maxdepth 1 -name "*.app" | head -1)
+          test -n "$APP" || { echo "::error::dmg 内未找到 .app"; exit 1; }
+          COPYFILE_DISABLE=1 tar --no-xattrs -czf "out/X8.IM-${{ matrix.label }}.app.tar.gz" \
+            -C "$MNT" "$(basename "$APP")"
+          hdiutil detach "$MNT" -quiet
+          rmdir "$MNT" 2>/dev/null || true
+          echo "updater 产物："
+          ls -lh out/*.app.tar.gz
           ls -lh out
 
       # 失败时把关键现场打出来，省得再去翻几十兆日志
@@ -262,7 +277,10 @@ jobs:
         with:
           name: x8im-macos-${{ matrix.label }}
           # ⚠️ uses 步骤不受 defaults.run.working-directory 影响，路径相对仓库根
-          path: desktop/out/*.dmg
+          # 2026-11-02：*.app.tar.gz 是 mac 静默升级的更新包（签名 .sig 在本机生成，不进 CI）
+          path: |
+            desktop/out/*.dmg
+            desktop/out/*.app.tar.gz
           if-no-files-found: error
 
       # 说明：产物不由 CI 直接回传服务器（避免把服务器密钥放进 GitHub）。
