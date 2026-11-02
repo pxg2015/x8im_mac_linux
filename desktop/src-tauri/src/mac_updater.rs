@@ -34,8 +34,7 @@
 //!   （对齐 Windows 的静默口径；替换由插件完成，权限不足时插件自己用 AppleScript 请求提权。）
 //! - 用户点「⚡ 一键升级」→ 前端调 `mac_self_update` → 立刻返回 `accepted`，真实工作在后台线程。
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::atomic::AtomicBool;
 
 /// 启动后首检延迟（秒）。给网络栈与界面留出启动时间。
 const FIRST_CHECK_SECS: u64 = 60;
@@ -91,10 +90,11 @@ fn check_and_install(app: &tauri::AppHandle) -> Result<Option<String>, String> {
         mac_log("[mac-upd] 已是最新版本");
         return Ok(None);
     };
+    let ver = update.version.clone();
     mac_log(&format!(
-        "[mac-upd] 发现新版 v{}（{} 字节），开始下载",
-        update.version,
-        update.content_length.unwrap_or(0)
+        "[mac-upd] 发现新版 v{}（{}），开始下载",
+        ver,
+        update.download_url
     ));
     // 插件内部会先 minisign 验签（pubkey 来自 tauri.conf.json 的 plugins.updater.pubkey），
     // 验签不过直接失败、绝不碰现有 app；安装时 APFS 走 renamex_np 原子交换，
@@ -116,8 +116,8 @@ fn check_and_install(app: &tauri::AppHandle) -> Result<Option<String>, String> {
         },
     ))
     .map_err(|e| format!("下载/安装失败: {e}"))?;
-    mac_log("[mac-upd] 安装完成");
-    Ok(Some(String::new()))
+    mac_log(&format!("[mac-upd] 安装完成 v{ver}"));
+    Ok(Some(ver))
 }
 
 // ---------------------------------------------------------------------------
@@ -159,6 +159,7 @@ fn restart_mac() {
 #[cfg(target_os = "macos")]
 #[tauri::command]
 pub fn mac_self_update(app: tauri::AppHandle) -> Result<String, String> {
+    use std::sync::atomic::Ordering;
     if BUSY.swap(true, Ordering::SeqCst) {
         return Ok("busy".to_string());
     }
@@ -193,6 +194,8 @@ pub fn mac_self_update(_app: tauri::AppHandle) -> Result<String, String> {
 // ---------------------------------------------------------------------------
 #[cfg(target_os = "macos")]
 pub fn spawn_scheduler(app: tauri::AppHandle) {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_secs(FIRST_CHECK_SECS));
         loop {
