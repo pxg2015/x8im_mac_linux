@@ -4803,7 +4803,7 @@ fn main() {
             linux_self_update,
             // 2026-11-02 macOS 静默升级：Rust 进程内调 tauri-plugin-updater 的原生通道
             //（远程域下前端 async 插件命令 IPC 永久 pending，取不到 rid，故必须走 Rust 侧）
-            mac_self_update,
+            mac_updater::mac_self_update,
             open_workbench,
             // 扩展面板（2026-10-24）：小程序独立内嵌窗口单例 ext-<appId>
             ext_open_window,

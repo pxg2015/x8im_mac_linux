@@ -164,7 +164,9 @@ pub fn mac_self_update(app: tauri::AppHandle) -> Result<String, String> {
         return Ok("busy".to_string());
     }
     let handle = app.clone();
-    std::thread::spawn(move || {
+    // ⚠️ 必须显式指定返回类型 ()：闭包尾是 loop{}（类型 !），Rust 2024 起 never-type
+    //    fallback 不再默认成 ()，不写就会报 dependency_on_unit_never_type_fallback。
+    std::thread::spawn::<_, ()>(move || {
         match check_and_install(&handle) {
             Ok(Some(_)) => {
                 // 已装上新版本 → 重启（进程即将退出，busy 不用复位）
@@ -196,7 +198,7 @@ pub fn mac_self_update(_app: tauri::AppHandle) -> Result<String, String> {
 pub fn spawn_scheduler(app: tauri::AppHandle) {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
-    std::thread::spawn(move || {
+    std::thread::spawn::<_, ()>(move || {
         std::thread::sleep(Duration::from_secs(FIRST_CHECK_SECS));
         loop {
             if !BUSY.load(Ordering::SeqCst) {
