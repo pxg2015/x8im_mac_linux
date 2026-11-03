@@ -4668,6 +4668,26 @@ fn si_log(msg: &str) {
     }
 }
 
+// 2026-11-03 修稳 in-app 重启：判断「被 --x8-restart 拉起的新进程」要等的上一代老进程
+// 是否还活着。用 OpenProcess(SYNCHRONIZE) + WaitForSingleObject(0) 轮询，不靠盲等固定毫秒。
+// 打不开句柄（已退出 / 无权限）一律视为已释放，避免卡死。
+#[cfg(target_os = "windows")]
+fn x8_parent_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    unsafe {
+        let h = OpenProcess(SYNCHRONIZE, 0, pid);
+        if h.is_null() {
+            return false;
+        }
+        let r = WaitForSingleObject(h, 0);
+        let exited = r == 0; // WAIT_OBJECT_0
+        CloseHandle(h);
+        !exited
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn enforce_single_instance() {
     use std::os::windows::ffi::OsStrExt;
@@ -4682,7 +4702,22 @@ fn enforce_single_instance() {
         // 老进程此刻还在退出：400ms 后 app.exit(0)，最迟 1.2s 硬退兜底。
         // 两个进程同时开 WebView2 会抢同一个用户数据目录（EBWebView）→ 新进程白屏，
         // 所以这里先等老进程彻底让出 UDF，再往下建窗口。只影响重启路径，不拖慢正常启动。
-        std::thread::sleep(std::time::Duration::from_millis(1700));
+        // 2026-11-03 修稳：原来盲等 1700ms，负载高时老进程还没退完 → 抢锁失败 → 新进程
+        // 起不来（表现就是「重启没反应」）。改为按 --x8-parent 传来的老进程 PID 轮询，
+        // 确认它真的退出再继续；拿不到 PID 才退化为固定 2.5s 等待。
+        let parent_pid = std::env::args()
+            .find_map(|a| a.strip_prefix("--x8-parent=").and_then(|s| s.parse::<u32>().ok()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            let alive = parent_pid.map(|p| x8_parent_alive(p)).unwrap_or(true);
+            if !alive {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
         return;
     }
 
@@ -4736,13 +4771,17 @@ async fn x8_restart(app: tauri::AppHandle) -> Result<String, String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let mut cmd = std::process::Command::new(&exe);
     for a in std::env::args_os().skip(1) {
-        // 之前就是被 --x8-restart 拉起来的，别把旧标记复制过去（否则越滚越多）
-        if a == "--x8-restart" {
+        // 之前就是被 --x8-restart 拉起来的，别把旧标记复制过去（否则越滚越多）；
+        // --x8-parent 同理（只给一次，指向上一代老进程），避免 PID 链越滚越长。
+        let s = a.to_string_lossy();
+        if s == "--x8-restart" || s.starts_with("--x8-parent=") {
             continue;
         }
         cmd.arg(a);
     }
     cmd.arg("--x8-restart");
+    // 把当前（老）进程 PID 传给子进程，让它精确等到本进程退出再建窗，根治 WebView2 抢锁。
+    cmd.arg(format!("--x8-parent={}", std::process::id()));
     // 脱离父进程的控制台/进程组，避免老进程退出时把新进程一起带走
     #[cfg(target_os = "windows")]
     {
@@ -4865,11 +4904,15 @@ fn main() {
             // 每启清理会导致用户每次启动被登出，故用 cfg(windows) 隔离，跟发 mac/linux 时不携带。
             #[cfg(target_os = "windows")]
             {
+                // 2026-11-03 修稳 in-app 重启：重启路径（--x8-restart）强制清一次
+                // WebView2 user data 目录，保证换版后拉到的是全新 /app/ 而非磁盘缓存的旧界面
+                // （版本没变时下面的版本门槛不会触发清理，导致重启完还是旧版）。
+                let is_restart = std::env::args().any(|a| a == "--x8-restart");
                 let ver = app.package_info().version.to_string();
                 let base = std::env::var("LOCALAPPDATA").unwrap_or_default();
                 let stamp = std::path::Path::new(&base).join("BangXin").join("webcache_ver.txt");
                 let prev = std::fs::read_to_string(&stamp).unwrap_or_default();
-                if prev.trim() != ver {
+                if prev.trim() != ver || is_restart {
                     if let Ok(local_data) = app.path().local_data_dir() {
                         let _ = std::fs::remove_dir_all(&local_data);
                     }

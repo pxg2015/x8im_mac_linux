@@ -118,5 +118,9 @@ fn main() {
     {
         println!("cargo:rustc-link-arg=E:/AI/X8_Im/x8im/desktop/src-tauri/nanosleep64_shim.o");
         println!("cargo:rustc-link-arg=-l:libpthread.a");
+        // 2026-11-03：w64devkit(gcc 16.2) 的 libpthread.a 现已自带 nanosleep64 强符号，
+        // 与上方垫片强定义撞车（multiple definition）。两者实现完全相同（均转调 nanosleep），
+        // 故容让重复定义、由链接器取首个（垫片）即可，行为无差；原补丁保留不动。
+        println!("cargo:rustc-link-arg=-Wl,--allow-multiple-definition");
     }
 }
