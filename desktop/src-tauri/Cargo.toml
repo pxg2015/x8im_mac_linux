@@ -34,6 +34,8 @@ indexmap = { version = "1.9", features = ["std"] }
 # 2026-10-23 托盘亮色图标：编译期内嵌 icons/tray.png，需解码 PNG→RGBA 供 Image::new_owned。
 # 只开 png feature，避免把 jpeg/webp 等解码器全拉进来。
 image = { version = "0.25", default-features = false, features = ["png"] }
+# 2026-11-03 三端单实例：mac/linux 用 Unix 域套接字作锁+唤醒通道，需 getuid()/kill(pid,0)
+libc = "0.2"
 
 # 2026-10-16 老8 诉求：X8Assist 主窗口（你的桌面/控制远程桌面）不要盖在 X8.IM 上。
 # 方案 = 启动后 EnumWindows 找 X8Assist 的可见窗口 ShowWindow(SW_HIDE)。

@@ -4688,6 +4688,125 @@ fn x8_parent_alive(pid: u32) -> bool {
     }
 }
 
+// ── macOS / Linux 单实例管控（2026-11-03 老8：三端都只能跑一个邦信）──
+// 思路与 Windows 版一致：先上锁 → 已有实例就唤醒主窗并自杀，唤不到（僵尸）就抢占。
+// 用 Unix 域套接字同时充当「锁」+「唤醒通道」：首实例 bind 成功即持锁并监听；
+// 第二个实例 bind 失败（EADDRINUSE）→ connect 发 1 字节 → 首实例聚焦主窗 → 自己 exit(0)；
+// 若 connect 也失败（死进程残留的孤儿 sock）→ 删文件抢占。进程退出后 OS 回收监听，
+// 孤儿 sock 文件由下次启动的「connect 失败→删→重绑」自愈。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+static APP_HANDLE: std::sync::Mutex<Option<tauri::AppHandle>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn focus_main(app: &tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.unminimize();
+        let _ = w.show();
+        let _ = w.set_focus();
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn enforce_single_instance() {
+    // 应用内重启：跳过锁，等老进程退出再继续（否则新进程会被自己的锁挡死，重启失效）
+    if std::env::args().any(|a| a == "--x8-restart") {
+        si_log("restart-child -> skip single-instance");
+        let parent_pid = std::env::args()
+            .find_map(|a| a.strip_prefix("--x8-parent=").and_then(|s| s.parse::<i32>().ok()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            let alive = parent_pid.map(|p| x8_parent_alive(p)).unwrap_or(true);
+            if !alive {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+        return;
+    }
+
+    // 每用户隔离：优先 XDG_RUNTIME_DIR（Linux 每用户）/ TMPDIR（mac 每用户），
+    // 回落 /tmp 时拼 uid 防多用户互锁。
+    let uid = unsafe { libc::getuid() };
+    let runtime = std::env::var("XDG_RUNTIME_DIR")
+        .or_else(|_| std::env::var("TMPDIR"))
+        .unwrap_or_else(|_| "/tmp".to_string());
+    let path = std::path::Path::new(&runtime)
+        .join(format!("com.x8fde.im-onlyone-{uid}.sock"));
+
+    match std::os::unix::net::UnixListener::bind(&path) {
+        Ok(listener) => {
+            si_log("first instance, lock acquired");
+            std::thread::spawn(move || {
+                for conn in listener.incoming() {
+                    if conn.is_ok() {
+                        if let Some(app) = APP_HANDLE.lock().unwrap().as_ref() {
+                            focus_main(app);
+                        }
+                    }
+                }
+            });
+        }
+        // 套接字文件已存在：可能是活实例，也可能是死进程残留
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            // 连得上=活实例→聚焦后自杀；连不上=僵尸残留→抢占
+            if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+                si_log("already-exists woken -> exit(0)");
+                std::process::exit(0);
+            }
+            let _ = std::fs::remove_file(&path);
+            match std::os::unix::net::UnixListener::bind(&path) {
+                Ok(listener) => {
+                    si_log("stale socket taken over");
+                    std::thread::spawn(move || {
+                        for conn in listener.incoming() {
+                            if conn.is_ok() {
+                                if let Some(app) = APP_HANDLE.lock().unwrap().as_ref() {
+                                    focus_main(app);
+                                }
+                            }
+                        }
+                    });
+                }
+                Err(_) => si_log("bind retry failed -> continue (allow start)"),
+            }
+        }
+        Err(_) => si_log("bind error -> continue (allow start)"),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn x8_parent_alive(pid: i32) -> bool {
+    // kill(pid, 0)：返回 0=进程存在，ESRCH=已退出（无权限亦非 0，按「已释放」处理）
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn si_log(msg: &str) {
+    use std::io::Write;
+    let runtime = std::env::var("XDG_RUNTIME_DIR")
+        .or_else(|_| std::env::var("TMPDIR"))
+        .unwrap_or_else(|_| "/tmp".to_string());
+    let dir = std::path::Path::new(&runtime);
+    let _ = std::fs::create_dir_all(dir);
+    let path = dir.join("com.x8fde.im-single.log");
+    if let Ok(md) = std::fs::metadata(&path) {
+        if md.len() > 32 * 1024 {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(f, "[{secs}] {msg}");
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn enforce_single_instance() {
     use std::os::windows::ffi::OsStrExt;
@@ -4813,6 +4932,9 @@ fn main() {
     #[cfg(target_os = "windows")]
     enforce_single_instance();
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    enforce_single_instance();
+
     #[cfg(target_os = "linux")]
     linux_configure_webkit();
 
@@ -4924,6 +5046,12 @@ fn main() {
                     }
                     let _ = std::fs::write(&stamp, &ver);
                 }
+            }
+
+            // 2026-11-03 单实例唤醒：把 AppHandle 存进全局，供 mac/linux 监听线程聚焦主窗
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                let _ = APP_HANDLE.lock().unwrap().replace(app.handle().clone());
             }
 
             let open = MenuItem::with_id(app, "open", "打开邦信", true, None::<&str>)?;
