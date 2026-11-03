@@ -1,6 +1,6 @@
 {
   "productName": "BangXin",
-  "version": "1.6.47",
+  "version": "1.6.48",
   "identifier": "com.x8fde.im",
   "build": {
     "frontendDist": "../dist"
@@ -9,7 +9,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "邦信 v1.6.47",
+        "title": "邦信 v1.6.48",
         "width": 1180,
         "height": 800,
         "minWidth": 800,
