@@ -1611,6 +1611,12 @@ async fn linux_self_update(app: tauri::AppHandle) -> Result<String, String> {
     }
     #[cfg(target_os = "linux")]
     {
+        // 2026-11-04：AppImage 版改走 tauri-plugin-updater 静默通道（插件按 APPIMAGE
+        // 环境变量定位待替换文件，下载 .AppImage.tar.gz → 验签 → 原地替换 → 重启）。
+        // 不弹 pkexec、不需要用户输密码；deb/rpm 仍走下面那条包管理器路径。
+        if std::env::var_os("APPIMAGE").is_some() {
+            return crate::mac_updater::mac_self_update(app.clone());
+        }
         let _ = app;
         // tauri 2 的 spawn_blocking 返回 JoinHandle<Result<T, tauri::Error>>（1.6.39 首轮 CI 实测：
         // 直接 .await 得到 Result<Result<String,String>, tauri::Error>，mismatched types）。

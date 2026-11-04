@@ -172,7 +172,24 @@ jobs:
           ls -lh "$B/deb" "$B/rpm" || true
           cp "$B"/deb/*.deb "out/X8.IM-linux${{ matrix.suffix }}.deb"
           cp "$B"/rpm/*.rpm "out/X8.IM-linux${{ matrix.suffix }}.rpm"
-          [ -f "$B"/appimage/*.AppImage ] && cp "$B"/appimage/*.AppImage "out/X8.IM-linux${{ matrix.suffix }}.AppImage" || echo "::warning::AppImage 未生成，跳过"
+          AI="out/X8.IM-linux${{ matrix.suffix }}.AppImage"
+          if compgen -G "$B/appimage/*.AppImage" >/dev/null; then
+            cp "$B"/appimage/*.AppImage "$AI"
+          else
+            echo "::warning::AppImage 未生成，跳过"
+          fi
+          # 2026-11-04 Linux 静默升级：tauri-plugin-updater 在 Linux 上认的更新包是
+          # **内含 .AppImage 条目的 tar.gz**（插件解 gz → 遍历 tar 找第一个扩展名 .AppImage
+          # 的条目 → 直接写回 APPIMAGE 环境变量指向的文件，失败自动回滚备份）。
+          # 为什么不开 createUpdaterArtifacts: true：那要求 CI 注入 TAURI_SIGNING_PRIVATE_KEY，
+          # 与 mac 一致「私钥绝不进 CI」，签名统一在本机 `tauri signer sign` 做，
+          # .sig 只在上传后写 latest.json 时用得到。
+          if [ -f "$AI" ]; then
+            cp "$AI" out/BangXin.AppImage
+            tar -czf "out/X8.IM-linux${{ matrix.suffix }}.AppImage.tar.gz" -C out BangXin.AppImage
+            rm -f out/BangXin.AppImage
+            ls -lh "out/X8.IM-linux${{ matrix.suffix }}.AppImage.tar.gz"
+          fi
           ls -lh out
 
       # 失败时把关键现场打出来，省得再去翻几十兆日志
