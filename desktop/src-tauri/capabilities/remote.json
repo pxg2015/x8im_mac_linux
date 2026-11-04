@@ -34,6 +34,8 @@
     "allow-install-rustdesk",
     "allow-linux-self-update",
     "allow-mac-self-update",
+    "allow-mac-upd-status",
+    "allow-mac-upd-snooze",
     "allow-open-workbench",
     "allow-open-in-browser",
     "allow-download-file",

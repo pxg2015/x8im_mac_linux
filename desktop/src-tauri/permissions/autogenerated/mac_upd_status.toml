@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-mac-upd-status"
+description = "Enables the mac_upd_status command without any pre-configured scope."
+commands.allow = ["mac_upd_status"]
+
+[[permission]]
+identifier = "deny-mac-upd-status"
+description = "Denies the mac_upd_status command without any pre-configured scope."
+commands.deny = ["mac_upd_status"]

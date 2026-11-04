@@ -4971,6 +4971,10 @@ fn main() {
             // 2026-11-02 macOS 静默升级：Rust 进程内调 tauri-plugin-updater 的原生通道
             //（远程域下前端 async 插件命令 IPC 永久 pending，取不到 rid，故必须走 Rust 侧）
             mac_updater::mac_self_update,
+            // 2026-11-04 老8「升级前要在 im 内提示、可取消、有进度」：
+            // 状态轮询（同步即返）+ 稍后提醒（落盘冷藏）。三端同名同签名，见 mac_updater.rs。
+            mac_updater::mac_upd_status,
+            mac_updater::mac_upd_snooze,
             open_workbench,
             // 扩展面板（2026-10-24）：小程序独立内嵌窗口单例 ext-<appId>
             ext_open_window,
