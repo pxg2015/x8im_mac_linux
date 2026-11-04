@@ -5014,6 +5014,10 @@ fn main() {
             x8_restart
         ])
         .setup(|app| {
+            // 2026-11-04 回退：主窗口恢复为 tauri.conf.json 配置创建（additionalBrowserArgs
+            // 改在 config 注入）。上一轮在此用 WebviewWindowBuilder 代码创建窗口，触发首帧导航
+            // 竞态 → 升级后白屏（#app 为空，刷新才好）。config 创建由 Tauri 在 WebView2 环境
+            // 就绪后才导航，渲染稳定（1.6.49 验证过）。
             // 2026-10-17 关键修复：升级后清理 WebView2 user data 目录，防止旧版本 bundle 缓存
             // 导致新安装/升级后仍报 `async is not defined` 白屏。identifier = com.x8fde.im。
             // ⚠️ 2026-10-23 重大修正：原实现**每次启动都删**。两个实例并存时，后启动的那个
@@ -5035,17 +5039,32 @@ fn main() {
                 let stamp = std::path::Path::new(&base).join("BangXin").join("webcache_ver.txt");
                 let prev = std::fs::read_to_string(&stamp).unwrap_or_default();
                 if prev.trim() != ver || is_restart {
-                    if let Ok(local_data) = app.path().local_data_dir() {
-                        let _ = std::fs::remove_dir_all(&local_data);
-                    }
-                    if let Ok(roaming_data) = app.path().app_data_dir() {
-                        let _ = std::fs::remove_dir_all(&roaming_data);
-                    }
+                    // 2026-11-04 修：彻底移除 WebView2 用户数据目录清理。
+                    // 历史无论「整目录 remove_dir_all」还是「只删缓存子目录」，都会让 Chromium
+                    // 在下次启动时判定 profile 损坏而重建整个 profile，连 Local Storage 里的
+                    // x8_token 一起清掉 → 升级/重启后必重新扫码（用户反复反馈的根因）。
+                    // 现 index.html 是 no-cache、JS 文件名带 contenthash、?v= 每次发版变化，
+                    // 旧 bundle 缓存不可能命中，无需清缓存即可避免白屏。清理整体移除。
+                    // 仅保留版本戳（供其它逻辑判断，不再触发任何删除）。
                     if let Some(dir) = stamp.parent() {
                         let _ = std::fs::create_dir_all(dir);
                     }
                     let _ = std::fs::write(&stamp, &ver);
                 }
+            }
+
+            // 2026-11-04 兜底：冷启动首屏若因慢加载空白，15s 后自动 reload 一次（等价于手动「刷新」）。
+            // 与 web 看门狗共用 sessionStorage 闸门 'x8_blank_reload'，避免重复刷新。web 侧已部署
+            // 自动恢复；此处作为客户端兜底，即使远端页面未更新也能自愈白屏。
+            #[cfg(target_os = "windows")]
+            {
+                let h = app.handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(15));
+                    if let Some(w) = h.get_webview_window("main") {
+                        let _ = w.eval("(function(){var k='x8_blank_reload';if(sessionStorage.getItem(k))return;var a=document.getElementById('app');if(a&&a.children.length===0){sessionStorage.setItem(k,'1');location.reload();}})();");
+                    }
+                });
             }
 
             // 2026-11-03 单实例唤醒：把 AppHandle 存进全局，供 mac/linux 监听线程聚焦主窗
