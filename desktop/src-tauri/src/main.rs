@@ -2188,7 +2188,22 @@ fn sanitize_filename(name: &str) -> String {
 /// 字符串一次过桥虽然多占 1/3 体积，但可控且不会卡死。
 /// 落盘走「.part → rename」原子写，与 download_file 同款，目录里不会出现半截文件。
 #[tauri::command]
-async fn save_bytes(name: String, b64: String) -> Result<String, String> {
+async fn save_bytes(name: String, b64: String, subdir: Option<String>) -> Result<String, String> {
+    // 2026-11-05 收即落盘：subdir 非空时落到「下载目录/子目录」（如 downfiles），
+    // 否则仍落下载目录根（向后兼容中转文件「打开/下载」旧调用，不传 subdir）。
+    // 子目录名做防穿越：剔除路径分隔符、拒绝 "." / ".." 整段，join 必在 downloads 之下。
+    let downloads = downloads_dir();
+    let dir: std::path::PathBuf = match &subdir {
+        Some(sd) => {
+            let cleaned: String = sd.chars().filter(|c| !matches!(c, '/' | '\\')).collect();
+            if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+                downloads.clone()
+            } else {
+                downloads.join(cleaned)
+            }
+        }
+        None => downloads.clone(),
+    };
     // 2026-10-24 P2-RS-1：base64 解码 + 写盘都是阻塞 CPU/IO，跑在 async 体里会占住 tokio worker
     //（几十 MB 解码可达数百 ms）——整段移入 spawn_blocking，与 download_file 一致。
     let result = tauri::async_runtime::spawn_blocking(move || {
@@ -2196,11 +2211,10 @@ async fn save_bytes(name: String, b64: String) -> Result<String, String> {
     if bytes.is_empty() {
         return Err("文件内容为空".into());
     }
-    let downloads = downloads_dir();
-    std::fs::create_dir_all(&downloads).map_err(|e| format!("无法创建下载目录：{}", e))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("无法创建下载目录：{}", e))?;
     let safe = sanitize_filename(&name);
-    let dest = downloads.join(&safe);
-    let tmp = downloads.join(format!("{}.{}.part", safe, std::process::id()));
+    let dest = dir.join(&safe);
+    let tmp = dir.join(format!("{}.{}.part", safe, std::process::id()));
     std::fs::write(&tmp, &bytes).map_err(|e| format!("写盘失败：{}", e))?;
     #[cfg(windows)]
     {
