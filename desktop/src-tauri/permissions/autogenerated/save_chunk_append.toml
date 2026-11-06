@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-save-chunk-append"
+description = "Enables the save_chunk_append command without any pre-configured scope."
+commands.allow = ["save_chunk_append"]
+
+[[permission]]
+identifier = "deny-save-chunk-append"
+description = "Denies the save_chunk_append command without any pre-configured scope."
+commands.deny = ["save_chunk_append"]

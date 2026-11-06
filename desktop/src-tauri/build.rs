@@ -56,6 +56,10 @@ fn main() {
             // 桌面端聊天文件下载落盘：带 Bearer 调系统 curl 拉私有文件（WebView <a download> 不生效）
             "download_file",
             "save_bytes",
+            // 2026-11-06 分块落盘（大文件绕开单次 base64 过 IPC 的上限）
+            "save_chunk_begin",
+            "save_chunk_append",
+            "save_chunk_end",
             // 2026-10-23 截屏：唤系统截图（ms-screenclip）→ 读剪贴板 → PNG base64 回前端
             "screen_clip_grab",
             // 2026-10-16 老8 定（按需启动 / 不用就 kill）：空闲回收本机 X8Assist
@@ -106,6 +110,12 @@ fn main() {
             "away_notice",
             // 2026-10-28 「重启邦信」点了没反应：改用自有命令自重启（不走 process 插件 ACL）
             "x8_restart",
+            // 2026-11-05 换版导航收归宿主（页面 location.replace 在 WebView2 里不可靠）
+            "x8_nav",
+            // 2026-11-05 登录凭据宿主侧留底（升级后免扫码自动登录）
+            "x8_auth_save",
+            "x8_auth_load",
+            "x8_auth_clear",
         ]),
     );
     if let Err(e) = tauri_build::try_build(attrs) {

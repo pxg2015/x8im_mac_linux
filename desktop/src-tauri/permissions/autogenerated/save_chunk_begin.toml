@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-save-chunk-begin"
+description = "Enables the save_chunk_begin command without any pre-configured scope."
+commands.allow = ["save_chunk_begin"]
+
+[[permission]]
+identifier = "deny-save-chunk-begin"
+description = "Denies the save_chunk_begin command without any pre-configured scope."
+commands.deny = ["save_chunk_begin"]

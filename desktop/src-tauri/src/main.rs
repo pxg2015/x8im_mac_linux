@@ -2138,6 +2138,556 @@ const SAFE_OPEN_EXT: &[&str] = &[
     "json", "xml",
 ];
 
+// ==================== 本地落盘 HTTP 服务（2026-11-06） ====================
+// 起因：P2P 收到的 152.9MB 文件在桌面端点「打开/保存」时永远卡在「分块写入中…」。
+// 实测证据：`%USERPROFILE%\Downloads\downfiles` 从未被创建、磁盘上无任何 `.part` 残留，
+// 说明前端 `invoke` 连**几百字节**的 `save_chunk_begin` 都没送达 Rust —— WebView2 的
+// IPC（postMessage 桥）在本机表现就是「发了没回」，Promise 永挂，不是 payload 大小问题。
+//
+// 处置：不再经过 IPC 传二进制。Rust 在 127.0.0.1 起一个极简 HTTP 服务，前端 `XHR` 直接
+// POST Blob（Chromium 把 127.0.0.1 视为可信来源，https 页面请求不触发 mixed-content 拦截），
+// 后端按 Content-Length 流式写盘，内存占用与文件大小无关。
+//
+// 约束：
+//   · 只监听回环，不对外
+//   · 落盘目录仍走 save_target_dir（防穿越），文件名仍走 sanitize_filename
+//   · 只接受 im.x8fde.com / tauri 外壳来源（Origin 校验），空 Origin（本机直连）放行
+const SAVE_HTTP_PORTS: std::ops::Range<u16> = 47615..47625;
+
+/// 启动本地落盘服务（幂等：绑定失败说明端口被占，换下一个；全占则直接放弃，
+/// 前端探测不到会自动退回 IPC / 浏览器下载）。
+fn save_http_start() {
+    std::thread::spawn(|| {
+        let mut bound: Option<std::net::TcpListener> = None;
+        for port in SAVE_HTTP_PORTS {
+            if let Ok(l) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+                bound = Some(l);
+                break;
+            }
+        }
+        let listener = match bound {
+            Some(l) => l,
+            None => return,
+        };
+        for conn in listener.incoming() {
+            if let Ok(stream) = conn {
+                std::thread::spawn(move || {
+                    let _ = save_http_handle(stream);
+                });
+            }
+        }
+    });
+}
+
+/// 查询参数百分号解码（文件名/subdir 用；+ 视为空格）
+fn pct_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hi = (b[i + 1] as char).to_digit(16);
+            let lo = (b[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(if b[i] == b'+' { b' ' } else { b[i] });
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+fn save_http_cors(origin: &str) -> String {
+    let allow = if origin.contains("im.x8fde.com")
+        || origin.contains("tauri.localhost")
+        || origin.contains("localhost")
+        || origin.is_empty()
+    {
+        if origin.is_empty() { "*".to_string() } else { origin.to_string() }
+    } else {
+        "null".to_string()
+    };
+    format!(
+        "Access-Control-Allow-Origin: {}\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nAccess-Control-Allow-Private-Network: true\r\nAccess-Control-Max-Age: 86400\r\n",
+        allow
+    )
+}
+
+fn save_http_reply(
+    s: &mut std::net::TcpStream,
+    code: u16,
+    cors: &str,
+    body: &str,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let reason = match code {
+        200 => "OK",
+        204 => "No Content",
+        400 => "Bad Request",
+        403 => "Forbidden",
+        404 => "Not Found",
+        500 => "Internal Server Error",
+        _ => "OK",
+    };
+    let msg = format!(
+        "HTTP/1.1 {} {}\r\n{}Content-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        code,
+        reason,
+        cors,
+        body.as_bytes().len(),
+        body
+    );
+    s.write_all(msg.as_bytes())?;
+    s.flush()
+}
+
+fn save_http_handle(mut s: std::net::TcpStream) -> std::io::Result<()> {
+    use std::io::{Read, Write};
+    s.set_read_timeout(Some(std::time::Duration::from_secs(1800)))?;
+
+    // 1) 读请求头（到 \r\n\r\n 为止），已读到的多余字节属于 body 开头
+    let mut head: Vec<u8> = Vec::with_capacity(4096);
+    let mut tmp = [0u8; 4096];
+    let hdr_end = loop {
+        if let Some(p) = head.windows(4).position(|w| w == b"\r\n\r\n") {
+            break p;
+        }
+        let n = s.read(&mut tmp)?;
+        if n == 0 {
+            return Ok(());
+        }
+        head.extend_from_slice(&tmp[..n]);
+        if head.len() > 256 * 1024 {
+            let cors = save_http_cors("");
+            return save_http_reply(&mut s, 400, &cors, "{\"ok\":false,\"error\":\"head_too_large\"}");
+        }
+    };
+    let head_str = String::from_utf8_lossy(&head[..hdr_end]).to_string();
+    let pre_body = head[hdr_end + 4..].to_vec();
+
+    let mut lines = head_str.split("\r\n");
+    let req_line = lines.next().unwrap_or("").to_string();
+    let rp: Vec<&str> = req_line.split(' ').collect();
+    let method = rp.first().copied().unwrap_or("").to_string();
+    let target = rp.get(1).copied().unwrap_or("/").to_string();
+
+    let mut clen: usize = 0;
+    let mut origin = String::new();
+    for l in lines {
+        let low = l.to_ascii_lowercase();
+        if let Some(v) = low.strip_prefix("content-length:") {
+            clen = v.trim().parse().unwrap_or(0);
+        } else if let Some(v) = low.strip_prefix("origin:") {
+            origin = v.trim().to_string();
+        }
+    }
+
+    let cors = save_http_cors(&origin);
+    if origin.contains("im.x8fde.com")
+        || origin.contains("tauri.localhost")
+        || origin.contains("localhost")
+        || origin.is_empty()
+    {
+        // 放行
+    } else {
+        return save_http_reply(&mut s, 403, &cors, "{\"ok\":false,\"error\":\"bad_origin\"}");
+    }
+
+    if method == "OPTIONS" {
+        return save_http_reply(&mut s, 204, &cors, "");
+    }
+
+    let (path_only, query) = match target.split_once('?') {
+        Some((p, q)) => (p.to_string(), q.to_string()),
+        None => (target.clone(), String::new()),
+    };
+
+    if path_only == "/ping" {
+        let body = format!("{{\"ok\":true,\"svc\":\"x8save\",\"pid\":{}}}", std::process::id());
+        return save_http_reply(&mut s, 200, &cors, &body);
+    }
+
+    // GET /pick?accept=image/* —— 系统文件选择框（2026-11-06）
+    // 为什么要 Rust 来弹：`<input type="file">` 在 WebView2 下**拿不到绝对路径**，
+    // 发送方就永远没法「定位到源目录」，只能把文件再落一份到 downfiles 里凑合（老8 否掉）。
+    // 这里只回路径，字节由前端再走 /readfile 取；任何失败都返回 ok:false，前端回退旧文件框。
+    if path_only == "/pick" && method == "GET" {
+        #[cfg(windows)]
+        {
+            let mut want_img = false;
+            for kv in query.split('&') {
+                if let Some((k, v)) = kv.split_once('=') {
+                    if k == "accept" && pct_decode(v).starts_with("image") {
+                        want_img = true;
+                    }
+                }
+            }
+            let filter = if want_img {
+                "$d.Filter='图片|*.png;*.jpg;*.jpeg;*.gif;*.webp;*.bmp'"
+            } else {
+                "$d.Filter='所有文件|*.*'"
+            };
+            // 输出一律 base64 单行：PowerShell 5.1 的 stdout 是 OEM 代码页，中文路径直接读会乱码。
+            // 给对话框挂一个不可见的 TopMost 宿主窗口：没有 owner 时对话框可能被邦信主窗口挡住，
+            // 用户就会以为「点了没反应」—— 这也是今天反复踩的同一类坑。
+            let script = format!(
+                "Add-Type -AssemblyName System.Windows.Forms|Out-Null;\
+                 $d=New-Object System.Windows.Forms.OpenFileDialog;\
+                 $d.Multiselect=$true;$d.CheckFileExists=$true;{};\
+                 $d.Title='邦信 - 选择要发送的文件';\
+                 $w=New-Object System.Windows.Forms.Form;\
+                 $w.TopMost=$true;$w.ShowInTaskbar=$false;$w.Opacity=0;$w.Width=1;$w.Height=1;\
+                 $w.StartPosition='CenterScreen';$w.Show()|Out-Null;\
+                 $r=$d.ShowDialog($w);$w.Close();\
+                 if($r -eq 'OK'){{foreach($f in $d.FileNames){{$i=Get-Item $f;\"$([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($f)))|$($i.Length)\"}}}}",
+                filter
+            );
+            let out = Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-STA",
+                    "-NonInteractive",
+                    "-WindowStyle",
+                    "Hidden",
+                    "-Command",
+                    &script,
+                ])
+                .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+                .output();
+            match out {
+                Ok(o) => {
+                    let txt = String::from_utf8_lossy(&o.stdout).to_string();
+                    // 每行：<base64(路径)>|<字节数> —— 带上大小，前端才能对大文件回退旧文件框
+                    //（那条路是磁盘句柄、零拷贝；这条路要把字节读进内存，超大文件会直接吃光内存）
+                    let mut files: Vec<serde_json::Value> = Vec::new();
+                    for line in txt.lines() {
+                        let l = line.trim();
+                        if l.is_empty() {
+                            continue;
+                        }
+                        let (b64, sz) = match l.split_once('|') {
+                            Some((a, b)) => (a, b.trim().parse::<u64>().unwrap_or(0)),
+                            None => (l, 0),
+                        };
+                        if let Ok(bytes) = b64_decode(b64) {
+                            if let Ok(p) = String::from_utf8(bytes) {
+                                files.push(serde_json::json!({ "path": p, "size": sz }));
+                            }
+                        }
+                    }
+                    // rc 一并带回去：PowerShell 被安全策略拦住（Add-Type 被禁）时 rc≠0 且没有输出，
+                    // 前端据此回退旧文件框 —— 否则会被当成「用户点了取消」，表现成「点+没反应」。
+                    let rc = o.status.code().unwrap_or(-1);
+                    let err_txt = String::from_utf8_lossy(&o.stderr).to_string();
+                    let body = serde_json::json!({
+                        "ok": true, "files": files, "rc": rc,
+                        "err": err_txt.chars().take(300).collect::<String>()
+                    })
+                    .to_string();
+                    return save_http_reply(&mut s, 200, &cors, &body);
+                }
+                Err(e) => {
+                    let body = serde_json::json!({ "ok": false, "error": format!("{e}") }).to_string();
+                    return save_http_reply(&mut s, 200, &cors, &body);
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            return save_http_reply(
+                &mut s,
+                200,
+                &cors,
+                "{\"ok\":false,\"error\":\"pick_unsupported\"}",
+            );
+        }
+    }
+
+    // GET /readfile?path=<绝对路径> —— 原始字节（把原生对话框选中的文件读成 File）
+    // 必须流式转发：2GB 上限的直传件一次性读进内存会直接把客户端打爆。
+    if path_only == "/readfile" && method == "GET" {
+        let mut p = String::new();
+        for kv in query.split('&') {
+            if let Some((k, v)) = kv.split_once('=') {
+                if k == "path" {
+                    p = pct_decode(v);
+                }
+            }
+        }
+        let pb = std::path::PathBuf::from(&p);
+        if !pb.is_file() {
+            return save_http_reply(&mut s, 404, &cors, "{\"ok\":false,\"error\":\"not_found\"}");
+        }
+        let len = std::fs::metadata(&pb).map(|m| m.len()).unwrap_or(0);
+        let mut f = match std::fs::File::open(&pb) {
+            Ok(f) => f,
+            Err(e) => {
+                let body = serde_json::json!({ "ok": false, "error": format!("{e}") }).to_string();
+                return save_http_reply(&mut s, 500, &cors, &body);
+            }
+        };
+        use std::io::Write;
+        let header = format!(
+            "HTTP/1.1 200 OK\r\n{}Content-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            cors, len
+        );
+        if s.write_all(header.as_bytes()).is_err() {
+            return Ok(());
+        }
+        let _ = std::io::copy(&mut f, &mut s);
+        return Ok(());
+    }
+
+    // GET /reveal?name=<文件名>&subdir=<子目录>&open=0|1
+    // 2026-11-06：为什么定位/打开也要走这里 —— 这台机器上 invoke 到 Rust 的 Promise
+    // 会「发了不回」（save_chunk_begin、reveal_file 实测都挂死，前端没有 reject 也没有 resolve），
+    // 而本地 HTTP 通稳定可用。存在则 explorer /select（open=1 则直接用默认程序打开），
+    // 不存在则打开所在目录，绝不让按钮「没反应」。
+    if path_only == "/reveal" && method == "GET" {
+        let mut name = String::new();
+        let mut subdir: Option<String> = None;
+        let mut want_open = false;
+        let mut probe_only = false;
+        let mut abs_path = String::new();
+        for kv in query.split('&') {
+            if let Some((k, v)) = kv.split_once('=') {
+                match k {
+                    "name" => name = pct_decode(v),
+                    // 绝对路径直达（2026-11-06）：发送方定位/打开自己发出的**原始文件**，
+                    // 不经过 downfiles —— 那是接收方的落地目录，发送方没必要存副本。
+                    "path" => abs_path = pct_decode(v),
+                    "subdir" => {
+                        let d = pct_decode(v);
+                        if !d.is_empty() {
+                            subdir = Some(d);
+                        }
+                    }
+                    "open" => want_open = pct_decode(v) == "1",
+                    // probe=1：只查存在性，不做任何 UI 动作（前端据此决定「要不要再存一份」）
+                    "probe" => probe_only = pct_decode(v) == "1",
+                    _ => {}
+                }
+            }
+        }
+        // 绝对路径优先于「downfiles 里按名字找」：发送方传的是他自己的源文件路径
+        if !abs_path.trim().is_empty() {
+            let p = std::path::PathBuf::from(&abs_path);
+            if p.is_file() {
+                let ps = p.to_string_lossy().to_string();
+                if probe_only {
+                    let body = serde_json::json!({
+                        "ok": true, "path": ps, "selected": true, "opened": false
+                    })
+                    .to_string();
+                    return save_http_reply(&mut s, 200, &cors, &body);
+                }
+                let mut opened = false;
+                if want_open {
+                    opened = open_external(&ps).is_ok();
+                }
+                reveal_in_folder(&p);
+                let body = serde_json::json!({
+                    "ok": true, "path": ps, "selected": true, "opened": opened
+                })
+                .to_string();
+                return save_http_reply(&mut s, 200, &cors, &body);
+            }
+            // 源文件已被移动/删除：不假装成功，让前端给人一句话
+            let body = serde_json::json!({
+                "ok": true, "path": "", "selected": false, "opened": false, "gone": true
+            })
+            .to_string();
+            return save_http_reply(&mut s, 200, &cors, &body);
+        }
+
+        let dir = save_target_dir(subdir.as_deref());
+        // 命中同基名（容忍 ` (n)` 递增后缀）即为已有副本，不要求名字逐字节相等
+        let target = if name.trim().is_empty() {
+            None
+        } else {
+            resolve_saved_file(&dir, &sanitize_filename(&name))
+        };
+        let mut selected = false;
+        let mut opened = false;
+        let path_str = match target {
+            Some(p) if p.is_file() => {
+                let ps = p.to_string_lossy().to_string();
+                selected = true;
+                if probe_only {
+                    return save_http_reply(
+                        &mut s,
+                        200,
+                        &cors,
+                        &serde_json::json!({
+                            "ok": true, "path": ps, "selected": true,
+                            "opened": false, "dir": dir.to_string_lossy().to_string()
+                        })
+                        .to_string(),
+                    );
+                }
+                if want_open {
+                    opened = open_external(&ps).is_ok();
+                }
+                #[cfg(windows)]
+                {
+                    // explorer /select, 必须分开传参：合成一个时含空格路径会被整体加引号，
+                    // explorer 解析不到开关（2026-10-22 修过同一处）
+                    let _ = Command::new("explorer")
+                        .arg("/select,")
+                        .arg(ps.replace('/', "\\"))
+                        .spawn();
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    if let Ok(c) = Command::new("open").args(["-R", &ps]).spawn() {
+                        reap_in_background(c);
+                    }
+                }
+                #[cfg(not(any(windows, target_os = "macos")))]
+                {
+                    if let Ok(c) = Command::new("xdg-open")
+                        .arg(p.parent().unwrap_or(std::path::Path::new("/")))
+                        .spawn()
+                    {
+                        reap_in_background(c);
+                    }
+                }
+                ps
+            }
+            _ => {
+                // 只探测：明确告诉前端「不在」，不做任何 UI 动作
+                if probe_only {
+                    return save_http_reply(
+                        &mut s,
+                        200,
+                        &cors,
+                        &serde_json::json!({
+                            "ok": true, "path": "", "selected": false,
+                            "opened": false, "dir": dir.to_string_lossy().to_string()
+                        })
+                        .to_string(),
+                    );
+                }
+                // 文件不在（被移走/删除）：直接把人送到目录，仍然「有反应」
+                if dir.exists() {
+                    let _ = open_external(&dir.to_string_lossy());
+                }
+                String::new()
+            }
+        };
+        let body = serde_json::json!({
+            "ok": true,
+            "path": path_str,
+            "selected": selected,
+            "opened": opened,
+            "dir": dir.to_string_lossy().to_string()
+        })
+        .to_string();
+        return save_http_reply(&mut s, 200, &cors, &body);
+    }
+
+    if path_only != "/save" || method != "POST" {
+        return save_http_reply(&mut s, 404, &cors, "{\"ok\":false,\"error\":\"not_found\"}");
+    }
+
+    // 2) 解析 name / subdir
+    let mut name = String::new();
+    let mut subdir: Option<String> = None;
+    for kv in query.split('&') {
+        if let Some((k, v)) = kv.split_once('=') {
+            match k {
+                "name" => name = pct_decode(v),
+                "subdir" => {
+                    let d = pct_decode(v);
+                    if !d.is_empty() {
+                        subdir = Some(d);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if name.trim().is_empty() {
+        return save_http_reply(&mut s, 400, &cors, "{\"ok\":false,\"error\":\"no_name\"}");
+    }
+
+    // 3) 流式写 .part → rename（同名自动加序号，绝不覆盖已有文件）
+    let dir = save_target_dir(subdir.as_deref());
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        let body = serde_json::json!({ "ok": false, "error": format!("无法创建目录：{}", e) }).to_string();
+        return save_http_reply(&mut s, 500, &cors, &body);
+    }
+    let safe = sanitize_filename(&name);
+    let tmp = dir.join(format!("{}.{}.x8part", safe, std::process::id()));
+    let mut final_path = dir.join(&safe);
+    if final_path.exists() {
+        let p = std::path::Path::new(&safe);
+        let stem = p.file_stem().map(|x| x.to_string_lossy().to_string()).unwrap_or_else(|| safe.clone());
+        let ext = p.extension().map(|x| format!(".{}", x.to_string_lossy())).unwrap_or_default();
+        let mut n = 1;
+        while n < 999 {
+            let cand = dir.join(format!("{} ({}){}", stem, n, ext));
+            if !cand.exists() {
+                final_path = cand;
+                break;
+            }
+            n += 1;
+        }
+    }
+
+    let write_res = (|| -> std::io::Result<usize> {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
+        let mut written = 0usize;
+        // 请求头之后已顺带读到的 body 片段
+        if !pre_body.is_empty() {
+            let take = if clen > 0 { pre_body.len().min(clen) } else { pre_body.len() };
+            f.write_all(&pre_body[..take])?;
+            written += take;
+        }
+        let mut buf = vec![0u8; 256 * 1024];
+        loop {
+            if clen > 0 && written >= clen {
+                break;
+            }
+            let want = if clen > 0 { (clen - written).min(buf.len()) } else { buf.len() };
+            let n = s.read(&mut buf[..want])?;
+            if n == 0 {
+                break;
+            }
+            f.write_all(&buf[..n])?;
+            written += n;
+        }
+        f.flush()?;
+        Ok(written)
+    })();
+
+    match write_res {
+        Ok(written) => {
+            let _ = std::fs::rename(&tmp, &final_path);
+            let body = serde_json::json!({
+                "ok": true,
+                "path": final_path.to_string_lossy().to_string(),
+                "bytes": written
+            })
+            .to_string();
+            save_http_reply(&mut s, 200, &cors, &body)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            let body = serde_json::json!({ "ok": false, "error": format!("写入失败：{}", e) }).to_string();
+            save_http_reply(&mut s, 500, &cors, &body)
+        }
+    }
+}
+// ==================== 本地落盘 HTTP 服务 · 结束 ====================
+
 /// 下载目录（Windows `%USERPROFILE%\Downloads`；其余 `~/Downloads`）。
 /// 2026-10-23 S2：抽成函数 —— download_file 落盘与 reveal_file 的目录校验必须用同一份定义，
 /// 分两处写字面量迟早会漂移（改一处忘一处，校验判错直接变「任意路径可定位」）。
@@ -2205,29 +2755,142 @@ fn sanitize_filename(name: &str) -> String {
     s
 }
 
+/// 在目录里找「这个名字」的文件，容忍重名递增后缀。
+/// 2026-11-06：downfiles 里同名文件会被存成 `a (1).zip`、`a (3).zip`，而消息里只有 `a.zip`。
+/// 旧实现按名字精确匹配 → 明明已经落过盘也判成「没有」→ 每点一次「打开」又存一份新副本
+/// （老8 反馈「每次点击打开就多保存一份」的机制）。这里按「基名 + 扩展名」匹配，
+/// 多个候选取修改时间最新的那份。
+fn resolve_saved_file(dir: &std::path::Path, want: &str) -> Option<std::path::PathBuf> {
+    let exact = dir.join(want);
+    if exact.is_file() {
+        return Some(exact);
+    }
+    let split = |s: &str| -> (String, String) {
+        let p = std::path::Path::new(s);
+        let stem = p
+            .file_stem()
+            .map(|x| x.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let ext = p
+            .extension()
+            .map(|x| x.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        (stem, ext)
+    };
+    // 去掉结尾的 " (n)"（Windows 重名递增格式）
+    let strip_counter = |s: &str| -> String {
+        let t = s.trim_end();
+        if !t.ends_with(')') {
+            return t.to_string();
+        }
+        if let Some(i) = t.rfind(" (") {
+            let mid = &t[i + 2..t.len() - 1];
+            if !mid.is_empty() && mid.chars().all(|c| c.is_ascii_digit()) {
+                return t[..i].to_string();
+            }
+        }
+        t.to_string()
+    };
+    let (want_stem, want_ext) = split(want);
+    let want_base = strip_counter(&want_stem);
+    let rd = std::fs::read_dir(dir).ok()?;
+    let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    for e in rd.flatten() {
+        let p = e.path();
+        if !p.is_file() {
+            continue;
+        }
+        let fname = match p.file_name() {
+            Some(n) => n.to_string_lossy().to_string(),
+            None => continue,
+        };
+        let (stem, ext) = split(&fname);
+        if ext != want_ext {
+            continue;
+        }
+        if strip_counter(&stem) != want_base {
+            continue;
+        }
+        let mt = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        if best.as_ref().map(|(t, _)| mt > *t).unwrap_or(true) {
+            best = Some((mt, p));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// 在系统文件管理器里「选中」某个文件（注意：是选中，不是打开它）。
+/// 2026-11-06：/reveal 的两条分支（downfiles 里的副本 / 发送方原始路径）共用同一份实现，
+/// 免得 Windows 的 `explorer /select,` 参数拼法在多处漂移。
+fn reveal_in_folder(p: &std::path::Path) {
+    #[cfg(windows)]
+    {
+        // 路径单独作为参数传：合并成一个字符串时，含空格的路径会被整体加引号，
+        // explorer 解析不到 /select 开关（2026-10-22 踩过）
+        let _ = Command::new("explorer")
+            .arg("/select,")
+            .arg(p.to_string_lossy().replace('/', "\\"))
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let ps = p.to_string_lossy().to_string();
+        if let Ok(c) = Command::new("open").args(["-R", &ps]).spawn() {
+            reap_in_background(c);
+        }
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        if let Some(parent) = p.parent() {
+            if let Ok(c) = Command::new("xdg-open").arg(parent).spawn() {
+                reap_in_background(c);
+            }
+        }
+    }
+}
+
+/// 落盘目标目录解析（save_bytes 与分块落盘三个命令共用）。
+/// 2026-11-05 收即落盘：subdir 非空时落到「下载目录/子目录」（如 downfiles），
+/// 否则仍落下载目录根（向后兼容中转文件「打开/下载」旧调用，不传 subdir）。
+/// 子目录名做防穿越：剔除路径分隔符、拒绝 "." / ".." 整段，join 必在 downloads 之下。
+fn save_target_dir(subdir: Option<&str>) -> std::path::PathBuf {
+    let downloads = downloads_dir();
+    match subdir {
+        Some(sd) => {
+            let cleaned: String = sd.chars().filter(|c| !matches!(c, '/' | '\\')).collect();
+            if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+                downloads
+            } else {
+                downloads.join(cleaned)
+            }
+        }
+        None => downloads,
+    }
+}
+
+/// 分块落盘只认「下载目录之下」的路径，防止前端拿任意 token 写到别处。
+fn in_downloads(p: &std::path::Path) -> bool {
+    let base = downloads_dir();
+    match (p.canonicalize(), base.canonicalize()) {
+        (Ok(a), Ok(b)) => a.starts_with(&b),
+        _ => p.starts_with(&base),
+    }
+}
+
 /// P2P 直传收到的文件落盘（2026-10-23）。
 ///
 /// 为什么需要它：WebView 里 `<a download>` 不生效，网页端能靠浏览器保存，桌面端只能走命令。
 /// 为什么用 base64 而不是 Vec<u8>：Tauri 把 Vec<u8> 当普通数组逐元素序列化，几十 MB 会卡死主线程；
 /// 字符串一次过桥虽然多占 1/3 体积，但可控且不会卡死。
 /// 落盘走「.part → rename」原子写，与 download_file 同款，目录里不会出现半截文件。
+/// 🔴 2026-11-06 实测上限：单次 base64 约 48MB（文件）以后，invoke 在 WebView2 侧永不返回
+/// （Rust 端连下载目录都不会创建）——大文件必须改走 save_chunk_* 分块链路。
 #[tauri::command]
 async fn save_bytes(name: String, b64: String, subdir: Option<String>) -> Result<String, String> {
-    // 2026-11-05 收即落盘：subdir 非空时落到「下载目录/子目录」（如 downfiles），
-    // 否则仍落下载目录根（向后兼容中转文件「打开/下载」旧调用，不传 subdir）。
-    // 子目录名做防穿越：剔除路径分隔符、拒绝 "." / ".." 整段，join 必在 downloads 之下。
-    let downloads = downloads_dir();
-    let dir: std::path::PathBuf = match &subdir {
-        Some(sd) => {
-            let cleaned: String = sd.chars().filter(|c| !matches!(c, '/' | '\\')).collect();
-            if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
-                downloads.clone()
-            } else {
-                downloads.join(cleaned)
-            }
-        }
-        None => downloads.clone(),
-    };
+    let dir = save_target_dir(subdir.as_deref());
     // 2026-10-24 P2-RS-1：base64 解码 + 写盘都是阻塞 CPU/IO，跑在 async 体里会占住 tokio worker
     //（几十 MB 解码可达数百 ms）——整段移入 spawn_blocking，与 download_file 一致。
     let result = tauri::async_runtime::spawn_blocking(move || {
@@ -2255,6 +2918,85 @@ async fn save_bytes(name: String, b64: String, subdir: Option<String>) -> Result
     .await
     .map_err(|e| format!("落盘线程异常：{}", e))?;
     result
+}
+
+/// 分块落盘 · 开始（2026-11-06）。
+/// 为什么要有：单次 `save_bytes` 把整个文件编成 base64 过 IPC，152.9MB 文件 = 204MB 字符串，
+/// WebView2 侧 `postMessage` 直接把消息丢掉（Rust 端连目录都没建），前端表现为永久「正在写盘…」。
+/// 改为前端按 4MB 分块多次调用 append，每次过桥仅 5.4MB，彻底绕开这个上限。
+/// 返回临时文件路径作 token（后续 append/end 都要带回来，且必须仍在下载目录内）。
+#[tauri::command]
+async fn save_chunk_begin(name: String, subdir: Option<String>) -> Result<String, String> {
+    let dir = save_target_dir(subdir.as_deref());
+    let safe = sanitize_filename(&name);
+    let tmp = dir.join(format!("{}.{}.part", safe, std::process::id()));
+    tauri::async_runtime::spawn_blocking(move || {
+        std::fs::create_dir_all(&dir).map_err(|e| format!("无法创建下载目录：{}", e))?;
+        // 清掉上次中断留下的同名残片，避免新内容接在旧字节后面
+        let _ = std::fs::remove_file(&tmp);
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)
+            .map_err(|e| format!("无法创建临时文件：{}", e))?;
+        Ok(tmp.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|e| format!("建盘线程异常：{}", e))?
+}
+
+/// 分块落盘 · 追加一片。返回已写入的总字节数，前端据此显示进度。
+#[tauri::command]
+async fn save_chunk_append(token: String, b64: String) -> Result<u64, String> {
+    let tmp = std::path::PathBuf::from(&token);
+    if !in_downloads(&tmp) {
+        return Err("非法写入路径".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        use std::io::Write;
+        let bytes = b64_decode(&b64)?;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&tmp)
+            .map_err(|e| format!("打开临时文件失败：{}", e))?;
+        f.write_all(&bytes).map_err(|e| format!("写入失败：{}", e))?;
+        f.flush().map_err(|e| format!("刷新失败：{}", e))?;
+        Ok(std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0))
+    })
+    .await
+    .map_err(|e| format!("写盘线程异常：{}", e))?
+}
+
+/// 分块落盘 · 收尾：临时文件 rename 成正式文件名，返回落盘路径（供「在文件夹中显示」）。
+#[tauri::command]
+async fn save_chunk_end(token: String, name: String) -> Result<String, String> {
+    let tmp = std::path::PathBuf::from(&token);
+    if !in_downloads(&tmp) {
+        return Err("非法写入路径".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = tmp.parent().map(|p| p.to_path_buf()).unwrap_or_else(downloads_dir);
+        let dest = dir.join(sanitize_filename(&name));
+        let size = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+        if size == 0 {
+            let _ = std::fs::remove_file(&tmp);
+            return Err("文件内容为空".into());
+        }
+        #[cfg(windows)]
+        {
+            if dest.exists() {
+                let _ = std::fs::remove_file(&dest);
+            }
+        }
+        if let Err(e) = std::fs::rename(&tmp, &dest) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("落盘失败：{}", e));
+        }
+        Ok(dest.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|e| format!("落盘线程异常：{}", e))?
 }
 
 /// 极简 base64 解码（标准字母表）。不引外部 crate，避免为一个小功能动依赖树。
@@ -2596,8 +3338,10 @@ async fn download_file(url: String, token: String, name: String, open: Option<bo
 
 /// 在文件管理器中定位并选中文件（对齐微信「在文件夹中显示」）。
 /// mac: `open -R`；Windows: `explorer /select,`；Linux: `xdg-open <dir>`。
+/// 2026-11-06：改 async —— 同步命令跑在主线程，explorer 一旦卡住会把整个线程占住，
+/// 后面所有 IPC 都「发了不回」。放后台线程里，最差也只是这一个动作失败。
 #[tauri::command]
-fn reveal_file(path: String) -> Result<(), String> {
+async fn reveal_file(path: String) -> Result<(), String> {
     let p = std::path::PathBuf::from(&path);
     if !p.is_file() {
         return Err("文件尚未下载，无法定位".into());
@@ -3851,6 +4595,85 @@ struct TaskCtx {
     prefix: &'static str,
 }
 
+/// 定位 %ProgramData%（操作系统「已知文件夹」级路径）。
+///
+/// 🔴 2026-11-05 老8：「`ProgramData 环境变量缺失，无法定位更新目录` 彻底根掉」。
+/// 原来只读 `std::env::var("ProgramData")` —— 进程环境块不完整时（计划任务 / 服务上下文 /
+/// 精简启动器 / 企业管控清变量）直接 Err → task_ctx() 整体失败 → 自主升级链路整个停摆，
+/// 日志里只有一句「环境变量缺失」，既看不出是环境问题还是权限问题，也没有任何自救。
+/// 现在三级解析，任一级拿到**真实存在**的目录就收工：
+///   ① 环境变量（最常见、零成本，命中即返回）
+///   ② SHGetKnownFolderPath(FOLDERID_ProgramData) —— 系统权威来源，完全不看环境块
+///   ③ %SystemDrive%\ProgramData、C:\ProgramData（最后兜底）
+/// 刻意不回落到 %LOCALAPPDATA%：Highest 权限上下文里它会被解析成 C:\ProgramData，
+/// 正是 2026-10-25 那次「Rust 落盘与 .cmd 读包对不上」的老坑。宁可明确报错也不暗中错位。
+#[cfg(windows)]
+pub(crate) fn programdata_dir() -> Result<std::path::PathBuf, String> {
+    // ① 环境变量
+    if let Ok(v) = std::env::var("ProgramData") {
+        let v = v.trim();
+        if !v.is_empty() {
+            let p = std::path::PathBuf::from(v);
+            if p.is_dir() {
+                return Ok(p);
+            }
+        }
+    }
+    // ② Shell 已知文件夹（不看环境块）
+    if let Some(p) = programdata_via_shell() {
+        if p.is_dir() {
+            return Ok(p);
+        }
+    }
+    // ③ 系统盘兜底
+    let mut cands: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(sd) = std::env::var("SystemDrive") {
+        let sd = sd.trim();
+        if !sd.is_empty() {
+            cands.push(std::path::PathBuf::from(format!("{}\\ProgramData", sd)));
+        }
+    }
+    cands.push(std::path::PathBuf::from(r"C:\ProgramData"));
+    for p in cands {
+        if p.is_dir() {
+            return Ok(p);
+        }
+    }
+    Err("无法定位 %ProgramData%（环境变量 / Shell 已知文件夹 / 系统盘均未命中）".to_string())
+}
+
+/// SHGetKnownFolderPath(FOLDERID_ProgramData) 的最小封装。失败返回 None，绝不 panic。
+#[cfg(windows)]
+fn programdata_via_shell() -> Option<std::path::PathBuf> {
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{SHGetKnownFolderPath, FOLDERID_ProgramData, KF_FLAG_DEFAULT};
+    unsafe {
+        let mut raw: *mut u16 = std::ptr::null_mut();
+        // htoken = NULL → 当前用户/进程上下文；KF_FLAG_DEFAULT = 0（不校验注册表重定向）
+        let hr = SHGetKnownFolderPath(
+            &FOLDERID_ProgramData,
+            KF_FLAG_DEFAULT as u32,
+            std::ptr::null_mut(),
+            &mut raw,
+        );
+        if hr < 0 || raw.is_null() {
+            return None;
+        }
+        let mut n = 0usize;
+        while *raw.add(n) != 0 {
+            n += 1;
+        }
+        let s = String::from_utf16_lossy(std::slice::from_raw_parts(raw, n));
+        CoTaskMemFree(raw as *mut core::ffi::c_void);
+        let s = s.trim();
+        if s.is_empty() {
+            None
+        } else {
+            Some(std::path::PathBuf::from(s))
+        }
+    }
+}
+
 /// 解析本机升级体系：新品牌（BangXin）优先；若机器上只有品牌迁移前的旧任务，
 /// 则整套回落到旧体系（旧任务 → 旧 .cmd → 旧目录 + 旧文件名）。
 /// 三种必须配套，只换一半就是「点了没反应」的静默失败。
@@ -3858,9 +4681,9 @@ struct TaskCtx {
 fn task_ctx() -> Result<TaskCtx, String> {
     // 🔴 2026-10-25：改用 %ProgramData%（而非 LOCALAPPDATA），与 updater-task.cmd 的
     //   %ProgramData% 展开结果一致，杜绝 Highest 权限计划任务上下文里路径错位。
-    let pd = std::env::var("ProgramData")
-        .map_err(|_| "ProgramData 环境变量缺失，无法定位更新目录".to_string())?;
-    let base = std::path::Path::new(&pd);
+    // 🔴 2026-11-05：不再直接读环境变量，改走 programdata_dir() 的三级解析，环境变量缺失也能活。
+    let pd = programdata_dir()?;
+    let base = pd.as_path();
     let fresh = TaskCtx {
         name: X8_TASK_NAME,
         updates: base.join("BangXin").join("updates"),
@@ -4120,6 +4943,13 @@ fn upd_log(msg: &str) {
         paths.push(std::path::Path::new(&local).join("BangXin").join("update.log"));
     }
     paths.push(std::path::PathBuf::from(r"C:\ProgramData\BangXin\update.log"));
+    // 2026-11-05：系统盘不是 C: 或 ProgramData 被重定向时，上面那条写不进去 → 用真实目录再补一份
+    if let Ok(pd) = programdata_dir() {
+        let p = pd.join("BangXin").join("update.log");
+        if !paths.contains(&p) {
+            paths.push(p);
+        }
+    }
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -4970,6 +5800,72 @@ async fn x8_restart(app: tauri::AppHandle) -> Result<String, String> {
     Ok("restarting".into())
 }
 
+/// 2026-11-05 老8「升级后不该再扫码」：登录凭据在宿主侧留一份。
+///
+/// 病根：自动登录的唯一凭据是 WebView2 里的 localStorage(`x8_token`)。它只活在
+/// 浏览器 profile 里 —— 一旦 profile 被重建、或走到 logout()/401 清理路径，凭据就
+/// 彻底没了，升级重启后只能扫码。凭据存在宿主目录（app_data_dir）里，与 WebView2
+/// 数据、缓存、前端版本完全解耦，升级/清缓存都不会动它。
+///
+/// 只存 token + 记住我时的账号密码（与原 localStorage `x8_saved_pass` 同口径），
+/// 文件落在当前用户自己的 AppData 下；退出登录时前端会显式清掉。
+fn x8_auth_file(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    use tauri::Manager;
+    let dir = app.path().app_data_dir().map_err(|e| format!("appdata: {e}"))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {e}"))?;
+    Ok(dir.join("auth.json"))
+}
+
+#[tauri::command]
+fn x8_auth_save(app: tauri::AppHandle, blob: String) -> Result<(), String> {
+    let p = x8_auth_file(&app)?;
+    // 先写临时文件再改名，避免断电/杀进程留下半截 JSON（下次读会解析失败 → 又要扫码）
+    let tmp = p.with_extension("json.tmp");
+    std::fs::write(&tmp, blob.as_bytes()).map_err(|e| format!("write: {e}"))?;
+    std::fs::rename(&tmp, &p).map_err(|e| format!("rename: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn x8_auth_load(app: tauri::AppHandle) -> Result<String, String> {
+    let p = x8_auth_file(&app)?;
+    match std::fs::read_to_string(&p) {
+        Ok(s) => Ok(s),
+        Err(_) => Ok(String::new()),
+    }
+}
+
+#[tauri::command]
+fn x8_auth_clear(app: tauri::AppHandle) -> Result<(), String> {
+    let p = x8_auth_file(&app)?;
+    let _ = std::fs::remove_file(&p);
+    Ok(())
+}
+
+/// 2026-11-05 老8「前端为什么老要重启」根治：换版导航从页面 JS 收归宿主。
+///
+/// 病根：页面里的 `location.replace('/app/index.html?_b=...')` 会被 WebView2 的各种
+/// 中间状态吞掉（HTTP 缓存命中、导航被取消、后台/最小化期间被节流、部署窗口期拿到半截
+/// 响应）。前端只能靠 15 秒看门狗猜，猜错两次就把提示条升级成「需要重启邦信」——
+/// 这才是「经常要重启」的唯一来源。
+///
+/// 宿主发起的 navigate 是**浏览器级**动作：不经过页面 JS 的作用域、不受缓存策略与
+/// 页面生命周期影响，是这套链路上唯一可靠的重载手段。
+/// 只放行应用自己的 https 地址，避免远端页面（或注入脚本）把窗口导航到任意站点。
+#[tauri::command]
+async fn x8_nav(app: tauri::AppHandle, target: String) -> Result<String, String> {
+    let u = tauri::Url::parse(&target).map_err(|e| format!("url: {e}"))?;
+    let host_ok = u.host_str().map(|h| h == "im.x8fde.com").unwrap_or(false);
+    if u.scheme() != "https" || !host_ok || !u.path().starts_with("/app/") {
+        return Err(format!("拒绝导航到非应用地址: {target}"));
+    }
+    let w = app
+        .get_webview_window("main")
+        .ok_or_else(|| "主窗口未找到".to_string())?;
+    w.navigate(u).map_err(|e| format!("navigate: {e}"))?;
+    Ok("nav".into())
+}
+
 fn main() {
     // 2026-10-23 老8：先上硬单实例锁，再初始化任何 GUI/WebView（顺序不能反，
     // 反了会先闪一下登录窗再退出，观感像崩溃）。
@@ -5004,7 +5900,7 @@ fn main() {
             ensure_rustdesk,
             // 2026-10-17：Linux 缺远程协助组件时一键安装（Windows/mac 恒返回 already）
             install_rustdesk,
-            // 2026-11-06 Linux P2P 传输内核（Go+pion sidecar）
+            // 2026-11-06 Linux P2P 传输内核端口下发（Go+pion sidecar；非 Linux 返回 null）
             p2p_sidecar_info,
             // 2026-10-26 Linux 应用内升级（下载本架构 deb/rpm → pkexec 安装 → 自动重启）
             linux_self_update,
@@ -5015,6 +5911,10 @@ fn main() {
             // 状态轮询（同步即返）+ 稍后提醒（落盘冷藏）。三端同名同签名，见 mac_updater.rs。
             mac_updater::mac_upd_status,
             mac_updater::mac_upd_snooze,
+            // 2026-11-06 分块落盘：大文件（>48MB）绕开单次 base64 过 IPC 的硬上限
+            save_chunk_begin,
+            save_chunk_append,
+            save_chunk_end,
             open_workbench,
             // 扩展面板（2026-10-24）：小程序独立内嵌窗口单例 ext-<appId>
             ext_open_window,
@@ -5061,9 +5961,17 @@ fn main() {
             win_auto_update,
             win_patch_update,
             // 2026-10-28 应用内自重启（替代不可靠的 plugin:process|restart）
-            x8_restart
+            x8_restart,
+            // 2026-11-05 换版导航收归宿主（页面自己 location.replace 会被 WebView2 吞掉）
+            x8_nav,
+            // 2026-11-05 登录凭据宿主侧留底：升级 / 清缓存后仍能自动登录，不必再扫码
+            x8_auth_save,
+            x8_auth_load,
+            x8_auth_clear
         ])
         .setup(|app| {
+            // 2026-11-06：本地落盘 HTTP 服务（绕开 WebView2 IPC 大包「发了不回」）
+            save_http_start();
             // 2026-11-04 回退：主窗口恢复为 tauri.conf.json 配置创建（additionalBrowserArgs
             // 改在 config 注入）。上一轮在此用 WebviewWindowBuilder 代码创建窗口，触发首帧导航
             // 竞态 → 升级后白屏（#app 为空，刷新才好）。config 创建由 Tauri 在 WebView2 环境

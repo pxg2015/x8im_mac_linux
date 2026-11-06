@@ -41,6 +41,9 @@
     "allow-open-in-browser",
     "allow-download-file",
     "allow-save-bytes",
+    "allow-save-chunk-begin",
+    "allow-save-chunk-append",
+    "allow-save-chunk-end",
     "allow-screen-clip-grab",
     "allow-reveal-file",
     "allow-notify-unread",
@@ -68,6 +71,10 @@
     "allow-ext-open-window",
     "allow-ext-close-window",
     "allow-ext-focus-window",
-    "allow-x8-restart"
+    "allow-x8-restart",
+    "allow-x8-nav",
+    "allow-x8-auth-save",
+    "allow-x8-auth-load",
+    "allow-x8-auth-clear"
   ]
 }
