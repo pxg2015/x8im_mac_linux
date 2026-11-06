@@ -256,6 +256,11 @@ func (s *session) readLoop() {
 		if mt == websocket.TextMessage {
 			var c ctrlIn
 			if e := json.Unmarshal(data, &c); e != nil {
+				// 🔴 2026-11-06：绝不能静默 continue。上一版这里是直接丢弃，结果服务端把
+				// TURN 的 urls 下发成字符串（pion 只认 []string），整条 init 帧解析失败 →
+				// 前端等不到任何回执 → createOffer 超时 → 只报「offer_error」，线上完全
+				// 看不出是格式问题。回一条 err 让前端把真实原因带到 UI / 错误上报。
+				s.sendCtrl(ctrlOut{T: "err", Msg: "bad_ctrl_json: " + e.Error(), N: int64(len(data))})
 				continue
 			}
 			s.onCtrl(c)

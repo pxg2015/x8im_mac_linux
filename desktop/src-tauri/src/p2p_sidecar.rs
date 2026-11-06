@@ -108,6 +108,20 @@ pub fn ensure() -> Option<(u16, String)> {
         }
     };
 
+    // 🔴 stderr 必须有人读：sidecar 的日志走 stderr（log.Printf），管道缓冲（64KB）写满后
+    // 它会阻塞在 write 上，整个传输内核假死 —— 表现就是「传过一次之后每次都 offer_error」。
+    if let Some(err) = child.stderr.take() {
+        std::thread::spawn(move || {
+            let reader = BufReader::new(err);
+            for line in reader.lines().map_while(Result::ok) {
+                let t = line.trim();
+                if !t.is_empty() {
+                    log_line(&format!("[sidecar] {t}"));
+                }
+            }
+        });
+    }
+
     // 从 stdout 读第一行 X8P2P_READY 拿端口；读超时就认定启动失败
     let stdout = child.stdout.take();
     let (tx, rx) = mpsc::channel::<Option<u16>>();
