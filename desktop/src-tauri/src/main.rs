@@ -29,7 +29,8 @@ mod upd_ui;
 // 为什么只有 Linux：发行版 webkit2gtk 编译时关了 WebRTC，WebView 里没有
 // RTCPeerConnection，大文件直传在 Linux 端架构性不可行。Windows/mac 的
 // WebView 自带 WebRTC，不启 sidecar（命令返回 null，前端继续走原生）。
-#[cfg(target_os = "linux")]
+// 模块本身三端都编译（纯 std），是否启用由 p2p_enabled() 在运行期判定 ——
+// 这样 X8_P2P_FORCE=1 时能在 Windows 上回归同一条 IPC 通道。
 mod p2p_sidecar;
 
 // 非 Windows：mac/linux 的升级走「下载新包手动装 / 系统包管理器」，
@@ -1609,21 +1610,86 @@ fn linux_install_rustdesk() -> Result<String, String> {
 //   · 只对包管理器安装生效：AppImage 跑在临时挂载点，装包覆盖不到它 → 直接报错让用户下 AppImage
 //   · 包名／架构口径与七牛对象名一致（x8im_dl.php 已放行），走中转不用直链
 //   · 全流程是阻塞调用（curl + pkexec），必须 spawn_blocking，否则整窗未响应（AppHang 老账）
-// P2P 传输内核 sidecar 的端口与令牌（2026-11-06）
+// P2P 传输内核 sidecar 的本地通道（2026-11-06）
 //
-// 前端 p2p.js 在「原生 RTCPeerConnection 不存在」时会问这里要 sidecar 地址，
-// 拿到就连 ws://127.0.0.1:<port>/?token=<token>，把 sidecar 当作虚拟 DataChannel 用。
+// 前端 p2p.js 在「原生 RTCPeerConnection 不存在」时会问这里要直传能力，
+// 拿到 {transport:"ipc"} 之后就用下面三兄弟把 sidecar 当虚拟 DataChannel 用。
 // 非 Linux 返回 null → 前端照旧走原生 WebRTC，不需要按平台分支。
-// 每次调用都会 health check：sidecar 崩了会自动重启并返回新端口，前端下一次发送即自愈。
+//
+// 🔴 为什么不是本地 WebSocket：WebKitGTK 把 https 页面里的 ws://（含 127.0.0.1）
+// 全部按混合内容拦掉，实测 error；http 页面则正常。页面必须 https，所以改走 IPC：
+// 二进制在 JS 侧转 base64，由这三条命令转进 sidecar 的 stdin/stdout 帧流。
+//
+// X8_P2P_FORCE=1 时 Windows/macOS 也会启用这条通道（仅用于本机回归 IPC 桥，
+// 正常发版不带这个环境变量；Windows/mac 照旧走原生 WebRTC）。
+fn p2p_enabled() -> bool {
+    if !p2p_sidecar::available() {
+        return false;
+    }
+    if cfg!(target_os = "linux") {
+        return true;
+    }
+    std::env::var("X8_P2P_FORCE").ok().as_deref() == Some("1")
+}
+
 #[tauri::command]
 fn p2p_sidecar_info() -> Option<serde_json::Value> {
-    #[cfg(target_os = "linux")]
-    {
-        if let Some((port, token)) = p2p_sidecar::ensure() {
-            return Some(serde_json::json!({ "port": port, "token": token }));
-        }
+    if p2p_enabled() {
+        return Some(serde_json::json!({ "transport": "ipc" }));
     }
     None
+}
+
+// 开一个传输会话（一个进程 = 一次传输），返回会话 id
+#[tauri::command]
+async fn p2p_sc_open() -> Result<u32, String> {
+    if !p2p_enabled() {
+        return Err("p2p sidecar 未启用".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(p2p_sidecar::open)
+        .await
+        .unwrap_or_else(|e| Err(format!("join: {e}")))
+}
+
+// op=1 时 payload 是控制 JSON 原文；op=2 时是二进制帧的 base64
+#[tauri::command]
+async fn p2p_sc_send(id: u32, op: u8, payload: String) -> Result<(), String> {
+    if !p2p_enabled() {
+        return Err("p2p sidecar 未启用".to_string());
+    }
+    let bytes = if op == 1 {
+        payload.into_bytes()
+    } else {
+        p2p_sidecar::b64_decode(&payload)?
+    };
+    tauri::async_runtime::spawn_blocking(move || p2p_sidecar::send(id, op, &bytes))
+        .await
+        .unwrap_or_else(|e| Err(format!("join: {e}")))
+}
+
+// 拉一帧；超时返回 null（前端继续轮询），携带 {op, payload}
+#[tauri::command]
+async fn p2p_sc_recv(id: u32, timeout_ms: u64) -> Result<Option<serde_json::Value>, String> {
+    if !p2p_enabled() {
+        return Err("p2p sidecar 未启用".to_string());
+    }
+    let r = tauri::async_runtime::spawn_blocking(move || p2p_sidecar::recv(id, timeout_ms))
+        .await
+        .unwrap_or_else(|e| Err(format!("join: {e}")))?;
+    Ok(r.map(|f| {
+        let payload = if f.op == 1 {
+            String::from_utf8_lossy(&f.payload).to_string()
+        } else {
+            p2p_sidecar::b64_encode(&f.payload)
+        };
+        serde_json::json!({ "op": f.op, "payload": payload })
+    }))
+}
+
+#[tauri::command]
+async fn p2p_sc_close(id: u32) -> Result<(), String> {
+    let _ = tauri::async_runtime::spawn_blocking(move || p2p_sidecar::close(id)).await;
+    Ok(())
 }
 
 #[tauri::command]
@@ -5900,8 +5966,13 @@ fn main() {
             ensure_rustdesk,
             // 2026-10-17：Linux 缺远程协助组件时一键安装（Windows/mac 恒返回 already）
             install_rustdesk,
-            // 2026-11-06 Linux P2P 传输内核端口下发（Go+pion sidecar；非 Linux 返回 null）
+            // 2026-11-06 Linux P2P 传输内核（Go+pion sidecar；非 Linux 返回 null）
+            // 页面 https + WebKitGTK 混合内容拦截 → 本地 WS 不可用，改走下面三条 IPC 命令
             p2p_sidecar_info,
+            p2p_sc_open,
+            p2p_sc_send,
+            p2p_sc_recv,
+            p2p_sc_close,
             // 2026-10-26 Linux 应用内升级（下载本架构 deb/rpm → pkexec 安装 → 自动重启）
             linux_self_update,
             // 2026-11-02 macOS 静默升级：Rust 进程内调 tauri-plugin-updater 的原生通道
@@ -6177,9 +6248,8 @@ fn main() {
             // 没点「结束」就直接退出客户端，X8Assist 会残留（长任务无重载）。
             match event {
                 tauri::RunEvent::Exit => {
-                    // sidecar 是子进程，主程序退出必须显式收掉，否则残留占端口
-                    #[cfg(target_os = "linux")]
-                    p2p_sidecar::stop();
+                    // sidecar 是子进程，主程序退出必须显式收掉，否则残留
+                    p2p_sidecar::stop_all();
                     kill_rustdesk_procs();
                 }
                 // 2026-10-19 修「窗口最小化后无法恢复」：macOS 点 Dock 图标 / LaunchServices

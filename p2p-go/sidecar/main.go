@@ -11,15 +11,23 @@
 //   * 前端把 dc 抽象成"虚拟 DataChannel"，字节仍回到前端写 IndexedDB
 //     → 接收端的断点续传 / autoSaveRecv / onFileOpen 一行都不用改
 //
-// 本地协议：一条 WebSocket = 一个传输会话（一个 fid 一次传输），见 sidecar/README 说明
+// 本地协议：一条 WebSocket（或一条 stdio 双工帧流）= 一个传输会话（一个 fid 一次传输）
 //   文本帧  = 控制协议 JSON
 //   二进制帧 = [1B flag][payload]，flag=0 二进制，flag=1 文本（DataChannel 上区分）
+//
+// 两种传输载体（同一个 session 逻辑，只换 peer 实现）：
+//   -listen 127.0.0.1:0  本地 WS（调试/直连用；⚠ https 页面里浏览器会按混合内容拦掉 ws://）
+//   -stdio               宿主（Tauri Rust）用管道拉起的帧流，走 Tauri IPC 转发，
+//                        彻底绕开 WebKitGTK 的「https 页面禁止明文 ws://」限制
 package main
 
 import (
+	"bufio"
+	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -40,6 +48,7 @@ import (
 
 var (
 	listenAddr = flag.String("listen", "127.0.0.1:0", "本地监听地址（0=随机端口，端口写 stdout 给宿主）")
+	stdioMode  = flag.Bool("stdio", false, "用 stdin/stdout 双工帧流通信（宿主用管道拉起；与 -listen 二选一）")
 	token      = flag.String("token", "", "本地连接令牌（宿主生成，防止同机进程蹭用）")
 	portMin    = flag.Int("portmin", 0, "ICE UDP 端口下限（0=不限制；必须与安全组放行区间对齐）")
 	portMax    = flag.Int("portmax", 0, "ICE UDP 端口上限")
@@ -87,6 +96,13 @@ func main() {
 	var err error
 	if api, err = buildAPI(); err != nil {
 		log.Fatalf("初始化 WebRTC 失败: %v", err)
+	}
+
+	// stdio 模式：宿主（Rust）用管道拉起本进程，双向帧流走管道，不进 TCP —— 
+	// 这是 Linux 端唯一可用的本地通道（https 页面里 ws:// 会被 WebKitGTK 按混合内容拦截）。
+	if *stdioMode {
+		runStdio()
+		return
 	}
 
 	ln, err := net.Listen("tcp", *listenAddr)
@@ -140,16 +156,125 @@ func buildAPI() (*webrtc.API, error) {
 }
 
 /* ------------------------------------------------------------------ */
-/* 会话：一条本地 WS = 一个 PeerConnection                              */
+/* 传输载体：WS 或 stdio 帧流                                           */
+/* ------------------------------------------------------------------ */
+
+// 帧类型（两种载体统一）
+const (
+	opText   byte = 1 // 控制协议 JSON
+	opBinary byte = 2 // [1B flag][payload]
+)
+
+// peer 是会话对底层载体的全部要求。抽出来之后 session 完全不关心对端是
+// WebSocket 还是宿主管道 —— 混合内容拦截这件事只影响「怎么送」，不影响协议。
+type peer interface {
+	ReadFrame() (op byte, data []byte, err error)
+	WriteFrame(op byte, data []byte) error
+	Close() error
+}
+
+// --- WebSocket 载体（调试/局域网直连） ---
+
+type wsPeer struct{ c *websocket.Conn }
+
+func (w *wsPeer) ReadFrame() (byte, []byte, error) {
+	mt, d, err := w.c.ReadMessage()
+	if err != nil {
+		return 0, nil, err
+	}
+	if mt == websocket.TextMessage {
+		return opText, d, nil
+	}
+	return opBinary, d, nil
+}
+
+func (w *wsPeer) WriteFrame(op byte, d []byte) error {
+	mt := websocket.BinaryMessage
+	if op == opText {
+		mt = websocket.TextMessage
+	}
+	_ = w.c.SetWriteDeadline(time.Now().Add(30 * time.Second))
+	return w.c.WriteMessage(mt, d)
+}
+
+func (w *wsPeer) Close() error { return w.c.Close() }
+
+// --- stdio 载体（Tauri IPC 桥） ---
+//
+// 帧格式：[4B 小端 payloadLen][1B op][payload]
+// stdout 只走帧，日志全部留在 stderr（log 默认输出），宿主分别接管两条管道。
+const maxStdioFrame = 8 * 1024 * 1024
+
+type stdioPeer struct {
+	r  *bufio.Reader
+	w  *bufio.Writer
+	mu sync.Mutex
+}
+
+func (s *stdioPeer) ReadFrame() (byte, []byte, error) {
+	var h [5]byte
+	if _, err := io.ReadFull(s.r, h[:]); err != nil {
+		return 0, nil, err
+	}
+	n := binary.LittleEndian.Uint32(h[0:4])
+	if n > maxStdioFrame {
+		return 0, nil, fmt.Errorf("帧过大: %d", n)
+	}
+	buf := make([]byte, n)
+	if n > 0 {
+		if _, err := io.ReadFull(s.r, buf); err != nil {
+			return 0, nil, err
+		}
+	}
+	return h[4], buf, nil
+}
+
+func (s *stdioPeer) WriteFrame(op byte, d []byte) error {
+	if len(d) > maxStdioFrame {
+		return fmt.Errorf("帧过大: %d", len(d))
+	}
+	var h [5]byte
+	binary.LittleEndian.PutUint32(h[0:4], uint32(len(d)))
+	h[4] = op
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.w.Write(h[:]); err != nil {
+		return err
+	}
+	if len(d) > 0 {
+		if _, err := s.w.Write(d); err != nil {
+			return err
+		}
+	}
+	return s.w.Flush()
+}
+
+func (s *stdioPeer) Close() error { return nil }
+
+func runStdio() {
+	p := &stdioPeer{
+		r: bufio.NewReaderSize(os.Stdin, 1<<20),
+		w: bufio.NewWriterSize(os.Stdout, 1<<20),
+	}
+	s := &session{p: p, out: make(chan outFrame, 256), done: make(chan struct{})}
+	log.Printf("sidecar 就绪（stdio）portrange=%d-%d skip=%v", *portMin, *portMax, skipList)
+	// 宿主读第一帧当握手（WS 模式对应 stdout 的 X8P2P_READY 那一行）
+	s.sendCtrl(ctrlOut{T: "ready"})
+	go s.writeLoop()
+	s.readLoop()
+}
+
+/* ------------------------------------------------------------------ */
+/* 会话：一条载体连接 = 一个 PeerConnection                             */
 /* ------------------------------------------------------------------ */
 
 type outFrame struct {
-	mt   int
+	op   byte
 	data []byte
 }
 
 type session struct {
-	ws   *websocket.Conn
+	p    peer
 	pc   *webrtc.PeerConnection
 	dc   *webrtc.DataChannel
 	out  chan outFrame
@@ -194,17 +319,17 @@ func handleConn(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	s := &session{ws: ws, out: make(chan outFrame, 256), done: make(chan struct{})}
+	s := &session{p: &wsPeer{c: ws}, out: make(chan outFrame, 256), done: make(chan struct{})}
 	log.Printf("会话建立 %s", r.RemoteAddr)
 	go s.writeLoop()
 	s.readLoop()
 }
 
-// --- 发送（统一走队列，gorilla 不允许并发写） ---
+// --- 发送（统一走队列，载体不允许并发写） ---
 
 func (s *session) sendCtrl(c ctrlOut) {
 	b, _ := json.Marshal(c)
-	s.push(websocket.TextMessage, b)
+	s.push(opText, b)
 }
 
 // push 往写队列丢一帧。
@@ -212,14 +337,14 @@ func (s *session) sendCtrl(c ctrlOut) {
 // 🔴 不能 close(out) 收口：pion 的连接状态回调在独立 goroutine 里，
 // session 关掉之后它仍可能再发一帧 —— close 之后再 send 会直接 panic，
 // 把整个 sidecar（含其它会话）打挂。改用 done channel 做统一出口。
-func (s *session) push(mt int, data []byte) {
+func (s *session) push(op byte, data []byte) {
 	select {
 	case <-s.done:
 		return
 	default:
 	}
 	select {
-	case s.out <- outFrame{mt, data}:
+	case s.out <- outFrame{op, data}:
 	case <-s.done:
 	case <-time.After(10 * time.Second):
 		s.shutdown("out_queue_stuck")
@@ -230,10 +355,9 @@ func (s *session) writeLoop() {
 	for {
 		select {
 		case f := <-s.out:
-			_ = s.ws.SetWriteDeadline(time.Now().Add(30 * time.Second))
-			if err := s.ws.WriteMessage(f.mt, f.data); err != nil {
-				vlog("写 WS 失败: %v", err)
-				s.shutdown("ws_write_error")
+			if err := s.p.WriteFrame(f.op, f.data); err != nil {
+				vlog("写载体失败: %v", err)
+				s.shutdown("write_error")
 				return
 			}
 		case <-s.done:
@@ -245,15 +369,17 @@ func (s *session) writeLoop() {
 // --- 收 ---
 
 func (s *session) readLoop() {
-	defer s.shutdown("ws_closed")
+	defer s.shutdown("peer_closed")
 
-	s.ws.SetReadLimit(4 * 1024 * 1024)
+	if w, ok := s.p.(*wsPeer); ok {
+		w.c.SetReadLimit(4 * 1024 * 1024)
+	}
 	for {
-		mt, data, err := s.ws.ReadMessage()
+		op, data, err := s.p.ReadFrame()
 		if err != nil {
 			return
 		}
-		if mt == websocket.TextMessage {
+		if op == opText {
 			var c ctrlIn
 			if e := json.Unmarshal(data, &c); e != nil {
 				// 🔴 2026-11-06：绝不能静默 continue。上一版这里是直接丢弃，结果服务端把
@@ -447,7 +573,7 @@ func (s *session) bindDC(dc *webrtc.DataChannel, remote bool) {
 			frame[0] = 0
 			copy(frame[1:], msg.Data)
 		}
-		s.push(websocket.BinaryMessage, frame)
+		s.push(opBinary, frame)
 	})
 }
 
@@ -458,7 +584,7 @@ func (s *session) shutdown(reason string) {
 		if s.pc != nil {
 			_ = s.pc.Close()
 		}
-		_ = s.ws.Close()
+		_ = s.p.Close()
 		log.Printf("会话结束 (%s)", reason)
 	})
 }
