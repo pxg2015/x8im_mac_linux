@@ -8,7 +8,7 @@
         "minWidth": 800,
         "minHeight": 600,
         "decorations": true,
-        "url": "https://im.x8fde.com/app/?v=1.6.66"
+        "url": "https://im.x8fde.com/app/?v=1.6.37"
       }
     ]
   },
@@ -39,9 +39,6 @@
         "epoch": 0,
         "desktopTemplate": "linux/x8im.desktop.hbs"
       }
-    },
-    "externalBin": [
-      "binaries/x8p2p-sidecar"
-    ]
+    }
   }
 }
