@@ -25,6 +25,13 @@ mod updater;
 #[cfg(windows)]
 mod upd_ui;
 
+// 2026-11-06 Linux P2P 传输内核（Go + pion sidecar）。
+// 为什么只有 Linux：发行版 webkit2gtk 编译时关了 WebRTC，WebView 里没有
+// RTCPeerConnection，大文件直传在 Linux 端架构性不可行。Windows/mac 的
+// WebView 自带 WebRTC，不启 sidecar（命令返回 null，前端继续走原生）。
+#[cfg(target_os = "linux")]
+mod p2p_sidecar;
+
 // 非 Windows：mac/linux 的升级走「下载新包手动装 / 系统包管理器」，
 // 不参与这套 Windows 自主升级状态机（它依赖 schtasks / NSIS / Win32 原生窗）。
 // 这里提供**同名同签名**的空实现，让 generate_handler! 的命令表三端完全一致
@@ -1602,6 +1609,23 @@ fn linux_install_rustdesk() -> Result<String, String> {
 //   · 只对包管理器安装生效：AppImage 跑在临时挂载点，装包覆盖不到它 → 直接报错让用户下 AppImage
 //   · 包名／架构口径与七牛对象名一致（x8im_dl.php 已放行），走中转不用直链
 //   · 全流程是阻塞调用（curl + pkexec），必须 spawn_blocking，否则整窗未响应（AppHang 老账）
+// P2P 传输内核 sidecar 的端口与令牌（2026-11-06）
+//
+// 前端 p2p.js 在「原生 RTCPeerConnection 不存在」时会问这里要 sidecar 地址，
+// 拿到就连 ws://127.0.0.1:<port>/?token=<token>，把 sidecar 当作虚拟 DataChannel 用。
+// 非 Linux 返回 null → 前端照旧走原生 WebRTC，不需要按平台分支。
+// 每次调用都会 health check：sidecar 崩了会自动重启并返回新端口，前端下一次发送即自愈。
+#[tauri::command]
+fn p2p_sidecar_info() -> Option<serde_json::Value> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Some((port, token)) = p2p_sidecar::ensure() {
+            return Some(serde_json::json!({ "port": port, "token": token }));
+        }
+    }
+    None
+}
+
 #[tauri::command]
 async fn linux_self_update(app: tauri::AppHandle) -> Result<String, String> {
     #[cfg(not(target_os = "linux"))]
@@ -4980,6 +5004,8 @@ fn main() {
             ensure_rustdesk,
             // 2026-10-17：Linux 缺远程协助组件时一键安装（Windows/mac 恒返回 already）
             install_rustdesk,
+            // 2026-11-06 Linux P2P 传输内核（Go+pion sidecar）
+            p2p_sidecar_info,
             // 2026-10-26 Linux 应用内升级（下载本架构 deb/rpm → pkexec 安装 → 自动重启）
             linux_self_update,
             // 2026-11-02 macOS 静默升级：Rust 进程内调 tauri-plugin-updater 的原生通道
@@ -5242,7 +5268,12 @@ fn main() {
             // 一并收掉。必要性：前端的空闲回收心跳随窗口/进程一起消失，若用户会话结束后
             // 没点「结束」就直接退出客户端，X8Assist 会残留（长任务无重载）。
             match event {
-                tauri::RunEvent::Exit => kill_rustdesk_procs(),
+                tauri::RunEvent::Exit => {
+                    // sidecar 是子进程，主程序退出必须显式收掉，否则残留占端口
+                    #[cfg(target_os = "linux")]
+                    p2p_sidecar::stop();
+                    kill_rustdesk_procs();
+                }
                 // 2026-10-19 修「窗口最小化后无法恢复」：macOS 点 Dock 图标 / LaunchServices
                 // 激活会向已运行实例发 reopen 事件，此前无人处理 → 最小化的窗口永远回不来，
                 // 用户只剩杀进程重启一条路（本机 Dock 不可见，连重启都得敲命令）。

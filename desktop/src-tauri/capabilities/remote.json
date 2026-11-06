@@ -37,6 +37,7 @@
     "allow-mac-upd-status",
     "allow-mac-upd-snooze",
     "allow-open-workbench",
+    "allow-p2p-sidecar-info",
     "allow-open-in-browser",
     "allow-download-file",
     "allow-save-bytes",

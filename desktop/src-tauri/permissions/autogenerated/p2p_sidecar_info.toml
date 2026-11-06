@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-p2p-sidecar-info"
+description = "Enables the p2p_sidecar_info command without any pre-configured scope."
+commands.allow = ["p2p_sidecar_info"]
+
+[[permission]]
+identifier = "deny-p2p-sidecar-info"
+description = "Denies the p2p_sidecar_info command without any pre-configured scope."
+commands.deny = ["p2p_sidecar_info"]

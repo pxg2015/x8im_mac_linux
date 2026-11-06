@@ -1,0 +1,11 @@
+# 构建产物（Linux 版由 CI 生成，Windows 版只在本机调试用）
+x8-p2p
+x8-p2p.exe
+x8p2p-sidecar
+x8p2p-sidecar.exe
+sidecar/x8p2p-sidecar*
+*.tar.gz
+*.bin
+
+# 测试页里 p2pSidecar.js 是 web/src/lib/ 的副本，改源头，别改这里
+_it/p2pSidecar.js
