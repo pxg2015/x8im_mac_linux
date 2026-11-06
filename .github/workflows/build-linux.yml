@@ -121,8 +121,7 @@ jobs:
                    src-tauri/Cargo.toml src-tauri/build.rs \
                    src-tauri/tauri.conf.json src-tauri/tauri.linux.conf.json \
                    src-tauri/icons/128x128.png src-tauri/icons/icon.png \
-                   src-tauri/linux/x8im.desktop.hbs \
-                   ../p2p-go/go.mod ../p2p-go/sidecar/main.go; do
+                   src-tauri/linux/x8im.desktop.hbs; do
             if [ -f "$f" ]; then echo "  ✓ $f"; else echo "::error::缺少必需文件 $f"; exit 1; fi
           done
           echo "preflight ok"
@@ -137,33 +136,6 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           printf '%s\n' '<!doctype html><meta charset="utf-8"><title>X8.IM</title>' > dist/index.html
-
-      # 2026-11-06 P2P 传输内核（Go + pion）：
-      # Linux 发行版的 webkit2gtk 编译时关了 WebRTC（ENABLE_WEB_RTC=OFF），WebView 里
-      # 没有 RTCPeerConnection，大文件直传在 Linux 端架构性不可行。这个 sidecar 承载
-      # 真正的 RTCPeerConnection，前端把它当虚拟 DataChannel 用。
-      # CGO_ENABLED=0 出静态二进制 —— 不依赖目标机 glibc，麒麟 V10 / UOS 通吃。
-      - name: Build P2P sidecar (Go)
-        run: |
-          set -euo pipefail
-          GO_VER=1.27.3
-          case "$(uname -m)" in
-            x86_64)  GOARCH=amd64 ;;
-            aarch64) GOARCH=arm64 ;;
-            *) echo "::error::不支持的架构 $(uname -m)"; exit 1 ;;
-          esac
-          curl -sSL --retry 3 "https://go.dev/dl/go${GO_VER}.linux-${GOARCH}.tar.gz" -o /tmp/go.tgz
-          sudo rm -rf /usr/local/go
-          sudo tar -C /usr/local -xzf /tmp/go.tgz
-          export PATH=/usr/local/go/bin:$PATH
-          go version
-          TRIPLE=$(rustc -vV | sed -n 's/^host: //p')
-          echo "triple=$TRIPLE"
-          mkdir -p src-tauri/binaries
-          ( cd "$GITHUB_WORKSPACE/p2p-go" && CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH" go build -trimpath -ldflags="-s -w" -o "$GITHUB_WORKSPACE/desktop/src-tauri/binaries/x8p2p-sidecar-${TRIPLE}" ./sidecar )
-          chmod +x "src-tauri/binaries/x8p2p-sidecar-${TRIPLE}"
-          ls -lh src-tauri/binaries/
-          file "src-tauri/binaries/x8p2p-sidecar-${TRIPLE}"
 
       - name: Build deb + rpm
         run: npx tauri build --bundles deb,rpm
