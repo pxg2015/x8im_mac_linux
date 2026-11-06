@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-x8-auth-load"
+description = "Enables the x8_auth_load command without any pre-configured scope."
+commands.allow = ["x8_auth_load"]
+
+[[permission]]
+identifier = "deny-x8-auth-load"
+description = "Denies the x8_auth_load command without any pre-configured scope."
+commands.deny = ["x8_auth_load"]

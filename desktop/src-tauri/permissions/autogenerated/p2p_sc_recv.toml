@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-p2p-sc-recv"
+description = "Enables the p2p_sc_recv command without any pre-configured scope."
+commands.allow = ["p2p_sc_recv"]
+
+[[permission]]
+identifier = "deny-p2p-sc-recv"
+description = "Denies the p2p_sc_recv command without any pre-configured scope."
+commands.deny = ["p2p_sc_recv"]

@@ -5326,6 +5326,7 @@ version = "1.0.0"
 dependencies = [
  "image",
  "indexmap 1.9.3",
+ "libc",
  "minisign-verify 0.2.5",
  "reqwest",
  "serde",

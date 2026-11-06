@@ -1,6 +1,6 @@
 {
   "productName": "BangXin",
-  "version": "1.6.66",
+  "version": "1.6.67",
   "identifier": "com.x8fde.im",
   "build": {
     "frontendDist": "../dist"
@@ -21,31 +21,48 @@
         "additionalBrowserArgs": "--disable-background-networking --disable-component-update --no-first-run --disable-safebrowsing --disable-features=msEdgeComponentUpdates,msEdgeShoppingAssistant,EdgeReadingList"
       }
     ],
-    "security": { "csp": null }
+    "security": {
+      "csp": null
+    }
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
-    "icon": ["icons/icon.ico"],
+    "targets": [
+      "nsis"
+    ],
+    "icon": [
+      "icons/icon.ico"
+    ],
     "category": "SocialNetworking",
     "shortDescription": "邦信 企业即时通讯与协同办公客户端",
     "longDescription": "邦信是面向企业的一体化协同客户端，提供即时通讯、群组协作、远程协助与工作台能力。",
-    "resources": ["bin/X8Assist/**/*", "post-update.cmd", "icons/icon.ico", "elevate.exe"],
+    "resources": [
+      "bin/X8Assist/**/*",
+      "post-update.cmd",
+      "icons/icon.ico",
+      "elevate.exe"
+    ],
     "createUpdaterArtifacts": true,
     "windows": {
       "nsis": {
         "installMode": "perMachine",
         "installerHooks": "installer.nsh",
         "template": "nsis/installer.nsi",
-        "languages": ["SimpChinese"]
+        "languages": [
+          "SimpChinese"
+        ]
       }
     }
   },
   "plugins": {
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDAwNjcwRUE2MkE5QTYxNTEKUldSUllab3FwZzVuQU1SOHhtaGR0SmdTWDRCb0dVcmpyVlBEbTBEMmd2Q292bkFvdjl0SmpUbzgK",
-      "endpoints": ["https://im.x8fde.com/app/latest.json"],
-      "windows": { "installMode": "quiet" }
+      "endpoints": [
+        "https://im.x8fde.com/app/latest.json"
+      ],
+      "windows": {
+        "installMode": "quiet"
+      }
     }
   }
 }

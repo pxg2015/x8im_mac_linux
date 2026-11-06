@@ -3309,10 +3309,13 @@ fn b64_encode(data: &[u8]) -> String {
 /// 2026-10-23 起用进程内 reqwest（不再 spawn 系统 curl）；S1 仍生效：只有 SAFE_OPEN_EXT
 /// 内的查看型文件才自动打开，可执行/脚本类只落盘。
 #[tauri::command]
-async fn download_file(url: String, token: String, name: String, open: Option<bool>) -> Result<String, String> {
+async fn download_file(app: tauri::AppHandle, url: String, token: String, name: String, open: Option<bool>, key: Option<String>) -> Result<String, String> {
     // 2026-10-24 稳定性修复（AppHangB1）：原为同步命令，reqwest blocking 下载 + 写盘全跑在主线程，
     // 大文件/慢网时整窗冻结（表现为「没反应、关不掉、移不动」）。改 async + spawn_blocking：
     // 阻塞 IO 移出主线程，await 期间 UI 正常响应；.part → rename 原子落盘逻辑不变。
+    // 2026-11-06：加 app/key -> 下载过程 emit('x8dl') 报进度（前端卡片显示接收 %）。
+    let app2 = app.clone();
+    let key2 = key.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
     // 只允许 https（及本机调试用的 http://localhost）——Bearer 令牌不能跟着任意明文地址发出去
     let local_http = url.starts_with("http://127.0.0.1") || url.starts_with("http://localhost");
@@ -3359,9 +3362,28 @@ async fn download_file(url: String, token: String, name: String, open: Option<bo
     let tmp = downloads.join(format!("{}.{}.part", safe, std::process::id()));
     let mut f = std::fs::File::create(&tmp)
         .map_err(|e| format!("文件下载失败（无法写入下载目录：{}）", e))?;
-    let copied = {
+    // 2026-11-06：手写分块拷贝替代 std::io::copy —— 边下边 emit 进度，
+    // 前端卡片才能显示「接收中 42%」。按 ~200ms 节流，避免 100MB 文件刷出上万条事件。
+    let total: u64 = resp.content_length().unwrap_or(0);
+    let mut got: u64 = 0;
+    let copied: std::io::Result<()> = {
+        use std::io::{Read, Write};
         let mut body = resp;
-        std::io::copy(&mut body, &mut f)
+        let mut buf = vec![0u8; 256 * 1024];
+        let mut last = std::time::Instant::now();
+        (|| -> std::io::Result<()> {
+            loop {
+                let n = body.read(&mut buf)?;
+                if n == 0 { break; }
+                f.write_all(&buf[..n])?;
+                got += n as u64;
+                if last.elapsed().as_millis() >= 200 {
+                    last = std::time::Instant::now();
+                    let _ = app2.emit("x8dl", serde_json::json!({ "key": key2, "got": got, "total": total }));
+                }
+            }
+            Ok(())
+        })()
     };
     let _ = std::io::Write::flush(&mut f);
     drop(f);
@@ -3383,6 +3405,11 @@ async fn download_file(url: String, token: String, name: String, open: Option<bo
     if !dest.is_file() {
         return Err("文件下载失败（未生成文件）".into());
     }
+    // 落盘完成：补一条终态事件，前端据此把卡片切成「已保存」并记住路径
+    let _ = app2.emit("x8dl", serde_json::json!({
+        "key": key2, "got": got, "total": total, "done": true,
+        "path": dest.to_string_lossy()
+    }));
 
     // S1 修复：仅查看型扩展名自动打开；其它（含 exe/bat/ps1/msi/…）只落盘不打开。
     // 对齐微信：默认行为 = 用户点击「打开」才打开；「在文件夹中显示」等传 open=false 只落盘不打开，
@@ -3736,12 +3763,37 @@ fn start_tray_flash(app: tauri::AppHandle, count: i64) {
         let mut cached_n: i64 = -1;
         let mut bright: Option<tauri::image::Image<'static>> = None;
         let mut dark: Option<tauri::image::Image<'static>> = None;
+        // 2026-11-06：主窗句柄在循环外取一次（Window 是 Arc 克隆，复用零成本），
+        // 供下面「人已回到窗口前台」自查用；不在每 tick 里重新 get_webview_window。
+        let main_win = app.get_webview_window("main");
+        // 前台自查降频：每 2 个 tick（1s）查一次，够快又不占用每帧。
+        const FRONT_CHECK_EVERY: u32 = 2;
+        let mut tick: u32 = 0;
         loop {
             use std::sync::atomic::Ordering;
             if TRAY_FLASH_GEN.load(Ordering::SeqCst) != my_gen {
                 // ③ 被新消息接替：不碰图标，新一代全权负责
                 return;
             }
+            // ② 人已回到主窗前台（获得焦点 + 可见 + 未最小化）：立刻停闪并落回默认 logo。
+            // 判据与 notify_unread 里的 away 完全同源（都用 OS 级窗口状态），口径一致。
+            // 此前这条退出条件只写在注释里、代码没实现 —— 窗口一直开着、消息也看完，
+            // 但 unread 计数没归零时循环会无限闪（2026-11-06 老8 反馈）。
+            // 只 return、不清 TRAY_FLASH_UNREAD、不动 GEN：新消息进来照常开新一代。
+            if tick % FRONT_CHECK_EVERY == 0 {
+                if let Some(w) = main_win.as_ref() {
+                    if w.is_focused().unwrap_or(false)
+                        && w.is_visible().unwrap_or(false)
+                        && !w.is_minimized().unwrap_or(false)
+                    {
+                        if let Some(tray) = app.tray_by_id("x8im-tray") {
+                            let _ = tray.set_icon(def_icon.clone());
+                        }
+                        return;
+                    }
+                }
+            }
+            tick = tick.wrapping_add(1);
             let n = TRAY_FLASH_UNREAD.load(Ordering::SeqCst);
             if n <= 0 {
                 // ① 已清完：自己还原默认 logo（与调用方的还原幂等，踩中竞态也只是同写一张图）

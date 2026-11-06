@@ -103,8 +103,9 @@ fn now_secs() -> i64 {
 // ---------------------------------------------------------------------------
 
 fn snooze_file() -> Option<std::path::PathBuf> {
-    let pd = std::env::var("ProgramData").ok()?;
-    Some(std::path::Path::new(&pd).join("BangXin").join("update-snooze.txt"))
+    // 2026-11-05：与 task_ctx() 共用三级解析，ProgramData 环境变量缺失时不再静默失效
+    let pd = crate::programdata_dir().ok()?;
+    Some(pd.join("BangXin").join("update-snooze.txt"))
 }
 
 fn load_snooze() {
