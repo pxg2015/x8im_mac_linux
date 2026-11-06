@@ -24,7 +24,14 @@ concurrency:
 jobs:
   build:
     name: ${{ matrix.label }}
-    runs-on: macos-14
+    # 2026-11-06：macos-14（Sonoma，arm64）镜像已于 2026-11-02 正式退役。
+    # 继续写 macos-14 会让 job 在 0 秒内被取消，报错形似
+    # "The configuration 'macos-14-arm64-us-default' is not supported"，
+    # 极易被误判成 Actions 额度用尽（public 仓其实免费、无额度）。
+    # 实测 macos-14=cancelled / macos-15=success / macos-latest=success。
+    # 固定 macos-15（arm64）而非 macos-latest：latest 现已指向 macos-26，
+    # Xcode 跨度更大；两个 target 仍都在 arm64 机器上（x86_64 走交叉编译）。
+    runs-on: macos-15
     timeout-minutes: 90
     defaults:
       run:
