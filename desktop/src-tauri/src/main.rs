@@ -101,6 +101,30 @@ fn reap_in_background(mut child: std::process::Child) {
     });
 }
 
+/// 2026-11-07 专家评审 P1-2：原来只判 spawn() 成功就返回 Ok，`xdg-open` 不存在或
+/// 退出码非 0 时前端会收到「已用浏览器打开」、但客户端已经退会 → 两头落空。
+/// 现在等待子进程退出码（最多 1.5s，仍在运行视为已成功拉起，后台收尸），失败返回 false
+/// 让调用方换下一个候选程序 / 走复制回落。
+#[cfg(not(windows))]
+fn open_checked(mut cmd: Command) -> Result<bool, String> {
+    let mut child = cmd.spawn().map_err(|e| format!("{e}"))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => return Ok(st.success()),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    // 浏览器已拉起但进程还没退（xdg-open 偶见），不能无限等
+                    reap_in_background(child);
+                    return Ok(true);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(40));
+            }
+            Err(e) => return Err(format!("{e}")),
+        }
+    }
+}
+
 /// 用系统默认程序打开一个外部 URL / 协议链接（各平台分别走 cmd start / open / xdg-open）
 /// 2026-10-14：抽出为跨平台 helper，供 rustdesk:// 协议与工作台浏览器回落共用。
 fn open_external(url: &str) -> Result<(), String> {
@@ -115,23 +139,66 @@ fn open_external(url: &str) -> Result<(), String> {
     }
     #[cfg(target_os = "macos")]
     {
-        let child = Command::new("open")
-            .arg(url)
-            .spawn()
-            .map_err(|e| format!("拉起外链失败: {e}"))?;
-        // 2026-10-24 P2-RS-5：后台收尸，防 Unix 僵尸进程
-        reap_in_background(child);
-        Ok(())
+        let mut c = Command::new("open");
+        c.arg(url);
+        match open_checked(c) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err("open 未能打开默认浏览器".into()),
+            Err(e) => Err(format!("拉起外链失败: {e}")),
+        }
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
-        let child = Command::new("xdg-open")
-            .arg(url)
-            .spawn()
-            .map_err(|e| format!("拉起外链失败: {e}"))?;
-        // 2026-10-24 P2-RS-5：同上，后台收尸
-        reap_in_background(child);
-        Ok(())
+        // Wayland 精简桌面常常没有 xdg-open；依次试 gio open / www-browser
+        let mut last = String::new();
+        for (prog, need_open) in [("xdg-open", false), ("gio", true), ("www-browser", false)] {
+            let mut c = Command::new(prog);
+            if need_open { c.arg("open"); }
+            c.arg(url);
+            match open_checked(c) {
+                Ok(true) => return Ok(()),
+                Ok(false) => last = format!("{prog} 退出码非 0"),
+                Err(e) => last = format!("{prog}: {e}"),
+            }
+        }
+        Err(format!("系统浏览器拉起失败（{last}），请手动打开链接"))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn enable_linux_webrtc(app: &tauri::AppHandle) {
+    use webkit2gtk::{prelude::*, UserMediaPermissionRequest};
+    let Some(win) = app.get_webview_window("main") else {
+        eprintln!("[x8][webrtc] main webview 未找到，开关未生效");
+        return;
+    };
+    let ret = win.with_webview(|w| {
+        let wv = w.inner();
+        // 2026-11-07 二次评审 P1-4：wry 只在 attributes.permission_handler 有值时才
+        // connect_permission_request；Tauri 用 config 建窗时 tauri-runtime-wry 的
+        // pending.permission_request_handler 为 None → WebKitGTK 默认拒绝 getUserMedia。
+        // 这里自行接管：只放行纯麦克风请求，摄像头/屏幕采集仍拒（客户端本就不支持）。
+        wv.connect_permission_request(|_wv, req| {
+            if let Some(m) = req.downcast_ref::<UserMediaPermissionRequest>() {
+                if m.is_for_audio_device() && !m.is_for_video_device() {
+                    req.allow();
+                } else {
+                    req.deny();
+                }
+                return true;
+            }
+            false
+        });
+        match WebViewExt::settings(&wv) {
+            Some(s) => {
+                s.set_enable_webrtc(true);        // WebKit 会同时隐含 enable-media-stream
+                eprintln!("[x8][webrtc] enable-webrtc=true，麦克风权限已放行");
+            }
+            None => eprintln!("[x8][webrtc] WebSettings 取不到，开关未生效"),
+        }
+    });
+    if let Err(e) = ret {
+        eprintln!("[x8][webrtc] with_webview 失败: {e}");
     }
 }
 
@@ -2186,11 +2253,15 @@ fn assist_has_live_session(pids: &[String]) -> bool {
 /// 在 WebView 里点 <a download> 没反应 —— Tauri WebView 不处理下载事件，
 /// 改为打开系统浏览器触发真实下载）。
 #[tauri::command]
-fn open_in_browser(url: String) -> Result<(), String> {
+async fn open_in_browser(url: String) -> Result<(), String> {
     if !url.starts_with("https://") {
         return Err("无效地址".into());
     }
-    open_external(&url)
+    // 2026-11-07 二次评审 P1-3：open_checked 会等子进程退出码（Linux 三个候选串行最多
+    // 1.5s×3）。同步 command 跑在主线程会把 WebView 一起卡住，必须丢到 blocking 线程池。
+    tokio::task::spawn_blocking(move || open_external(&url))
+        .await
+        .map_err(|e| format!("拉起外链失败: {e}"))?
 }
 
 /// 仅这些「查看型」扩展名在下载后自动用默认程序打开；其余（含可执行/脚本类）
@@ -6095,6 +6166,9 @@ fn main() {
         .setup(|app| {
             // 2026-11-06：本地落盘 HTTP 服务（绕开 WebView2 IPC 大包「发了不回」）
             save_http_start();
+            // 2026-11-07 P2-8 探针：Linux WebKitGTK enable-webrtc 默认 FALSE
+            #[cfg(target_os = "linux")]
+            enable_linux_webrtc(app.handle());
             // 2026-11-04 回退：主窗口恢复为 tauri.conf.json 配置创建（additionalBrowserArgs
             // 改在 config 注入）。上一轮在此用 WebviewWindowBuilder 代码创建窗口，触发首帧导航
             // 竞态 → 升级后白屏（#app 为空，刷新才好）。config 创建由 Tauri 在 WebView2 环境

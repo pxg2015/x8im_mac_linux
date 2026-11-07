@@ -24,7 +24,7 @@ reqwest = { version = "0.13", features = ["blocking"] }
 # 2026-10-24 稳定性：给自动升级下载加超时看门狗（tokio::time::timeout），
 # 断流卡死时判失败而不是永久挂起（前端小窗会一直停在「正在升级」）。
 # tokio 本就是 tauri/reqwest 的传递依赖，显式声明 + 开 time 特性即可，版本自动统一到 tauri 所用那版。
-tokio = { version = "1", features = ["time"] }
+tokio = { version = "1", features = ["time", "rt"] }
 # generate_context! 宏（plugins 配置）生成代码直接引用 serde_json
 serde_json = "1"
 # 组件式静默升级：验签 portable zip（与 tauri 同一把 minisign 密钥）
@@ -36,6 +36,13 @@ indexmap = { version = "1.9", features = ["std"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 # 2026-11-03 三端单实例：mac/linux 用 Unix 域套接字作锁+唤醒通道，需 getuid()/kill(pid,0)
 libc = "0.2"
+
+# 2026-11-07 P2-8 探针：Linux WebKitGTK 的 `enable-webrtc` 设置默认 FALSE（WebKitGTK 2.38+），
+# wry/tauri 都没去开它 —— 这正是 Linux 客户端 `RTCPeerConnection` 不存在的可疑原因之一。
+# 这里显式启用；v2_38 是 set_enable_webrtc 的 feature 门（wry 已带 v2_40，feature 会合并）。
+# 只影响 Linux 目标；若发行版 webkit2gtk 编译时就没带 WebRTC，开了也没坏处（设置无效而已）。
+[target.'cfg(target_os = "linux")'.dependencies]
+webkit2gtk = { version = "2.0.2", features = ["v2_38"] }
 
 # 2026-10-16 老8 诉求：X8Assist 主窗口（你的桌面/控制远程桌面）不要盖在 X8.IM 上。
 # 方案 = 启动后 EnumWindows 找 X8Assist 的可见窗口 ShowWindow(SW_HIDE)。
