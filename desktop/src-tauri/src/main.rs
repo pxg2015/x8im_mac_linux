@@ -125,6 +125,22 @@ fn open_checked(mut cmd: Command) -> Result<bool, String> {
     }
 }
 
+/// 2026-11-07 A：AppImage / 打包运行时会把 LD_LIBRARY_PATH 等指向自带库目录，
+/// 子进程（xdg-open -> gio -> Chrome）继承后 Chrome 加载到不匹配的 libnss3/libglib
+/// 会直接崩，而桌面入口层仍返回退出码 0 —— 表现为「报成功、浏览器没打开」。
+/// 拉起外部程序前清掉这些污染变量；DBUS / DISPLAY / XDG_* 必须保留。
+#[cfg(not(any(windows, target_os = "macos")))]
+fn x8_clean_child_env(c: &mut Command) {
+    for k in [
+        "LD_LIBRARY_PATH", "LD_PRELOAD", "LD_AUDIT", "LD_DEBUG",
+        "QT_PLUGIN_PATH", "QT_QPA_PLATFORM_PLUGIN_PATH", "GTK_PATH", "GTK_MODULES",
+        "GIO_EXTRA_MODULES", "GDK_PIXBUF_MODULE_FILE", "GSETTINGS_SCHEMA_DIR",
+        "PYTHONPATH", "PERL5LIB",
+    ] {
+        c.env_remove(k);
+    }
+}
+
 /// 用系统默认程序打开一个外部 URL / 协议链接（各平台分别走 cmd start / open / xdg-open）
 /// 2026-10-14：抽出为跨平台 helper，供 rustdesk:// 协议与工作台浏览器回落共用。
 fn open_external(url: &str) -> Result<(), String> {
@@ -149,10 +165,31 @@ fn open_external(url: &str) -> Result<(), String> {
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
-        // Wayland 精简桌面常常没有 xdg-open；依次试 gio open / www-browser
+        // 2026-11-07 A：http(s) 链接优先「直启已知浏览器」。
+        // xdg-open / gio open 在 AppImage 环境常返回 0 却没拉起浏览器（DBus 激活发到
+        // 错误会话、或浏览器继承污染的动态库后立刻崩），单看退出码挡不住。
+        // 直启可执行文件绕开桌面入口层，并继续用 open_checked 复核退出码。
+        let is_web = url.starts_with("https://") || url.starts_with("http://");
         let mut last = String::new();
+        if is_web {
+            for prog in [
+                "google-chrome", "google-chrome-stable", "chromium",
+                "chromium-browser", "firefox", "microsoft-edge",
+            ] {
+                let mut c = Command::new(prog);
+                x8_clean_child_env(&mut c);
+                c.arg(url);
+                match open_checked(c) {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => last = format!("{prog} 退出码非 0"),
+                    Err(e) => last = format!("{prog}: {e}"),
+                }
+            }
+        }
+        // 回落到桌面默认入口（本地目录/文件也只走这里）
         for (prog, need_open) in [("xdg-open", false), ("gio", true), ("www-browser", false)] {
             let mut c = Command::new(prog);
+            x8_clean_child_env(&mut c);
             if need_open { c.arg("open"); }
             c.arg(url);
             match open_checked(c) {
