@@ -47,6 +47,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 🔴 2026-11-06 根治「Key 不匹配」：Secrets 里的 RD_SERVER_KEY 曾经少一个字符
+      # （43 位 vs 正确的 44 位），编译进客户端后与服务端 hbbs 的公钥不等，
+      # 用户侧只看到「Key 不匹配」且无从定位。这里在构建前硬校验，配错直接红。
+      - name: Verify RustDesk server key (must be 44-char base64)
+        run: |
+          set -euo pipefail
+          if [ -z "${RD_SERVER:-}" ]; then echo "::error::RD_SERVER secret 未配置"; exit 1; fi
+          if [ "${#RD_SERVER_KEY}" -ne 44 ]; then
+            echo "::error::RD_SERVER_KEY 长度为 ${#RD_SERVER_KEY}，必须为 44（ed25519 公钥 base64 标准长度）"
+            exit 1
+          fi
+          if [ "${RD_SERVER_KEY: -1}" != "=" ]; then echo "::error::RD_SERVER_KEY 尾部缺少 '='"; exit 1; fi
+          echo "RD_SERVER=${RD_SERVER}；RD_SERVER_KEY 长度 44 ✓"
+
       - name: Install Tauri Linux build deps
         run: |
           set -euo pipefail

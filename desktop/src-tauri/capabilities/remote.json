@@ -30,6 +30,7 @@
     "allow-open-rustdesk",
     "allow-close-rustdesk",
     "allow-ensure-rustdesk",
+    "allow-ensure-assist-server",
     "allow-assist-idle-reap",
     "allow-install-rustdesk",
     "allow-linux-self-update",

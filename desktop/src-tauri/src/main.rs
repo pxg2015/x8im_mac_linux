@@ -165,6 +165,13 @@ fn open_external(url: &str) -> Result<(), String> {
     }
 }
 
+/// 2026-11-07 P2-8：Linux 原生 WebRTC 开关探针。
+/// WebKitSettings:enable-webrtc 自 2.38 起默认 FALSE（官方 reference 明确写了 Default value FALSE），
+/// 而 wry 0.57 / tauri-runtime-wry 2.12 全文没有调用过任何 WebSettings 设置 —— Tauri 建的
+/// WebView 就一直用这个 false。若发行版 webkit2gtk 编译时带了 WebRTC，这里打开后
+/// `window.RTCPeerConnection` 就会出现，Linux 客户端不再只能看直播。
+/// 注意：这仍是探针，需 Linux CI 构建 + 真机用「🔍 诊断」回执确认；编译期没带 WebRTC 的
+/// 发行版（部分精简包）打开也无效，此时 A 方案「去浏览器」仍是兜底。
 #[cfg(target_os = "linux")]
 fn enable_linux_webrtc(app: &tauri::AppHandle) {
     // webkit2gtk 2.0.2 没有 prelude 模块，必须显式导入各 auto trait（写法对齐 wry 0.57）
@@ -305,21 +312,30 @@ fn kill_rustdesk_procs() {
     }
 }
 
-fn ensure_rustdesk_server_config() -> bool {
+fn ensure_rustdesk_server_config() -> Result<(), String> {
+    // 🔴 2026-11-06 根治「Key 不匹配」（老8 报 Windows 连 mac）：
+    // 构建期漏注入时 RD_SERVER_KEY 是空字符串，旧实现照样写盘 → `key = ''`。
+    // 而 rustdesk 的 `get_key()`（src/common.rs:2158）在配置取不到 key 时会**静默回落**
+    // 编译期常量 RS_PUB_KEY（官方公网 key），于是本机带着公网 key 去连自建 hbbs，
+    // 服务端 `rendezvous_server.rs:682` 比对失败 → 客户端只显示「Key 不匹配」，
+    // 既看不出是哪一端、也看不出是空值。故：注入缺失一律拒写并显式报错。
+    if RD_SERVER.is_empty() || RD_SERVER_KEY.is_empty() {
+        return Err("远程协助未配置服务器：本安装包缺少 RD_SERVER / RD_SERVER_KEY 注入，请升级到完整包".into());
+    }
     // Windows：品牌客户端 X8Assist 的配置（实测读写处）
     #[cfg(windows)]
     let (dir, fname) = match x8assist_config_dir() {
         Some(d) => (d, "X8Assist2.toml"),
-        None => return false,
+        None => return Err("未找到 X8Assist 配置目录（远程协助组件可能未安装）".into()),
     };
     // mac/linux：邦信内嵌/依赖的是官方 RustDesk（app-name = RustDesk）
     #[cfg(not(windows))]
     let (dir, fname) = match rustdesk_user_config_dir() {
         Some(d) => (d, "RustDesk2.toml"),
-        None => return false,
+        None => return Err("未找到 RustDesk 配置目录（HOME 不可读）".into()),
     };
-    if std::fs::create_dir_all(&dir).is_err() {
-        return false;
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return Err(format!("创建远程协助配置目录失败：{e}"));
     }
     let path = dir.join(fname);
     let old = std::fs::read_to_string(&path).unwrap_or_default();
@@ -333,7 +349,7 @@ fn ensure_rustdesk_server_config() -> bool {
     if old.lines().any(|l| l.trim() == want_hdr)
         && want.iter().all(|w| old.lines().any(|l| l.trim() == *w))
     {
-        return false;
+        return Ok(());
     }
     // RustDesk 在跑会在退出时回写旧配置 → 先结束再写（三平台同理，kill_rustdesk_procs 已跨平台）
     kill_rustdesk_procs();
@@ -372,7 +388,29 @@ fn ensure_rustdesk_server_config() -> bool {
             content.push('\n');
         }
     }
-    std::fs::write(&path, content).is_ok()
+    if let Err(e) = std::fs::write(&path, &content) {
+        return Err(format!("写入远程协助配置失败（{}）：{e}", path.display()));
+    }
+    // 写盘后**回读校验**：RustDesk 只在进程启动时读一次配置，写错/写丢等于静默失效
+    // （历史病灶：配置路径写错无人读取，全靠 dll 编译期注入兜底）。
+    let now = std::fs::read_to_string(&path).unwrap_or_default();
+    let ok = now.lines().any(|l| l.trim() == want_hdr)
+        && want.iter().all(|w| now.lines().any(|l| l.trim() == *w));
+    if !ok {
+        return Err(format!("远程协助配置写入后校验失败：{}", path.display()));
+    }
+    Ok(())
+}
+
+/// 2026-11-06 根治「Key 不匹配」补强（老8 授权「根治」）：三端登录后都无条件对齐一次远控服务器配置。
+/// 此前只有 Windows 在登录同步里写配置，mac/linux **只在用户点「接受协助」时才写** →
+/// 没点过的机器配置里根本没有 key，rustdesk 便回落官方公网 key，表现为「连不上、报 Key 不匹配」。
+/// 本命令只做幂等写盘（一致时不动文件、不杀进程、不弹任何系统授权），可安全地在登录链路调用。
+#[tauri::command]
+async fn ensure_assist_server() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(ensure_rustdesk_server_config)
+        .await
+        .map_err(|e| format!("远程协助配置线程异常：{e}"))?
 }
 
 fn rustdesk_get_id(app: &tauri::AppHandle) -> Result<String, String> {
@@ -1243,7 +1281,9 @@ fn ensure_rustdesk_blocking(app: tauri::AppHandle, expected_rid: String, passwor
     #[cfg(not(windows))]
     let exe = rustdesk_path(&app).ok_or("内置 RustDesk 缺失")?;
     // 先幂等写自建服务器配置（可能结束在跑的 RustDesk），再取 ID（新起进程即读新配置）
-    let _ = ensure_rustdesk_server_config();
+    // 🔴 2026-11-06：失败必须上抛 —— 配置写不进去就别取 ID，否则拿到的是官方节点的身份，
+    // 后续连接一律「Key 不匹配」，且用户完全看不出根因。
+    ensure_rustdesk_server_config().map_err(|e| format!("远程协助服务器配置未就绪：{e}"))?;
     // 2026-10-16 A+：前端统一传 expectedRid=''，不再在此早退。平台分支各自读取/设置本机密码
     // （Windows 读 %PROGRAMDATA%\X8Assist\x8pwd.txt；非 Windows 用前端生成的随机密码经 --password 提权设置），
     // 以便被控端也能把 per-device 密码上报服务端，控制端 getconn 才能免确认直连。
@@ -1958,7 +1998,8 @@ async fn open_rustdesk(app: tauri::AppHandle, target: String, password: Option<S
         // 2026-10-15 老8 要求：先结束已有实例再拉起，避免多实例并存（hbbs 注册互踩）
         kill_rustdesk_procs();
         // 2026-10-15：连接前幂等确保自建服务器配置已写入（防「配置没落位」打回公共节点）
-        let _ = ensure_rustdesk_server_config();
+        // 🔴 2026-11-06：写不进去直接报错，别把用户送到官方节点去撞「Key 不匹配」
+        ensure_rustdesk_server_config().map_err(|e| format!("远程协助服务器配置未就绪：{e}"))?;
         // 2026-10-16 老8：本机进入待控状态前，先把「连接管理器窗口」（含权限面板）关成不显示
         ensure_approve_config();
         // 2026-10-15 老8 定：必须品牌化 X8Assist.exe，未装报错提示重装/升级
@@ -1977,7 +2018,8 @@ async fn open_rustdesk(app: tauri::AppHandle, target: String, password: Option<S
         // 纯数字 = 对方 ID，直接发起控制；带密码则一并下发（免输密码/免确认）
         // 2026-10-15：连接前幂等确保自建服务器配置已写入（防「配置没落位就直连」打回公共节点）
         // 2026-10-15 老8 要求：先结束已有实例再拉起，避免多实例并存
-        let _ = ensure_rustdesk_server_config();
+        // 🔴 2026-11-06：同上，配置未就绪一律中断，不静默连公共节点
+        ensure_rustdesk_server_config().map_err(|e| format!("远程协助服务器配置未就绪：{e}"))?;
         kill_rustdesk_procs();
         // 2026-10-16 老8：旧实例已退出、新进程尚未启动 —— 正是把本机保存的该对端偏好
         // 写成顺手值的时机（画面适应窗口 + 收起工具栏），用户点一下就走，不必再调菜单。
@@ -6095,6 +6137,8 @@ fn main() {
             // command not found，空闲回收静默失效（1.5.6 修复）。
             assist_idle_reap,
             ensure_rustdesk,
+            // 2026-11-06：三端登录后无条件对齐远控服务器配置（只写盘，不提权、不拉进程）
+            ensure_assist_server,
             // 2026-10-17：Linux 缺远程协助组件时一键安装（Windows/mac 恒返回 already）
             install_rustdesk,
             // 2026-11-06 Linux P2P 传输内核（Go+pion sidecar；非 Linux 返回 null）
@@ -6174,7 +6218,8 @@ fn main() {
         .setup(|app| {
             // 2026-11-06：本地落盘 HTTP 服务（绕开 WebView2 IPC 大包「发了不回」）
             save_http_start();
-            // 2026-11-07 P2-8 探针：Linux WebKitGTK enable-webrtc 默认 FALSE
+            // 2026-11-07 P2-8 探针：Linux WebKitGTK 默认 enable-webrtc=FALSE，wry 没开。
+            // 显式打开；前端黄条上的「🔍 诊断」可复制真机的 RTCPeerConnection 状态用于验收。
             #[cfg(target_os = "linux")]
             enable_linux_webrtc(app.handle());
             // 2026-11-04 回退：主窗口恢复为 tauri.conf.json 配置创建（additionalBrowserArgs
