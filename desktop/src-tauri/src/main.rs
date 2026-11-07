@@ -167,7 +167,15 @@ fn open_external(url: &str) -> Result<(), String> {
 
 #[cfg(target_os = "linux")]
 fn enable_linux_webrtc(app: &tauri::AppHandle) {
-    use webkit2gtk::{prelude::*, UserMediaPermissionRequest};
+    // webkit2gtk 2.0.2 没有 prelude 模块，必须显式导入各 auto trait（写法对齐 wry 0.57）
+    use webkit2gtk::{
+        glib::prelude::*,                 // Cast: downcast_ref
+        PermissionRequestExt,            // allow / deny
+        SettingsExt,                     // set_enable_webrtc
+        UserMediaPermissionRequest,
+        UserMediaPermissionRequestExt,   // is_for_audio_device / is_for_video_device
+        WebViewExt,                      // connect_permission_request / settings
+    };
     let Some(win) = app.get_webview_window("main") else {
         eprintln!("[x8][webrtc] main webview 未找到，开关未生效");
         return;
