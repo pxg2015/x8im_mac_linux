@@ -80,6 +80,16 @@
     "allow-x8-nav",
     "allow-x8-auth-save",
     "allow-x8-auth-load",
-    "allow-x8-auth-clear"
+    "allow-x8-auth-clear",
+    "allow-mail-config-get",
+    "allow-mail-config-set",
+    "allow-mail-config-clear",
+    "allow-mail-list",
+    "allow-mail-sync",
+    "allow-mail-read",
+    "allow-mail-attachment",
+    "allow-mail-mark-seen",
+    "allow-mail-send",
+    "allow-mail-unseen"
   ]
 }

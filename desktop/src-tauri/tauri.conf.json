@@ -1,6 +1,6 @@
 {
   "productName": "BangXin",
-  "version": "1.6.69",
+  "version": "1.6.75",
   "identifier": "com.x8fde.im",
   "build": {
     "frontendDist": "../dist"
@@ -11,7 +11,7 @@
       {
         "label": "main",
         "title": "邦信",
-        "url": "https://im.x8fde.com/app/?v=1.6.69",
+        "url": "https://im.x8fde.com/app/?v=1.6.75",
         "width": 1180,
         "height": 800,
         "minWidth": 800,

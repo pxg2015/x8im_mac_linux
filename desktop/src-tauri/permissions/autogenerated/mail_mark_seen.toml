@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-mail-mark-seen"
+description = "Enables the mail_mark_seen command without any pre-configured scope."
+commands.allow = ["mail_mark_seen"]
+
+[[permission]]
+identifier = "deny-mail-mark-seen"
+description = "Denies the mail_mark_seen command without any pre-configured scope."
+commands.deny = ["mail_mark_seen"]

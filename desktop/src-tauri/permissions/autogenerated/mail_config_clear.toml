@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-mail-config-clear"
+description = "Enables the mail_config_clear command without any pre-configured scope."
+commands.allow = ["mail_config_clear"]
+
+[[permission]]
+identifier = "deny-mail-config-clear"
+description = "Denies the mail_config_clear command without any pre-configured scope."
+commands.deny = ["mail_config_clear"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-ensure-assist-server"
+description = "Enables the ensure_assist_server command without any pre-configured scope."
+commands.allow = ["ensure_assist_server"]
+
+[[permission]]
+identifier = "deny-ensure-assist-server"
+description = "Denies the ensure_assist_server command without any pre-configured scope."
+commands.deny = ["ensure_assist_server"]

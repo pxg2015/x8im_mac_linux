@@ -37,6 +37,24 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # 2026-11-03 三端单实例：mac/linux 用 Unix 域套接字作锁+唤醒通道，需 getuid()/kill(pid,0)
 libc = "0.2"
 
+# ── 2026-11-07 内置邮件（邦信 Email，Rust 原生，方案 A）──
+# 收信 IMAP 993 SSL / 发信 SMTP 465 SSL / MIME 解析 / 凭据进系统凭据库。
+# native-tls 沿用项目既有 TLS 栈（reqwest 已带 openssl-sys），不新增系统级依赖；
+# 全部走同步阻塞调用 + spawn_blocking，不占 WebView 主线程，也不引入新 tokio feature。
+imap = "2.4.1"
+native-tls = "0.2"
+# 2026-11-08 修中文主题/正文乱码：默认 features= [] 时 GBK/GB2312/Big5 解码器直接
+# from_utf8_lossy（每个字节变 U+FFFD，界面显示成实心菱形 ◆）。开 full_encoding 后走
+# encoding_rs；encoding_rs-0.8.42 已在本机 cargo 缓存，离线可构建。
+mail-parser = { version = "0.11.9", features = ["full_encoding"] }
+lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "native-tls"] }
+keyring = "2.3.3"
+base64 = "0.22"
+chrono = "0.4"
+# 2026-11-08 客户端 SQLite 邮件缓存：清单/正文/已发送落 app_data_dir/mail.db，
+# 进来先读缓存秒开，再后台做 IMAP 增量同步。bundled = 编译内置 SQLite，不依赖系统库。
+rusqlite = { version = "0.32", features = ["bundled"] }
+
 # 2026-11-07 P2-8 探针：Linux WebKitGTK 的 `enable-webrtc` 设置默认 FALSE（WebKitGTK 2.38+），
 # wry/tauri 都没去开它 —— 这正是 Linux 客户端 `RTCPeerConnection` 不存在的可疑原因之一。
 # 这里显式启用；v2_38 是 set_enable_webrtc 的 feature 门（wry 已带 v2_40，feature 会合并）。
@@ -55,6 +73,10 @@ webkit2gtk = { version = "2.0.2", features = ["v2_38"] }
 # 2026-11-05 追加 Win32_System_Com：CoTaskMemFree 释放 SHGetKnownFolderPath 返回的
 # PWSTR（programdata_dir() 用它兜底 %ProgramData%，不再单靠环境变量）。
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_System_Threading", "Win32_Security", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_Com", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_UI_Input_KeyboardAndMouse"] }
+# 2026-11-07 方案 B PoC：WebResourceRequested 拦截 /app/assets/*（版本跟随 wry 0.57 的传递依赖，
+# 已在 Cargo.lock 中，不新增下载）。Win32_UI_Shell 提供 SHCreateMemStream。
+webview2-com = "0.39"
+windows = { version = "0.62", features = ["Win32_UI_Shell", "Win32_System_Com"] }
 
 # ── 2026-10-23 体积优化（安装包瘦身 50MB → 约 31MB）──
 # 实测：未加本段时 x8im.exe = 38.7MB（release 默认 opt-level=3 + lto=false + strip=false）。
