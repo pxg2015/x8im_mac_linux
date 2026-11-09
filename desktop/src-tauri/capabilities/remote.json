@@ -90,6 +90,7 @@
     "allow-mail-attachment",
     "allow-mail-mark-seen",
     "allow-mail-send",
-    "allow-mail-unseen"
+    "allow-mail-unseen",
+    "allow-mail-secret-get"
   ]
 }

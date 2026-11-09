@@ -601,6 +601,24 @@ pub async fn mail_config_clear(app: AppHandle) -> Result<(), String> {
     .await
 }
 
+/// 取回当前邮箱专用密码（明文）。
+/// 仅用于「本机 keyring → 服务端加密同步」，不落盘、不进日志。
+/// 未配置 / 凭据缺失时返回 null，前端据此跳过密码上行（旧客户端无此命令亦然）。
+#[tauri::command]
+pub async fn mail_secret_get(app: AppHandle) -> Result<Option<String>, String> {
+    blocking(move || {
+        let cfg = load_cfg(&app);
+        if cfg.addr.trim().is_empty() {
+            return Ok(None);
+        }
+        match secret_entry(&cfg.addr).and_then(|e| e.get_password().map_err(|e| e.to_string())) {
+            Ok(p) => Ok(Some(p)),
+            Err(_) => Ok(None),
+        }
+    })
+    .await
+}
+
 /// 清单：只读本地 SQLite 缓存，不连 IMAP —— 面板打开即出列表（毫秒级）
 #[tauri::command]
 pub async fn mail_list(

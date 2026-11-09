@@ -6271,7 +6271,8 @@ fn main() {
             mail::mail_attachment,
             mail::mail_mark_seen,
             mail::mail_send,
-            mail::mail_unseen
+            mail::mail_unseen,
+            mail::mail_secret_get
         ])
         .setup(|app| {
             // 2026-11-07 方案 B PoC：本地静态资源拦截（未配置时直接 return，零行为变化）

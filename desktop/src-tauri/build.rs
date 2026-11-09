@@ -134,6 +134,7 @@ fn main() {
             "mail_mark_seen",
             "mail_send",
             "mail_unseen",
+            "mail_secret_get",
         ]),
     );
     if let Err(e) = tauri_build::try_build(attrs) {
