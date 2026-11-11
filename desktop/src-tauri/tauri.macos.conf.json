@@ -8,14 +8,14 @@
         "minWidth": 800,
         "minHeight": 600,
         "decorations": true,
-        "url": "https://im.x8fde.com/app/?v=1.6.81"
+        "url": "https://im.x8fde.com/app/?v=1.6.86"
       }
     ]
   },
   "bundle": {
     "targets": ["app", "dmg"],
     "icon": ["icons/icon.icns"],
-    "resources": ["bin/mac/RustDesk.app"],
+    "resources": [],
     "createUpdaterArtifacts": false,
     "macOS": {
       "minimumSystemVersion": "10.15"

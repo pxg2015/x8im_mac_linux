@@ -1,6 +1,6 @@
 {
   "productName": "BangXin",
-  "version": "1.6.85",
+  "version": "1.6.86",
   "identifier": "com.x8fde.im",
   "build": {
     "frontendDist": "../dist"
@@ -37,7 +37,6 @@
     "shortDescription": "邦信 企业即时通讯与协同办公客户端",
     "longDescription": "邦信是面向企业的一体化协同客户端，提供即时通讯、群组协作、远程协助与工作台能力。",
     "resources": [
-      "bin/X8Assist/**/*",
       "post-update.cmd",
       "icons/icon.ico",
       "elevate.exe"

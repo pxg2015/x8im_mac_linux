@@ -108,6 +108,12 @@ fn rustdesk_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
         if let Some(p) = installed_assist_path() {
             return Some(p);
         }
+        // mac 2026-11-11 方案 A：组件改为按需下载到用户目录缓存，优先于安装包内资源
+        // （自 1.6.86 起安装包不再内置 RustDesk.app）。
+        #[cfg(target_os = "macos")]
+        if let Some(p) = macos_cached_exe() {
+            return Some(p);
+        }
         let dir = app.path().resource_dir().ok()?;
         // mac：不拼死文件名 —— 官方包内可执行叫 `RustDesk`（大写），
         // 一律从 Info.plist 的 CFBundleExecutable 取（见 macos_bundle_exe）
@@ -481,7 +487,7 @@ async fn ensure_assist_server() -> Result<(), String> {
 }
 
 fn rustdesk_get_id(app: &tauri::AppHandle) -> Result<String, String> {
-    let exe = rustdesk_path(app).ok_or("内置 RustDesk 缺失")?;
+    let exe = rustdesk_path(app).ok_or("远程协助组件未安装")?;
     let out = Command::new(&exe)
         .arg("--get-id")
         .output()
@@ -829,6 +835,27 @@ fn macos_bundle_exe(app: &std::path::Path) -> Option<std::path::PathBuf> {
 fn macos_installed_exe() -> Option<std::path::PathBuf> {
     macos_bundle_exe(std::path::Path::new("/Applications/RustDesk.app"))
 }
+
+/// mac 按需下载组件的缓存目录（2026-11-11 方案 A）。
+///
+/// 刻意不用 app_data_dir / local_data_dir：那两个目录（identifier com.x8fde.im）
+/// 在启动时会被清理（见 main() setup 注释），缓存会被反复删掉重下。
+/// 用独立 `~/Library/Application Support/BangXin/assist`，与 Windows 的
+/// `%ProgramData%\BangXin\assist` 对称，卸载/升级都不受影响。
+#[cfg(target_os = "macos")]
+fn macos_assist_cache_dir() -> Option<std::path::PathBuf> {
+    std::env::var("HOME")
+        .ok()
+        .map(|h| std::path::Path::new(&h).join("Library/Application Support/BangXin/assist"))
+}
+
+/// mac 缓存里的可执行文件（`.../assist/bin/mac/RustDesk.app/Contents/MacOS/<CFBundleExecutable>`）。
+#[cfg(target_os = "macos")]
+fn macos_cached_exe() -> Option<std::path::PathBuf> {
+    let dir = macos_assist_cache_dir()?.join("bin").join("mac");
+    macos_bundle_exe(&dir.join("RustDesk.app"))
+}
+
 
 /// mac：尽力清掉**资源包内那份** bundle 的 quarantine（无提权、失败静默）。
 ///
@@ -1346,7 +1373,7 @@ async fn ensure_rustdesk(app: tauri::AppHandle, expected_rid: String, password: 
 fn ensure_rustdesk_blocking(app: tauri::AppHandle, expected_rid: String, password: String) -> Result<EnsureOut, String> {
     // 2026-10-15 老8 定：Windows 只认品牌化 X8Assist，便携 rustdesk.exe 不再参与安装链路
     #[cfg(not(windows))]
-    let exe = rustdesk_path(&app).ok_or("内置 RustDesk 缺失")?;
+    let exe = rustdesk_path(&app).ok_or("远程协助组件未安装")?;
     // 先幂等写自建服务器配置（可能结束在跑的 RustDesk），再取 ID（新起进程即读新配置）
     // 🔴 2026-11-06：失败必须上抛 —— 配置写不进去就别取 ID，否则拿到的是官方节点的身份，
     // 后续连接一律「Key 不匹配」，且用户完全看不出根因。
@@ -1586,7 +1613,11 @@ async fn install_rustdesk() -> Result<String, String> {
         {
             linux_install_rustdesk()
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            mac_install_rustdesk()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             Ok("already".to_string())
         }
@@ -1594,6 +1625,121 @@ async fn install_rustdesk() -> Result<String, String> {
     .await
     .map_err(|e| format!("远程协助组件安装线程异常：{e}"))?
 }
+
+/// mac：按需下载官方 RustDesk.app 到用户目录缓存（2026-11-11 方案 A）。
+///
+/// 与 Windows 共用一份清单（latest-assist.json，按架构取 darwin-aarch64 /
+/// darwin-x86_64，带 sha256 校验）。解压后放 `~/Library/Application Support/
+/// BangXin/assist/bin/mac/`，清 quarantine 后直接 exec。
+///
+/// 与 Windows 的关键差异：**不写 /Applications，因此不需要提权、不弹密码**——
+/// 写 /Applications 属于系统目录，那才是之前弹管理员框的原因。
+///
+/// 为什么用 ditto 而不是 cp -R：RustDesk.app 的 framework 里有 `Versions/Current`
+/// 符号链接，cp -R 在部分场景会把它解引用成实体目录，破坏签名（CI 里踩过同一坑）。
+#[cfg(target_os = "macos")]
+fn mac_install_rustdesk() -> Result<String, String> {
+    if macos_cached_exe().is_some() || macos_installed_exe().is_some() {
+        return Ok("already".into());
+    }
+    let dir = macos_assist_cache_dir().ok_or("HOME 不可读，无法定位组件缓存目录")?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建组件缓存目录失败：{e}"))?;
+
+    let man = dir.join("latest-assist.json");
+    let _ = std::fs::remove_file(&man);
+    let _ = Command::new("/usr/bin/curl")
+        .args(["-L", "--fail", "-s", "--max-time", "60", "-o"])
+        .arg(&man)
+        .arg("https://im.x8fde.com/app/latest-assist.json")
+        .status();
+
+    let plat = if cfg!(target_arch = "aarch64") {
+        "darwin-aarch64"
+    } else {
+        "darwin-x86_64"
+    };
+    let mut url = String::new();
+    let mut want_sha = String::new();
+    if let Ok(txt) = std::fs::read_to_string(&man) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+            if let Some(p) = v.get("platforms").and_then(|p| p.get(plat)) {
+                url = p.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string();
+                want_sha = p.get("sha256").and_then(|s| s.as_str()).unwrap_or("").to_string();
+            }
+        }
+    }
+    if url.is_empty() {
+        return Err("远程协助组件清单不可用（请检查网络后重试）".into());
+    }
+
+    let tgz = dir.join("RustDesk.app.tar.gz");
+    let _ = std::fs::remove_file(&tgz);
+    let dl = Command::new("/usr/bin/curl")
+        .args(["-L", "--fail", "-s", "--max-time", "600", "-o"])
+        .arg(&tgz)
+        .arg(&url)
+        .status();
+    if !matches!(dl, Ok(s) if s.success()) || !tgz.is_file() {
+        return Err("远程协助组件下载失败（请检查网络后重试）".into());
+    }
+    if !want_sha.is_empty() {
+        use sha2::{Digest, Sha256};
+        match std::fs::read(&tgz) {
+            Ok(bytes) => {
+                let got = format!("{:x}", Sha256::digest(&bytes));
+                if got != want_sha {
+                    let _ = std::fs::remove_file(&tgz);
+                    return Err("组件包校验失败（下载不完整），请重试".into());
+                }
+            }
+            Err(e) => return Err(format!("读取组件包失败：{e}")),
+        }
+    }
+
+    let stage = dir.join("stage");
+    let _ = std::fs::remove_dir_all(&stage);
+    std::fs::create_dir_all(&stage).map_err(|e| format!("创建解压目录失败：{e}"))?;
+    let ex = Command::new("/usr/bin/tar")
+        .arg("-xzf")
+        .arg(&tgz)
+        .arg("-C")
+        .arg(&stage)
+        .status()
+        .map_err(|e| format!("解压组件失败：{e}"))?;
+    if !ex.success() {
+        let _ = std::fs::remove_dir_all(&stage);
+        return Err("组件解压失败，请重试".into());
+    }
+    let src = stage.join("RustDesk.app");
+    if !src.is_dir() {
+        let _ = std::fs::remove_dir_all(&stage);
+        return Err("组件包内容异常（缺 RustDesk.app），请重试".into());
+    }
+    let dst_dir = dir.join("bin").join("mac");
+    std::fs::create_dir_all(&dst_dir).map_err(|e| format!("创建组件目录失败：{e}"))?;
+    let dst = dst_dir.join("RustDesk.app");
+    let _ = std::fs::remove_dir_all(&dst);
+    let dt = Command::new("/usr/bin/ditto")
+        .arg(&src)
+        .arg(&dst)
+        .status()
+        .map_err(|e| format!("落位组件失败：{e}"))?;
+    let _ = std::fs::remove_dir_all(&stage);
+    let _ = std::fs::remove_file(&tgz);
+    if !dt.success() {
+        return Err("组件落位失败，请重试".into());
+    }
+    // 清隔离标记：不清会触发 Gatekeeper「已损坏」。用户对自己的文件有 xattr 权限，无需提权。
+    let _ = Command::new("/usr/bin/xattr")
+        .args(["-dr", "com.apple.quarantine"])
+        .arg(&dst)
+        .output();
+    if macos_cached_exe().is_none() {
+        return Err("组件安装后未找到可执行文件，请到下载页手动安装".into());
+    }
+    Ok("installed".into())
+}
+
 
 /// Linux：PATH 里是否已有可执行的 rustdesk（与 rustdesk_path() 同判据）。
 /// 注意这是实时扫目录、不是进程启动时的缓存，所以刚装完立刻调用也能发现。
@@ -2032,11 +2178,20 @@ fn assist_exe(_app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
 /// 只有它还不存在（首次、尚未走过 ensure_rustdesk）时才回落资源包。
 #[cfg(not(windows))]
 fn assist_exe(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    // mac 2026-11-11 方案 A：优先按需下载的缓存（与 ensure_rustdesk 的 rustdesk_path 同源，
+    // 满足「--password 与启动必须是同一份」），其次才是历史上落位到 /Applications 的那份
+    // （老机器升级上来的），最后回落到安装包内资源（1.6.86 起已无）。
+    #[cfg(target_os = "macos")]
+    if let Some(p) = macos_cached_exe() {
+        return Ok(p);
+    }
     #[cfg(target_os = "macos")]
     if let Some(p) = macos_installed_exe() {
         return Ok(p);
     }
-    rustdesk_path(app).ok_or_else(|| "内置 RustDesk 缺失".to_string())
+    rustdesk_path(app).ok_or_else(|| {
+        "远程协助组件未安装，请在「远程协助」里点安装，或到下载页手动安装组件".to_string()
+    })
 }
 
 /// 拉起 rustdesk:// 协议或直连（控制方用），绕过 WebView 外链限制。
