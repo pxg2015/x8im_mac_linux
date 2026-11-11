@@ -198,6 +198,8 @@ pub fn launch_user(bin: &Path, args: &[String], token: &str, port: u16) -> Resul
     }
 
     // 3) 以当前用户 load（无需管理员）。优先用现代 bootstrap gui 域；失败退用旧式 load。
+    let label = format!("gui/{uid}/com.x8fde.im.wxgo");
+    let mut diag = String::new();
     let out = Command::new("/bin/launchctl")
         .args([
             "bootstrap",
@@ -207,9 +209,29 @@ pub fn launch_user(bin: &Path, args: &[String], token: &str, port: u16) -> Resul
         .output();
     let bootstrap_ok = matches!(out, Ok(ref o) if o.status.success());
     if !bootstrap_ok {
+        if let Ok(o) = &out {
+            diag.push_str(&format!(
+                "bootstrap 失败：{}\n",
+                String::from_utf8_lossy(&o.stderr).trim()
+            ));
+        }
         let _ = Command::new("/bin/launchctl")
             .args(["load", &plist_path.display().to_string()])
             .output();
+    }
+
+    // 3.5) 真正拉起：plist RunAtLoad=false，必须显式 kickstart，否则只注册不运行
+    //      （表现为「无日志 + 端口超时」——这是 1.6.84 失败的根因）。
+    let ks = Command::new("/bin/launchctl")
+        .args(["kickstart", "-k", &label])
+        .output();
+    if let Ok(o) = &ks {
+        if !o.status.success() {
+            diag.push_str(&format!(
+                "kickstart 失败：{}\n",
+                String::from_utf8_lossy(&o.stderr).trim()
+            ));
+        }
     }
 
     // 4) 等端口就绪（探测前先 settle 500ms，让 launchd 真正拉起进程；总上限 12s）。
@@ -226,14 +248,20 @@ pub fn launch_user(bin: &Path, args: &[String], token: &str, port: u16) -> Resul
             return Ok(());
         }
     }
-    // 超时：把真实死因（panic / 端口被旧 root 守护强占 / 签名拦截）从日志尾巴拼进错误。
+    // 超时：把真实死因（bootstrap/kickstart 报错 / 签名拦截 / panic）从日志 + 诊断拼进错误。
     let tail = read_log_tail(&log_path, 40);
     let _ = fs::remove_file(&tok_path);
-    Err(format!(
-        "微信插件启动超时，端口 {port} 未就绪。{tail}\n\
-         若提示端口被占用，多是 1.6.83 的旧 root 守护未清掉，请手动：\
-         sudo launchctl bootout system/com.x8fde.im.wxgo"
-    ))
+    let mut reason = format!("微信插件启动超时，端口 {port} 未就绪。{tail}");
+    if !diag.trim().is_empty() {
+        reason.push_str(&format!("\nlaunchctl 诊断：\n{diag}"));
+    }
+    if tail.contains("无日志") {
+        reason.push_str(
+            "\n若提示端口被占用，多是 1.6.83 的旧 root 守护未清掉，请手动：\
+             sudo launchctl bootout system/com.x8fde.im.wxgo",
+        );
+    }
+    Err(reason)
 }
 
 /// 当前用户家目录（HOME）。
