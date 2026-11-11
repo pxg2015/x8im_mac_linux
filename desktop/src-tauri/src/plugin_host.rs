@@ -487,7 +487,16 @@ impl Plugin {
                     .replace("{root}", &root)
                     .replace("{id}", &self.spec.id)
             };
-            let args: Vec<String> = self.spec.args.iter().map(|a| sub(a)).collect();
+            // mac 上插件由 LaunchDaemon 以 root 拉起，无父进程管道：
+            // ① 去掉 --parent-watch（否则 wxgo 会因 stdin EOF 误判父进程已死而自退）；
+            // ② 令牌改经 X8TOKEN_FILE 临时文件注入（见 mac_wx_setup::launch_root）。
+            let args: Vec<String> = self
+                .spec
+                .args
+                .iter()
+                .filter(|a| a.as_str() != "--parent-watch")
+                .map(|a| sub(a.as_str()))
+                .collect();
             let token = self.gen_token()?;
             *self.token.lock().unwrap() = token.clone();
             // 以 root 经 osascript 提权拉起，函数内已等端口就绪；握手时 pid==0 会跳过
