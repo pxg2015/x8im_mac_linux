@@ -29,6 +29,9 @@ tokio = { version = "1", features = ["time", "rt"] }
 serde_json = "1"
 # 组件式静默升级：验签 portable zip（与 tauri 同一把 minisign 密钥）
 minisign-verify = "0.2"
+# 2026-11-10 WX 插件：令牌用 OS CSPRNG 生成（plugin_host::gen_token）；下载校验 sha256
+getrandom = "0.3"
+sha2 = "0.10"
 # 修复 indexmap 未启用 std feature 导致 IndexMap 缺省泛型参数丢失（schemars 编译失败）
 indexmap = { version = "1.9", features = ["std"] }
 # 2026-10-23 托盘亮色图标：编译期内嵌 icons/tray.png，需解码 PNG→RGBA 供 Image::new_owned。

@@ -91,6 +91,26 @@
     "allow-mail-mark-seen",
     "allow-mail-send",
     "allow-mail-unseen",
-    "allow-mail-secret-get"
+    "allow-mail-secret-get",
+    "allow-plugins-list",
+    "allow-wx-plugin-info",
+    "allow-wx-plugin-start",
+    "allow-wx-plugin-prepare",
+    "allow-wx-plugin-update-now",
+    "allow-wx-plugin-stop",
+    "allow-wx-conversations",
+    "allow-wx-messages",
+    "allow-wx-contacts",
+    "allow-wx-follow-get",
+    "allow-wx-follow-set",
+    "allow-wx-customer-list",
+    "allow-wx-customer-set",
+    "allow-wx-status",
+    "allow-wx-sync-now",
+    "allow-wx-set-active",
+    "allow-wx-pick-messages",
+    "allow-wx-media-data",
+    "allow-wx-setup-state",
+    "allow-wx-setup-run"
   ]
 }

@@ -25,6 +25,19 @@ pub fn db_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir.join("mail.db"))
 }
 
+/// 应用数据目录（app_data_dir），确保存在。
+///
+/// 同时是 wxgo 插件的 --data-dir：插件把 config.json / wxgo.log / 密钥放这里，
+/// 归档库指向同目录的 mail.db（见 wx_sidecar.rs）。
+pub fn data_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("无法定位应用数据目录：{e}"))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建数据目录失败：{e}"))?;
+    Ok(dir)
+}
+
 pub fn open(app: &AppHandle) -> Result<Connection, String> {
     let p = db_path(app)?;
     let c = Connection::open(&p).map_err(|e| format!("打开邮件缓存失败：{e}"))?;

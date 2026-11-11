@@ -38,6 +38,27 @@ mod local_assets;
 mod p2p_sidecar;
 mod mail;   // 2026-11-07 内置邮件（Rust 原生 IMAP/SMTP，方案 A）
 mod mail_cache; // 2026-11-08 客户端 SQLite 邮件缓存（清单/正文秒开）
+// 2026-11-10 WX 消息插件机制（与 Windows 同源，三端命令表一致）
+mod plugin_host; // 通用插件宿主：找到 → 拉起 → 验契约 → 看门狗 → 退出回收
+mod wx_sidecar;  // WX 消息插件（Go）薄封装，转调 plugin_host
+mod wx_cache;    // 本地微信消息库（mail.db 的 wx_* 表，客户端读写）
+mod signing;     // 组件包三端共用验签（minisign，与 updater 同一把公钥）
+mod wx_updater;  // wxgo 组件自动下载 / 更新 / 编译时间上报
+// macOS 读微信前置条件检测 + 提权拉起（mac 专用；linux 回落同名同签名空实现）
+#[cfg(target_os = "macos")]
+mod mac_wx_setup;
+#[cfg(not(target_os = "macos"))]
+mod mac_wx_setup {
+    use serde_json::Value;
+    #[tauri::command]
+    pub fn wx_setup_state() -> Value {
+        serde_json::json!({ "supported": false })
+    }
+    #[tauri::command]
+    pub fn wx_setup_run() -> Value {
+        serde_json::json!({ "ok": false, "err": "当前平台不支持" })
+    }
+}
 
 // 非 Windows：mac/linux 的升级走「下载新包手动装 / 系统包管理器」，
 // 不参与这套 Windows 自主升级状态机（它依赖 schtasks / NSIS / Win32 原生窗）。
@@ -6272,7 +6293,30 @@ fn main() {
             mail::mail_mark_seen,
             mail::mail_send,
             mail::mail_unseen,
-            mail::mail_secret_get
+            mail::mail_secret_get,
+            // 2026-11-10 WX 消息（插件 + 本地 wx_* 表；四处同步：本表 / build.rs
+            //   AppManifest / capabilities/remote.json / 命令定义处）
+            wx_cache::plugins_list,
+            wx_cache::wx_plugin_info,
+            wx_cache::wx_plugin_start,
+            wx_cache::wx_plugin_prepare,
+            wx_cache::wx_plugin_update_now,
+            wx_cache::wx_plugin_stop,
+            wx_cache::wx_conversations,
+            wx_cache::wx_messages,
+            wx_cache::wx_contacts,
+            wx_cache::wx_follow_get,
+            wx_cache::wx_follow_set,
+            wx_cache::wx_customer_list,
+            wx_cache::wx_customer_set,
+            wx_cache::wx_status,
+            wx_cache::wx_sync_now,
+            wx_cache::wx_set_active,
+            wx_cache::wx_pick_messages,
+            wx_cache::wx_media_data,
+            // 2026-11-10 macOS 读微信前置条件检测 + 提权重签（mac 专用，其余平台恒返回 unsupported）
+            mac_wx_setup::wx_setup_state,
+            mac_wx_setup::wx_setup_run
         ])
         .setup(|app| {
             // 2026-11-07 方案 B PoC：本地静态资源拦截（未配置时直接 return，零行为变化）
