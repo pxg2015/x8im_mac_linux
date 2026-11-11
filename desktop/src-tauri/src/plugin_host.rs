@@ -678,6 +678,18 @@ impl Plugin {
                 std::thread::sleep(Duration::from_millis(300));
             }
             crate::mac_wx_setup::kill_by_port(self.spec.port);
+            // kill 之后必须等端口真正释放：TERM → 进程退出有窗口期。若紧接着
+            // install_from + launch_user，旧进程还占着端口 → ensure 探活即复用，
+            // 结果「二进制已换、跑的还是旧进程」，且版本文件写新版后永不再更新
+            // （2026-11-11 实测：诊断版 wxgo 装不上正是这个原因）。
+            if let Ok(a) = format!("127.0.0.1:{}", self.spec.port).parse::<SocketAddr>() {
+                for _ in 0..50 {
+                    if TcpStream::connect_timeout(&a, Duration::from_millis(150)).is_err() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
             self.pid.store(0, Ordering::Relaxed);
             return;
         }

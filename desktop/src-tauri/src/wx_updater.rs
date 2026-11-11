@@ -251,7 +251,7 @@ pub fn prepare(app: &AppHandle, force: bool) -> Result<Value, String> {
         let s = state().lock().unwrap();
         s.remote.as_ref().map(|m| (m.version.clone(), m.build_time.clone(), m.contract_min, m.platforms.clone()))
     };
-    if let Some((ver, _bt, cmin, plats)) = remote {
+    if let Some((ver, rbt, cmin, plats)) = remote {
         if cmin > HOST_CONTRACT {
             set_error(format!("组件要求契约版本 {cmin}，当前客户端仅 {HOST_CONTRACT}"));
             let _ = start_and_probe(app);
@@ -304,16 +304,44 @@ pub fn prepare(app: &AppHandle, force: bool) -> Result<Value, String> {
                 }
             }
         } else {
+            // 版本文件已是最新，但**跑着的进程未必是磁盘上这份**：
+            // mac 上插件由 LaunchAgent 拉起，宿主不持子进程句柄。若「二进制已被覆盖、
+            // 旧进程仍占着端口」，start_and_probe 探到端口活着就直接复用了旧实例，
+            // 版本文件还照样写新版 —— 于是永远停在旧版、再不触发更新
+            // （2026-11-11 实测：诊断文件写不出来正是这个原因）。
+            // 这里用进程自报的 buildTime 与清单比对，落后就停掉重启一次（只一次，防抖）。
             match start_and_probe(app) {
                 Ok(bt) if !bt.is_empty() => {
                     if bt != local.build_time {
-                        write_local(&dir, &Local { version: local.version, build_time: bt });
+                        write_local(
+                            &dir,
+                            &Local { version: local.version.clone(), build_time: bt.clone() },
+                        );
+                    }
+                    if !rbt.is_empty() && bt != rbt {
+                        p.stop();
+                        match start_and_probe(app) {
+                            Ok(bt2) if !bt2.is_empty() => {
+                                write_local(
+                                    &dir,
+                                    &Local {
+                                        version: local.version.clone(),
+                                        build_time: bt2.clone(),
+                                    },
+                                );
+                                set_phase(if bt2 == rbt { "up_to_date" } else { "stale_running" });
+                            }
+                            Ok(_) => {}
+                            Err(e) => set_error(format!("重启组件失败：{e}")),
+                        }
                     }
                 }
                 _ => {}
             }
             if let Ok(mut s) = state().lock() {
-                if s.phase != "failed" {
+                // stale_running：重启后仍跑旧版（如新包起不来），保留该状态供前端提示，
+                // 不要被这里无条件改回 up_to_date。
+                if s.phase != "failed" && s.phase != "stale_running" {
                     s.phase = "up_to_date";
                 }
             }
