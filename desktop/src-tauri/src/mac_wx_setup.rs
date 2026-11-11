@@ -6,15 +6,18 @@
 //  2) Hardened Runtime（HR）：微信默认带 HR，会拦 task_for_pid，wxgo 无法 attach。
 //     必须「重签」微信——抽原 entitlements、去掉 runtime 标志、用本机 ad-hoc 证书
 //     重签（保留 allow-jit / debugger，否则微信起不来）。重签要管理员密码。
-//  3) 提权拉起：邦信本体以普通用户跑，但 attach 微信需要 root。用
-//     `osascript -e 'do shell script ... with administrator privileges'`
-//     一次性弹管理员密码，把 wxgo 注册为系统 LaunchDaemon 以 root 拉起；
-//     不引入已公证的 helper（成本太高）。改用 LaunchDaemon 彻底脱离 osascript
-//     会话，避免 `nohup ... &` 被会话拆除回收导致「起来即被杀」。
+//  3) 用户态拉起：微信以当前登录用户运行，macOS 的 TCC/SIP 限制下，root 进程
+//     **无法 lldb-attach 到用户态微信**（密钥提取需在微信进程内断点捕获 passphrase）。
+//     故 wxgo 必须以「当前用户」经 LaunchAgent 拉起，与微信同用户、同会话，lldb 才能挂上。
+//     同事在 mac 上用「用户态 LaunchAgent + lldb 挂用户微信」已验证成功，本机对齐该路径。
+//     免管理员密码（LaunchAgent 在 gui/$UID 域，普通用户即可 load）。
 //
 // ⚠️ 令牌只经 0600 临时文件（X8TOKEN_FILE 指向它）注入，绝不进 argv / plist 明文 /
 //   环境变量值；wxgo 读后即删，落盘窗口极短。邦信本进程不持 wxgo 子进程句柄
-//   （root 进程），所以 plugin_host 在 mac 上靠端口探活。
+//   （用户态进程），所以 plugin_host 在 mac 上靠端口探活。
+//   升级兼容：从 1.6.83（root LaunchDaemon）升级时，旧 root 守护仍占端口，故首次
+//   以管理员密码 bootout 旧 system 域守护（仅当 /Library/LaunchDaemons 下 plist
+//   仍存在才弹窗，之后即不再弹）。
 
 use std::fs;
 use std::net::{SocketAddr, TcpStream};
@@ -122,18 +125,51 @@ pub fn resign_wechat() -> Result<String, String> {
     Ok("微信已重签（已移除 Hardened Runtime）。请退出并重新打开微信使其生效。".into())
 }
 
-/// 以 root 经 LaunchDaemon 提权拉起 wxgo（彻底脱离 osascript 会话，避免被回收）。
+/// 以当前用户经 LaunchAgent 拉起 wxgo（用户态，无需管理员权限）。
 ///
-/// 为什么不用 `do shell script "... &"` / `nohup ... &`：
-/// osascript 的授权会话结束后，launchd/authorizationhost 会把残留子进程清掉，
-/// 即便 nohup 也只能挡 SIGHUP、挡不住会话拆除 —— wxgo 起来瞬间即被杀，端口从未稳定监听。
-/// 改用系统 LaunchDaemon：launchd 成为其父进程，与邦信进程 / osascript 会话完全解耦，
-/// 只要邦信不主动 stop，它就能一直存活。
+/// 为什么从 root LaunchDaemon 改回用户态 LaunchAgent：
+/// 微信以当前登录用户运行；macOS 的 TCC/SIP 限制下，root 进程无法 lldb-attach 到
+/// 用户态微信（密钥提取需在微信进程内断点捕获 passphrase）。同事在 mac 上用「用户态
+/// 拉起 + lldb 挂用户微信」已验证成功，故本机也走用户态。LaunchAgent 在 gui/$UID 域，
+/// 普通用户即可 load，令牌仍只经 0600 临时文件注入。
 ///
-/// 令牌只经 0600 临时文件（X8TOKEN_FILE 指向它）喂给插件，绝不进 argv / plist 明文 /
-/// 环境变量值；wxgo 读后即删该文件，落盘窗口极短。本机不持子进程句柄，靠端口探活。
-pub fn launch_root(bin: &Path, args: &[String], token: &str, port: u16) -> Result<(), String> {
-    // 1) 令牌写入 0600 临时文件（仅 root 守护进程可读），经 X8TOKEN_FILE 注入。
+/// 升级兼容：从 1.6.83（root LaunchDaemon）升级时，旧 root 守护仍占着端口、会挡新实例
+/// 绑定。故先尝试用管理员密码 bootout 旧 system 域守护（仅当 /Library/LaunchDaemons 下
+/// plist 仍存在才弹窗，弹一次后 plist 即删，之后不再弹）；再 bootout 同名 user agent，
+/// 保证单实例 + 新令牌生效。令牌只经 0600 临时文件（X8TOKEN_FILE）注入，绝不进 argv /
+/// plist 明文 / 环境变量值；wxgo 读后即删，落盘窗口极短。本机不持子进程句柄，靠端口探活。
+pub fn launch_user(bin: &Path, args: &[String], token: &str, port: u16) -> Result<(), String> {
+    // 0) 升级兼容：若存在旧版 root LaunchDaemon，需管理员一次性清理（仅首次弹一次密码）。
+    let old_daemon = "/Library/LaunchDaemons/com.x8fde.im.wxgo.plist";
+    if Path::new(old_daemon).exists() {
+        let inner = format!(
+            "launchctl bootout system/com.x8fde.im.wxgo 2>/dev/null; rm -f {daemon}; true",
+            daemon = shell_quote(old_daemon)
+        );
+        let osa = format!(
+            "do shell script \"{}\" with administrator privileges",
+            escape_for_osascript(&inner)
+        );
+        let out = Command::new("/usr/bin/osascript")
+            .args(["-e", &osa])
+            .output()
+            .map_err(|e| format!("清理旧版后台微信插件失败：{e}"))?;
+        if !out.status.success() {
+            return Err(
+                "清理旧版（root）后台微信插件被拒。请允许管理员密码，或手动执行：\
+                 sudo launchctl bootout system/com.x8fde.im.wxgo 并删除 \
+                 /Library/LaunchDaemons/com.x8fde.im.wxgo.plist 后重试。"
+                    .into(),
+            );
+        }
+    }
+    // 同名 user agent 也先清掉（无需管理员），保证单实例 + 新令牌生效。
+    let uid = current_uid();
+    let _ = Command::new("/bin/launchctl")
+        .args(["bootout", &format!("gui/{uid}/com.x8fde.im.wxgo")])
+        .output();
+
+    // 1) 令牌写入 0600 临时文件（当前用户可读），经 X8TOKEN_FILE 注入。
     let tok_path = std::env::temp_dir().join(format!("x8_wx_token_{port}.txt"));
     fs::write(&tok_path, format!("{token}\n"))
         .map_err(|e| format!("写令牌文件失败：{e}"))?;
@@ -143,46 +179,37 @@ pub fn launch_root(bin: &Path, args: &[String], token: &str, port: u16) -> Resul
         let _ = fs::set_permissions(&tok_path, fs::Permissions::from_mode(0o600));
     }
 
-    // 2) 生成 LaunchDaemon plist（含 bin + 参数 + X8TOKEN_FILE 路径 + 日志重定向）。
+    // 2) 生成 LaunchAgent plist，装入 ~/Library/LaunchAgents（用户态，免管理员）。
+    let home = home_dir().ok_or_else(|| "无法定位当前用户家目录（HOME 为空）".to_string())?;
+    let agent_dir = Path::new(&home).join("Library").join("LaunchAgents");
+    fs::create_dir_all(&agent_dir).map_err(|e| format!("建 LaunchAgents 目录失败：{e}"))?;
+    let plist_path = agent_dir.join("com.x8fde.im.wxgo.plist");
     let work_dir = bin
         .parent()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "/tmp".to_string());
     let log_path = format!("/tmp/x8_wx_{port}.log");
     let plist = build_wxgo_plist(bin, args, &tok_path.display().to_string(), &work_dir, &log_path);
-    let plist_tmp = std::env::temp_dir().join("com.x8fde.im.wxgo.plist");
-    fs::write(&plist_tmp, plist).map_err(|e| format!("写 LaunchDaemon plist 失败：{e}"))?;
+    fs::write(&plist_path, plist).map_err(|e| format!("写 LaunchAgent plist 失败：{e}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&plist_tmp, fs::Permissions::from_mode(0o600));
+        let _ = fs::set_permissions(&plist_path, fs::Permissions::from_mode(0o644));
     }
 
-    // 3) 以 root 经 osascript 提权：拷 plist 到 /Library/LaunchDaemons、赋权、bootstrap + kickstart。
-    //    路径用 shell_quote 单引号包裹（含空格安全）；bootstrap 已加载时静默失败，靠 kickstart 重启。
-    let plist_q = shell_quote(&plist_tmp.display().to_string());
-    let inner = format!(
-        "cp {plist_q} /Library/LaunchDaemons/com.x8fde.im.wxgo.plist; \
-         chown root:wheel /Library/LaunchDaemons/com.x8fde.im.wxgo.plist; \
-         chmod 644 /Library/LaunchDaemons/com.x8fde.im.wxgo.plist; \
-         launchctl bootstrap system /Library/LaunchDaemons/com.x8fde.im.wxgo.plist 2>/dev/null; \
-         launchctl kickstart -k system/com.x8fde.im.wxgo 2>/dev/null || \
-         launchctl load /Library/LaunchDaemons/com.x8fde.im.wxgo.plist 2>/dev/null",
-        plist_q = plist_q
-    );
-    let osa = format!(
-        "do shell script \"{}\" with administrator privileges",
-        escape_for_osascript(&inner)
-    );
-    let out = Command::new("/usr/bin/osascript")
-        .args(["-e", &osa])
-        .output()
-        .map_err(|e| format!("提权拉起微信插件失败：{e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "提权拉起微信插件失败：{}",
-            String::from_utf8_lossy(&out.stderr)
-        ));
+    // 3) 以当前用户 load（无需管理员）。优先用现代 bootstrap gui 域；失败退用旧式 load。
+    let out = Command::new("/bin/launchctl")
+        .args([
+            "bootstrap",
+            &format!("gui/{uid}"),
+            &plist_path.display().to_string(),
+        ])
+        .output();
+    let bootstrap_ok = matches!(out, Ok(ref o) if o.status.success());
+    if !bootstrap_ok {
+        let _ = Command::new("/bin/launchctl")
+            .args(["load", &plist_path.display().to_string()])
+            .output();
     }
 
     // 4) 等端口就绪（探测前先 settle 500ms，让 launchd 真正拉起进程；总上限 12s）。
@@ -199,13 +226,39 @@ pub fn launch_root(bin: &Path, args: &[String], token: &str, port: u16) -> Resul
             return Ok(());
         }
     }
-    // 超时：把真实死因（panic / 被拦 / 签名拦截）从日志尾巴拼进错误，便于定位。
+    // 超时：把真实死因（panic / 端口被旧 root 守护强占 / 签名拦截）从日志尾巴拼进错误。
     let tail = read_log_tail(&log_path, 40);
     let _ = fs::remove_file(&tok_path);
-    Err(format!("微信插件（root）启动超时，端口 {port} 未就绪。{tail}"))
+    Err(format!(
+        "微信插件启动超时，端口 {port} 未就绪。{tail}\n\
+         若提示端口被占用，多是 1.6.83 的旧 root 守护未清掉，请手动：\
+         sudo launchctl bootout system/com.x8fde.im.wxgo"
+    ))
 }
 
-/// 构造 wxgo 的 LaunchDaemon plist（XML）。令牌只以文件路径（X8TOKEN_FILE）传递，
+/// 当前用户家目录（HOME）。
+fn home_dir() -> Option<String> {
+    let h = std::env::var("HOME").ok()?;
+    if h.trim().is_empty() {
+        None
+    } else {
+        Some(h)
+    }
+}
+
+/// 当前用户 uid（用于 gui/<uid> LaunchAgent 域）。
+fn current_uid() -> u32 {
+    #[cfg(unix)]
+    unsafe {
+        libc::getuid()
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
+/// 构造 wxgo 的 LaunchAgent plist（XML）。令牌只以文件路径（X8TOKEN_FILE）传递，
 /// 绝不把明文写进 plist；--parent-watch 被刻意剔除（mac 无父管道，靠 HTTP 优雅退出回收）。
 fn build_wxgo_plist(
     bin: &Path,
@@ -283,26 +336,30 @@ fn xml_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// 按端口反查并杀掉 root 拉起的 wxgo（优雅退出由调用方先发 /api/app/shutdown）。
+/// 按端口反查并杀掉用户态 wxgo（优雅退出由调用方先发 /api/app/shutdown）。
 pub fn kill_by_port(port: u16) {
-    // 反查监听该端口的 PID（本机监听对当前用户可见），逐个 TERM。
+    // 优先用 launchctl 按 label 停掉 user agent（优雅，不靠猜 PID）。
+    let uid = current_uid();
+    let _ = Command::new("/bin/launchctl")
+        .args(["bootout", &format!("gui/{uid}/com.x8fde.im.wxgo")])
+        .output();
+    // 反查监听该端口的 PID，逐个 TERM（含残留 / 同名其他实例）。
     let out = Command::new("/usr/sbin/lsof")
         .arg(format!("-tiTCP:{port}"))
         .arg("-sTCP:LISTEN")
         .output();
-    let mut killed = false;
     if let Ok(o) = out {
         for pid in String::from_utf8_lossy(&o.stdout).split_whitespace() {
             let _ = Command::new("/bin/kill").args(["-TERM", pid]).output();
-            killed = true;
         }
     }
-    if !killed {
-        // 兜底：按进程名收（lsof 看不到 root 进程时）
-        let _ = Command::new("/usr/bin/pkill")
-            .args(["-f", "wxadapter"])
-            .output();
-    }
+    // 兜底：按进程名收（lsof 看不到时）
+    let _ = Command::new("/usr/bin/pkill")
+        .args(["-f", "wxadapter"])
+        .output();
+    let _ = Command::new("/usr/bin/pkill")
+        .args(["-f", "wxgo"])
+        .output();
 }
 
 /// 单引号包裹（POSIX sh 标准转义，内部单引号用 '\'' 处理）；路径含空格也安全。

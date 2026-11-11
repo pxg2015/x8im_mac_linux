@@ -1,6 +1,6 @@
 {
   "productName": "BangXin",
-  "version": "1.6.83",
+  "version": "1.6.84",
   "identifier": "com.x8fde.im",
   "build": {
     "frontendDist": "../dist"

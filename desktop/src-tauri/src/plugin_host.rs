@@ -453,8 +453,8 @@ impl Plugin {
             return Err("应用正在退出".to_string());
         }
 
-        // ── macOS：wxgo 必须以 root 经提权通道拉起（attach 微信要 task_for_pid），
-        //    本进程非 root、不持子进程句柄，状态全靠端口探活 + 握手（pid 校验在 mac 上无意义）。 ──
+        // ── macOS：wxgo 以当前用户经 LaunchAgent 拉起（与微信同用户，才能 lldb-attach
+        //    提取密钥），本进程不持子进程句柄，状态全靠端口探活 + 握手。 ──
         #[cfg(target_os = "macos")]
         {
             if self.running() {
@@ -487,9 +487,9 @@ impl Plugin {
                     .replace("{root}", &root)
                     .replace("{id}", &self.spec.id)
             };
-            // mac 上插件由 LaunchDaemon 以 root 拉起，无父进程管道：
+            // mac 上插件由 LaunchAgent 以当前用户拉起，无父进程管道：
             // ① 去掉 --parent-watch（否则 wxgo 会因 stdin EOF 误判父进程已死而自退）；
-            // ② 令牌改经 X8TOKEN_FILE 临时文件注入（见 mac_wx_setup::launch_root）。
+            // ② 令牌改经 X8TOKEN_FILE 临时文件注入（见 mac_wx_setup::launch_user）。
             let args: Vec<String> = self
                 .spec
                 .args
@@ -499,9 +499,9 @@ impl Plugin {
                 .collect();
             let token = self.gen_token()?;
             *self.token.lock().unwrap() = token.clone();
-            // 以 root 经 osascript 提权拉起，函数内已等端口就绪；握手时 pid==0 会跳过
-            // pid 校验（root 子进程 pid 本进程不知道），安全。
-            crate::mac_wx_setup::launch_root(&bin, &args, &token, self.spec.port)?;
+            // 以当前用户经 LaunchAgent 拉起（无需管理员），函数内已等端口就绪；握手时
+            // pid==0 会跳过 pid 校验（用户态子进程 pid 本进程不知道），安全。
+            crate::mac_wx_setup::launch_user(&bin, &args, &token, self.spec.port)?;
             return self.handshake();
         }
 
