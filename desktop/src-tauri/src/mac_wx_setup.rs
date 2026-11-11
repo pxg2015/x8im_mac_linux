@@ -44,21 +44,56 @@ fn wechat_container() -> Option<String> {
         .map(|h| format!("{h}/Library/Containers/com.tencent.xinWeChat/Data"))
 }
 
-/// 微信是否已重签（移除 Hardened Runtime）。
-/// `codesign -dvvv` 在 HR 开启时会输出 `Flags=0x10000[runtime]`；重签后该标志消失。
+/// 微信是否已重签到「可被调试」的状态（两个条件缺一不可）：
+///  1) 不带 Hardened Runtime —— `codesign -dvvv` 输出里没有 `Flags=0x10000[runtime]`；
+///  2) 带 `com.apple.security.get-task-allow` —— 否则 taskgated 会拒掉 lldb 的
+///     task_for_pid（实测：Developer mode disabled 时，非 root 与 root 一并被拒，
+///     报 "Not allowed to attach to process"）。补上这个调试授权位才能免开开发者模式。
 pub fn wechat_resigned() -> bool {
     let out = Command::new("/usr/bin/codesign")
         .args(["-dvvv", &wechat_app()])
         .output();
-    match out {
+    let no_runtime = match out {
         Ok(o) => {
             let s = String::from_utf8_lossy(&o.stdout);
             let e = String::from_utf8_lossy(&o.stderr);
-            let txt = format!("{s}{e}");
             // 含 "runtime" 即仍带 Hardened Runtime → 未重签
-            !txt.contains("runtime")
+            !format!("{s}{e}").contains("runtime")
         }
+        Err(_) => return false,
+    };
+    if !no_runtime {
+        return false;
+    }
+    has_get_task_allow()
+}
+
+/// 目标 app 的 entitlements 里是否已带调试授权位（get-task-allow）。
+fn has_get_task_allow() -> bool {
+    let out = Command::new("/usr/bin/codesign")
+        .args(["-d", "--entitlements", ":-", &wechat_app()])
+        .output();
+    match out {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).contains("get-task-allow"),
         Err(_) => false,
+    }
+}
+
+/// 往 entitlements plist 里补 `com.apple.security.get-task-allow`（已存在则原样返回）。
+fn ensure_get_task_allow(xml: &str) -> String {
+    if xml.contains("get-task-allow") {
+        return xml.to_string();
+    }
+    // 插到最后一个 </dict> 之前（根 dict 收尾处）
+    match xml.rfind("</dict>") {
+        Some(i) => {
+            let mut s = String::with_capacity(xml.len() + 80);
+            s.push_str(&xml[..i]);
+            s.push_str("\t<key>com.apple.security.get-task-allow</key>\n\t<true/>\n");
+            s.push_str(&xml[i..]);
+            s
+        }
+        None => xml.to_string(),
     }
 }
 
@@ -100,11 +135,17 @@ pub fn resign_wechat() -> Result<String, String> {
             String::from_utf8_lossy(&dump.stderr)
         ));
     }
-    fs::write(&ent, &dump.stdout).map_err(|e| format!("写 entitlements 失败：{e}"))?;
+    // 1.5) 关键：往 entitlements 补 get-task-allow。缺它时无论 root 与否，taskgated 都会
+    //      拒掉 lldb 的 task_for_pid（除非开全局开发者模式 + 注销重登），补上即可 attach。
+    let ent_xml = ensure_get_task_allow(&String::from_utf8_lossy(&dump.stdout));
+    fs::write(&ent, &ent_xml).map_err(|e| format!("写 entitlements 失败：{e}"))?;
 
-    // 2) 以 root 重签：不加 --options runtime（即移除 Hardened Runtime）
+    // 2) 以 root 重签：不加 --options runtime（即移除 Hardened Runtime）；
+    //    同时清掉下载隔离属性 —— 重签会让 Gatekeeper 在下次启动重新校验，
+    //    残留 com.apple.quarantine 时微信会被拦成「Apple 无法检查是否包含恶意软件」。
     let inner = format!(
-        "/usr/bin/codesign --force --deep --sign - --entitlements \"{ent}\" \"{app}\"",
+        "/usr/bin/codesign --force --deep --sign - --entitlements \"{ent}\" \"{app}\" \
+         && /usr/bin/xattr -rd com.apple.quarantine \"{app}\"",
         ent = ent.display(),
         app = app
     );
@@ -122,7 +163,9 @@ pub fn resign_wechat() -> Result<String, String> {
             String::from_utf8_lossy(&out.stderr)
         ));
     }
-    Ok("微信已重签（已移除 Hardened Runtime）。请退出并重新打开微信使其生效。".into())
+    Ok("微信已重签（已移除 Hardened Runtime 并补上调试授权 get-task-allow，隔离属性已清）。\
+        请完全退出微信（⌘Q）再重新打开，否则旧签名进程仍无法被挂接。"
+        .into())
 }
 
 /// 以当前用户经 LaunchAgent 拉起 wxgo（用户态，无需管理员权限）。
@@ -329,8 +372,17 @@ fn build_wxgo_plist(
     <string>{log}</string>
     <key>RunAtLoad</key>
     <false/>
+    <!-- 只在「异常退出」（panic / 崩溃 / 被杀）时由 launchd 重新拉起；
+         正常退出（/api/app/shutdown → exit 0）不复活，避免与 stop_with 打架。
+         ThrottleInterval 防崩溃循环狂刷。2026-11-11：原先 KeepAlive=false，
+         插件一崩就永久死掉，界面只剩「状态未知 / 插件无响应」。 -->
     <key>KeepAlive</key>
-    <false/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
 </dict>
 </plist>
 "#,

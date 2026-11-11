@@ -718,9 +718,14 @@ pub async fn wx_status(app: tauri::AppHandle) -> Result<WxStatusView, String> {
 /// 插件用 `{ok:false,error:"..."}` 表达「微信未打开」这类业务失败 —— 一律转成
 /// Err，让界面原样弹出来，不要显示「已同步」骗人。
 #[tauri::command]
-pub async fn wx_sync_now(_app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+pub async fn wx_sync_now(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
     blocking(move || {
-        let raw = crate::wx_sidecar::http_post("/api/capture", "{}", 120_000)?;
+        // 先确保插件在跑（mac 上插件由 LaunchAgent 拉起，可能因崩溃/被停而死掉；
+        // 直接 POST 会得到「插件无响应」这种毫无信息的错误）。
+        crate::wx_sidecar::ensure_started(&app)?;
+        // 超时对齐 keyext：mac 密钥捕获要在微信「退出登录 → 重新登录」时挂断点，
+        // 窗口 180s；这里留 240s，否则用户慢一步就被宿主判超时、白抓一轮。
+        let raw = crate::wx_sidecar::http_post("/api/capture", "{}", 240_000)?;
         let v = serde_json::from_str::<serde_json::Value>(&raw)
             .unwrap_or_else(|_| serde_json::json!({ "ok": true }));
         if v.get("ok").and_then(|x| x.as_bool()) == Some(false) {
