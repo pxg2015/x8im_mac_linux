@@ -119,6 +119,42 @@ fn version_file(dir: &Path) -> PathBuf {
     dir.join("wxgo.version.json")
 }
 
+/// 上一版快照：装新版之前写，回退时连版本号一起还原。
+/// 只还原二进制不还原版本号的话，下次打开又会判定「有新版本」→ 重装 → 再失败。
+fn prev_file(dir: &Path) -> PathBuf {
+    dir.join("wxgo.prev.json")
+}
+
+/// 「这个版本启动失败过」的封禁记录。2026-11-12：没有它，一个起不来的新版本
+/// 会让每次打开 W消息 都重下 11MB 再失败一次，用户看到的就是「永远在更新、
+/// 版本号却从不变化」。force（点「重试更新」）时忽略并清除。
+fn blocked_file(dir: &Path) -> PathBuf {
+    dir.join("wxgo.blocked.json")
+}
+
+#[derive(Serialize, Deserialize, Default, Clone)]
+struct Blocked {
+    version: String,
+    error: String,
+    at: u64,
+}
+
+fn read_blocked(dir: &Path) -> Option<Blocked> {
+    let s = std::fs::read_to_string(blocked_file(dir)).ok()?;
+    serde_json::from_str::<Blocked>(&s).ok()
+}
+
+fn write_blocked(dir: &Path, b: &Blocked) {
+    let _ = std::fs::create_dir_all(dir);
+    if let Ok(s) = serde_json::to_string(b) {
+        let _ = std::fs::write(blocked_file(dir), s);
+    }
+}
+
+fn clear_blocked(dir: &Path) {
+    let _ = std::fs::remove_file(blocked_file(dir));
+}
+
 fn read_local(dir: &Path) -> Local {
     std::fs::read_to_string(version_file(dir))
         .ok()
@@ -265,12 +301,34 @@ pub fn prepare(app: &AppHandle, force: bool) -> Result<Value, String> {
             return Ok(status(&dir, None));
         }
         let need = !have_bin || local.version != ver;
+        // 上一版装过却起不来 → 不再自动重装同一版本（每次重下 11MB、再失败一次，
+        // 用户看到的就是「一直在更新但版本从不变化」）。点「重试更新」(force) 才重试。
+        let blk = read_blocked(&dir);
+        let blocked_here = matches!(&blk, Some(b) if b.version == ver);
+        if blocked_here && !force && have_bin {
+            let reason = blk.as_ref().map(|b| b.error.clone()).unwrap_or_default();
+            let _ = start_and_probe(app);
+            set_error(format!(
+                "组件 {ver} 上次启动失败，已跳过自动更新：{reason}\n\
+                 当前运行的是 {cur}。点「重试更新」可重新下载安装 {ver}；\
+                 点「回退到上一版」可清掉这条记录。",
+                cur = if local.version.is_empty() { "未知版本".to_string() } else { local.version.clone() }
+            ));
+            return Ok(status(&dir, None));
+        }
         if need {
             set_phase("downloading");
             match download(ent.unwrap()) {
                 Ok(bytes) => {
                     set_phase("installing");
                     p.stop(); // 优雅退出，Windows 运行中 exe 才可覆盖
+                    // 装之前记下「当前能跑的版本」：回退时连版本号一起还原。
+                    if !local.version.is_empty() {
+                        if let Ok(s) = serde_json::to_vec(&local) {
+                            let _ = std::fs::create_dir_all(&dir);
+                            let _ = std::fs::write(prev_file(&dir), s);
+                        }
+                    }
                     if let Err(e) = p.install_from(&dir, &bytes) {
                         set_error(e.clone());
                         let _ = start_and_probe(app);
@@ -280,6 +338,7 @@ pub fn prepare(app: &AppHandle, force: bool) -> Result<Value, String> {
                     write_local(&dir, &next);
                     match start_and_probe(app) {
                         Ok(bt) => {
+                            clear_blocked(&dir); // 起来了 → 解除封禁
                             write_local(&dir, &Local { version: ver, build_time: bt });
                             if let Ok(mut s) = state().lock() {
                                 s.phase = "up_to_date";
@@ -287,12 +346,24 @@ pub fn prepare(app: &AppHandle, force: bool) -> Result<Value, String> {
                             }
                         }
                         Err(e) => {
-                            // 新包起不来 → 回退上一版，再把插件拉起来，绝不留死页签
-                            let rolled = p.rollback(&dir);
+                            // 2026-11-12 老8 定：不再自动回退。
+                            // 自动回退会把「组件时间」变回旧值，用户以为没更新成功 →
+                            // 反复点更新 → 每次重下 11MB 再失败一次，问题被永久隐藏
+                            // （今天下午就是这样反复了一下午）。
+                            // 现在：新版留在磁盘上、失败原因摊开、并封禁该版本防止
+                            // 反复重下；由用户点「回退到上一版」或「重试更新」决定下一步。
+                            // 注意这里刻意不再 start_and_probe：那次注定失败，只会让
+                            // 打开页签再多等一个 30s 超时。
                             write_local(&dir, &local);
-                            let _ = start_and_probe(app);
-                            set_error(format!("新版组件启动失败（{}），已{}", e,
-                                if rolled { "回退旧版" } else { "保留原状" }));
+                            write_blocked(
+                                &dir,
+                                &Blocked { version: ver.clone(), error: e.clone(), at: now() },
+                            );
+                            set_error(format!(
+                                "新版组件 {ver} 启动失败：{e}\n\
+                                 已停止自动回退（新版保留在磁盘上，不会再重复下载）。\
+                                 点「回退到上一版」立刻恢复可用，或点「重试更新」重新下载安装。"
+                            ));
                             return Ok(status(&dir, None));
                         }
                     }
@@ -352,6 +423,35 @@ pub fn prepare(app: &AppHandle, force: bool) -> Result<Value, String> {
     Ok(status(&dir, None))
 }
 
+/// 手动回退到上一版（新版起不来、或新版本身有问题时的逃生口）。
+/// 与已移除的「自动回退」的区别：这一步由用户点，且会把版本号一起还原、
+/// 解除版本封禁 —— 否则下次打开又判定「有新版本」→ 重装 → 再失败。
+pub fn rollback_to_prev(app: &AppHandle) -> Result<Value, String> {
+    let dir = plugin_dir(app)?;
+    let p = crate::plugin_host::get("wx");
+    p.stop();
+    // 等旧进程彻底放开 exe / 端口（Windows 下文件还被占用时改名会失败）。
+    std::thread::sleep(Duration::from_millis(400));
+    if !p.rollback(&dir) {
+        return Err("没有可回退的上一版（插件从未更新过，或备份已被后续安装覆盖）".into());
+    }
+    let prev = std::fs::read_to_string(prev_file(&dir))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Local>(&s).ok())
+        .unwrap_or_default();
+    let local = Local {
+        version: prev.version,
+        build_time: start_and_probe(app).unwrap_or_else(|_| prev.build_time.clone()),
+    };
+    write_local(&dir, &local);
+    clear_blocked(&dir);
+    if let Ok(mut s) = state().lock() {
+        s.phase = "up_to_date";
+        s.error.clear();
+    }
+    Ok(status(&dir, None))
+}
+
 /// 给前端的组件状态快照。
 pub fn status(dir: &Path, err: Option<String>) -> Value {
     let local = read_local(dir);
@@ -369,6 +469,9 @@ pub fn status(dir: &Path, err: Option<String>) -> Value {
         "has_update": has_update,
         "update_state": s.phase,
         "update_error": error,
+        // 2026-11-12：有过「某版本启动失败」的封禁记录 → 前端才亮出「回退到上一版」。
+        // 不让前端去猜文案，判据只在这里。
+        "need_rollback": read_blocked(dir).is_some(),
     })
 }
 

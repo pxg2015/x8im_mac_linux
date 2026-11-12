@@ -22,13 +22,15 @@
 use std::fs;
 use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use serde_json::{json, Value};
 
-// 与 plugin_host.rs 同口径的端口等待常量（mac 提权拉起后探活用）
-const BOOT_TIMEOUT_MS: u64 = 12000;
+// 与 plugin_host.rs 同口径的启动等待常量（mac 经 LaunchAgent 拉起后等就绪）。
+// 2026-11-12：从 12s 抬到 30s —— 慢启动（抢单实例锁 / 争端口 / 大库初始化）
+// 不该被当成「启动失败」而回退旧版；判据同时改为以 ready 标记为主。
+const BOOT_TIMEOUT_MS: u64 = 30000;
 const PROBE_INTERVAL_MS: u64 = 100;
 
 /// 微信主程序路径（标准安装位置）
@@ -181,7 +183,13 @@ pub fn resign_wechat() -> Result<String, String> {
 /// plist 仍存在才弹窗，弹一次后 plist 即删，之后不再弹）；再 bootout 同名 user agent，
 /// 保证单实例 + 新令牌生效。令牌只经 0600 临时文件（X8TOKEN_FILE）注入，绝不进 argv /
 /// plist 明文 / 环境变量值；wxgo 读后即删，落盘窗口极短。本机不持子进程句柄，靠端口探活。
-pub fn launch_user(bin: &Path, args: &[String], token: &str, port: u16) -> Result<(), String> {
+pub fn launch_user(
+    bin: &Path,
+    args: &[String],
+    token: &str,
+    port: u16,
+    ready: &Path,
+) -> Result<(), String> {
     // 0) 升级兼容：若存在旧版 root LaunchDaemon，需管理员一次性清理（仅首次弹一次密码）。
     let old_daemon = "/Library/LaunchDaemons/com.x8fde.im.wxgo.plist";
     if Path::new(old_daemon).exists() {
@@ -211,6 +219,16 @@ pub fn launch_user(bin: &Path, args: &[String], token: &str, port: u16) -> Resul
     let _ = Command::new("/bin/launchctl")
         .args(["bootout", &format!("gui/{uid}/com.x8fde.im.wxgo")])
         .output();
+    // 🔴 2026-11-12：bootout 是异步的 —— 带 KeepAlive 的 job 需要先等它自己退出。
+    // 不等就 bootstrap 会拿到「5: Input/output error」，且日志文件都不建
+    // （实测 2026-11-12：W消息 报「新版组件启动失败（启动超时）」，日志为空）。
+    // 这里轮询到 job 真正从 gui 域消失，最多 3s。
+    for _ in 0..30 {
+        if !agent_loaded(uid) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 
     // 1) 令牌写入 0600 临时文件（当前用户可读），经 X8TOKEN_FILE 注入。
     let tok_path = std::env::temp_dir().join(format!("x8_wx_token_{port}.txt"));
@@ -240,26 +258,37 @@ pub fn launch_user(bin: &Path, args: &[String], token: &str, port: u16) -> Resul
         let _ = fs::set_permissions(&plist_path, fs::Permissions::from_mode(0o644));
     }
 
-    // 3) 以当前用户 load（无需管理员）。优先用现代 bootstrap gui 域；失败退用旧式 load。
+    // 3) 以当前用户 load（无需管理员）。优先用现代 bootstrap gui 域；失败重试一次，
+    //    再失败退用旧式 load。2026-11-12：单次 bootstrap 撞上 launchd 的异步收尾
+    //    就会报「5: Input/output error」，重试是必要且安全的（job 已 bootout 干净）。
     let label = format!("gui/{uid}/com.x8fde.im.wxgo");
     let mut diag = String::new();
-    let out = Command::new("/bin/launchctl")
-        .args([
-            "bootstrap",
-            &format!("gui/{uid}"),
-            &plist_path.display().to_string(),
-        ])
-        .output();
-    let bootstrap_ok = matches!(out, Ok(ref o) if o.status.success());
-    if !bootstrap_ok {
-        if let Ok(o) = &out {
-            diag.push_str(&format!(
-                "bootstrap 失败：{}\n",
-                String::from_utf8_lossy(&o.stderr).trim()
-            ));
+    let mut bootstrap_ok = false;
+    for attempt in 0..2 {
+        let out = Command::new("/bin/launchctl")
+            .args([
+                "bootstrap",
+                &format!("gui/{uid}"),
+                &plist_path.display().to_string(),
+            ])
+            .output();
+        if matches!(out, Ok(ref o) if o.status.success()) {
+            bootstrap_ok = true;
+            break;
         }
+        if let Ok(o) = &out {
+            let msg = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            if !msg.is_empty() {
+                diag.push_str(&format!("bootstrap 失败（第 {} 次）：{msg}\n", attempt + 1));
+            }
+        }
+        if attempt == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(600));
+        }
+    }
+    if !bootstrap_ok {
         let _ = Command::new("/bin/launchctl")
-            .args(["load", &plist_path.display().to_string()])
+            .args(["load", "-w", &plist_path.display().to_string()])
             .output();
     }
 
@@ -277,31 +306,63 @@ pub fn launch_user(bin: &Path, args: &[String], token: &str, port: u16) -> Resul
         }
     }
 
-    // 4) 等端口就绪（探测前先 settle 500ms，让 launchd 真正拉起进程；总上限 12s）。
+    // 4) 等插件就绪（探测前先 settle 500ms，让 launchd 真正拉起进程；总上限 30s）。
+    //    2026-11-12：判据从「端口能连上」换成「插件写了 ready 标记」为主，
+    //    端口探测降级为兜底（旧版插件不写标记）。原实现 12s 端口轮询会把
+    //    「抢单实例锁 / 争端口 / 大库初始化」的慢启动误判成启动失败 → 回退旧版。
     std::thread::sleep(Duration::from_millis(500));
     let addr = format!("127.0.0.1:{port}")
         .parse::<SocketAddr>()
         .map_err(|e| format!("端口解析失败：{e}"))?;
     let tries = BOOT_TIMEOUT_MS / PROBE_INTERVAL_MS;
-    for _ in 0..tries {
+    let mut spawned_fallback = false;
+    for i in 0..tries {
         std::thread::sleep(Duration::from_millis(PROBE_INTERVAL_MS));
-        if TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok() {
+        if ready.is_file() {
+            let _ = fs::remove_file(&tok_path);
+            return Ok(());
+        }
+        // 端口探测每秒一次即可，别每 100ms 连一次浪费 fd。
+        if i % 10 == 9 && TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok() {
             // 端口已起：wxgo 已读过令牌文件，本机删掉它缩短落盘窗口。
             let _ = fs::remove_file(&tok_path);
             return Ok(());
+        }
+        // 🔴 最后一招（2026-11-12）：launchd 域彻底坏掉时（bootstrap/kickstart 全失败），
+        // 5s 后还在原地就绕过 launchd，直接以当前用户 spawn —— 宿主本来就是登录用户，
+        // 与微信同用户，lldb 照样能 attach。宁可少一层 KeepAlive 自愈（由宿主看门狗
+        // 30s 兜），也不能让用户卡在「组件起不来」上。
+        if i == 50 && !spawned_fallback {
+            spawned_fallback = true;
+            match Command::new(bin)
+                .args(args)
+                .env("X8TOKEN_FILE", &tok_path)
+                .current_dir(bin.parent().unwrap_or(Path::new("/tmp")))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(c) => diag.push_str(&format!("launchd 未拉起，已改为直接启动 pid={}\n", c.id())),
+                Err(e) => diag.push_str(&format!("直接启动也失败：{e}\n")),
+            }
         }
     }
     // 超时：把真实死因（bootstrap/kickstart 报错 / 签名拦截 / panic）从日志 + 诊断拼进错误。
     let tail = read_log_tail(&log_path, 40);
     let _ = fs::remove_file(&tok_path);
-    let mut reason = format!("微信插件启动超时，端口 {port} 未就绪。{tail}");
+    let mut reason = format!(
+        "微信插件启动超时（{}s 内未就绪，端口 {port} 未监听）。{tail}",
+        BOOT_TIMEOUT_MS / 1000
+    );
     if !diag.trim().is_empty() {
         reason.push_str(&format!("\nlaunchctl 诊断：\n{diag}"));
     }
     if tail.contains("无日志") {
         reason.push_str(
-            "\n若提示端口被占用，多是 1.6.83 的旧 root 守护未清掉，请手动：\
-             sudo launchctl bootout system/com.x8fde.im.wxgo",
+            "\n若反复出现：可能是 1.6.83 的旧 root 守护没清掉，终端执行 \
+             sudo launchctl bootout system/com.x8fde.im.wxgo 并删除 \
+             /Library/LaunchDaemons/com.x8fde.im.wxgo.plist 后重开邦信。",
         );
     }
     Err(reason)
@@ -317,8 +378,18 @@ fn home_dir() -> Option<String> {
     }
 }
 
+/// 该 LaunchAgent 是否还留在当前用户的 gui 域里。
+/// `launchctl print` 成功 = job 还在（哪怕进程已死，KeepAlive 也会重拉）。
+fn agent_loaded(uid: u32) -> bool {
+    Command::new("/bin/launchctl")
+        .args(["print", &format!("gui/{uid}/com.x8fde.im.wxgo")])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// 当前用户 uid（用于 gui/<uid> LaunchAgent 域）。
-fn current_uid() -> u32 {
+pub fn current_uid() -> u32 {
     #[cfg(unix)]
     unsafe {
         libc::getuid()
@@ -396,13 +467,16 @@ fn build_wxgo_plist(
 /// 读日志末尾 N 行（超时兜底诊断用）。
 fn read_log_tail(path: &str, n: usize) -> String {
     let Ok(s) = fs::read_to_string(path) else {
-        return "(无日志)".to_string();
+        // 文件不存在 = 进程压根没被 spawn（launchd 连重定向都没建）。
+        // 2026-11-12：原文案误导向 Gatekeeper；真正常见原因是 launchd 域的
+        // bootstrap 失败（Input/output error）或 plist 指向的可执行文件不可用。
+        return "(无日志文件，说明插件进程没被真正拉起)".to_string();
     };
     let lines: Vec<&str> = s.lines().collect();
     let start = lines.len().saturating_sub(n);
     let tail = lines[start..].join("\n");
     if tail.trim().is_empty() {
-        "(日志为空，插件可能未被执行——疑被 Gatekeeper 拦下或未重签)".to_string()
+        "(日志为空，插件刚启动就退出了，多半是抢单实例锁失败或参数不认)".to_string()
     } else {
         format!("日志末尾：\n{tail}")
     }

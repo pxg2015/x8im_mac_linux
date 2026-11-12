@@ -43,9 +43,15 @@ const WATCHDOG_SECS: u64 = 30;
 /// 重启失败的退避上限（秒）。2026-11-10 P2-4：不再「3 次失败后永久放弃」，
 /// 改为指数退避后继续重试，界面状态可以自己恢复。
 const MAX_BACKOFF_SECS: u64 = 300;
-/// 拉起后等端口就绪的上限。探测间隔从 200ms 缩到 100ms（P2-3），总时长不变。
-const BOOT_TIMEOUT_MS: u64 = 8000;
+/// 拉起后等就绪的上限。探测间隔 100ms。
+/// 2026-11-12：8s → 30s。插件启动变慢的真实原因（抢单实例锁最长 7s、争端口最长
+/// 10s、大库初始化）本来就可能超过 8s，超时就被判「启动失败」→ 自动回退旧版，
+/// 用户看到的是「装上了又变回旧版本」。判据同时改成以 ready 标记为主。
+const BOOT_TIMEOUT_MS: u64 = 30000;
 const PROBE_INTERVAL_MS: u64 = 100;
+/// 插件「已就绪」标记文件名，与 wxgo `SetReadyFile(<data-dir>/wx_ready.json)` 一致。
+/// 放数据目录而非临时目录：mac 上插件由 launchd 拉起，其 TMPDIR 未必与本进程相同。
+const READY_FILE: &str = "wx_ready.json";
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -447,6 +453,31 @@ impl Plugin {
         Ok(out)
     }
 
+    /// 等插件就绪。主判据 = 插件自己写的 ready 标记（端口 listen 成功后才落），
+    /// 兜底 = 健康接口能通（旧版插件不写标记，升级过渡期必须兼容）。
+    /// `deadline_ms` 总上限；非 mac 分支还会在子进程已死时提前返回。
+    fn wait_ready(&self, ready: &Path, deadline_ms: u64) -> bool {
+        let tries = deadline_ms / PROBE_INTERVAL_MS;
+        for i in 0..tries {
+            if ready.is_file() {
+                return true;
+            }
+            // 健康接口每秒探一次即可（握手前还要再校验 token/pid）。
+            if i % 10 == 9 && self.get(&self.spec.health, 800).is_ok() {
+                return true;
+            }
+            // 非 mac：子进程没了就别傻等满 30s（launchd 域下本进程看不到 pid）。
+            #[cfg(not(target_os = "macos"))]
+            {
+                if !self.running() {
+                    return ready.is_file() || self.get(&self.spec.health, 800).is_ok();
+                }
+            }
+            std::thread::sleep(Duration::from_millis(PROBE_INTERVAL_MS));
+        }
+        ready.is_file() || self.get(&self.spec.health, 800).is_ok()
+    }
+
     /// 确保插件在跑；已跑则直接返回端口。
     pub fn ensure(&self, app: &AppHandle) -> Result<u16, String> {
         if SHUTDOWN.load(Ordering::Relaxed) {
@@ -479,6 +510,11 @@ impl Plugin {
                 .ok_or_else(|| format!("plugin_missing:{}", self.spec.id))?;
             let data_dir = crate::mail_cache::data_dir(app)?;
             let db = crate::mail_cache::db_path(app)?;
+            // 清掉上一轮的就绪标记：残留文件会让 wait_ready 立刻「就绪」，
+            // 结果握手打到旧进程/半启动进程上（2026-11-12）。
+            let ready = data_dir.join(READY_FILE);
+            let _ = std::fs::remove_file(&ready);
+            std::fs::create_dir_all(&data_dir).ok();
             let root = bin.parent().unwrap_or(&self.root).display().to_string();
             let sub = |s: &str| -> String {
                 s.replace("{data}", &data_dir.display().to_string())
@@ -501,7 +537,7 @@ impl Plugin {
             *self.token.lock().unwrap() = token.clone();
             // 以当前用户经 LaunchAgent 拉起（无需管理员），函数内已等端口就绪；握手时
             // pid==0 会跳过 pid 校验（用户态子进程 pid 本进程不知道），安全。
-            crate::mac_wx_setup::launch_user(&bin, &args, &token, self.spec.port)?;
+            crate::mac_wx_setup::launch_user(&bin, &args, &token, self.spec.port, &ready)?;
             return self.handshake();
         }
 
@@ -534,6 +570,10 @@ impl Plugin {
 
         let data_dir = crate::mail_cache::data_dir(app)?;
         let db = crate::mail_cache::db_path(app)?;
+        // 清掉上一轮就绪标记（同 mac 分支，防残留文件误判就绪）。
+        let ready = data_dir.join(READY_FILE);
+        let _ = std::fs::remove_file(&ready);
+        std::fs::create_dir_all(&data_dir).ok();
 
         let token = self.gen_token()?;
         *self.token.lock().unwrap() = token.clone();
@@ -595,20 +635,17 @@ impl Plugin {
         }
         *self.child.lock().unwrap() = Some(child);
 
-        // 等端口就绪（探测间隔 100ms，总上限仍为 8s）
-        let tries = BOOT_TIMEOUT_MS / PROBE_INTERVAL_MS;
-        for _ in 0..tries {
-            std::thread::sleep(Duration::from_millis(PROBE_INTERVAL_MS));
-            if self.get(&self.spec.health, 800).is_ok() {
-                return self.handshake();
-            }
-            // 进程已经死了就别傻等
-            if !self.running() {
-                break;
-            }
+        // 等就绪：ready 标记为主、健康接口兜底，总上限 30s。
+        if self.wait_ready(&ready, BOOT_TIMEOUT_MS) {
+            return self.handshake();
         }
         self.stop();
-        Err(format!("插件 {} 启动超时（端口未就绪）", self.spec.id))
+        Err(format!(
+            "插件 {} 启动超时（{}s 内未就绪，端口 {} 未监听）。插件日志见数据目录 wxgo.log",
+            self.spec.id,
+            BOOT_TIMEOUT_MS / 1000,
+            self.spec.port
+        ))
         }
     }
 
@@ -669,9 +706,20 @@ impl Plugin {
 
     /// 2026-11-10 P1-1：先请插件优雅收尾，等 2s，超时才 TerminateProcess。
     fn stop_with(&self, graceful: bool) {
-        // ── macOS：插件是 root 子进程，本进程不持句柄，只能走 HTTP 优雅退出 + 端口反杀。 ──
+        // ── macOS：插件以当前用户经 LaunchAgent 拉起，本进程不持句柄，
+        //    走「bootout → HTTP 优雅退出 → 端口反杀」三段收尾。 ──
         #[cfg(target_os = "macos")]
         {
+            // 🔴 2026-11-12：**必须先 bootout**。plist 带 KeepAlive(SuccessfulExit=false)，
+            // 直接 kill 会被 launchd 判成「异常退出」并在 5s 内把旧二进制重拉起来 ——
+            // 换包时新旧进程抢端口，紧随其后的 bootstrap 还会拿到
+            // 「Bootstrap failed: 5: Input/output error」，日志文件都不建（今天实测）。
+            let _ = Command::new("/bin/launchctl")
+                .args([
+                    "bootout",
+                    &format!("gui/{}/com.x8fde.im.wxgo", crate::mac_wx_setup::current_uid()),
+                ])
+                .output();
             let tok = self.token.lock().unwrap().clone();
             if graceful && !tok.is_empty() {
                 let _ = self.post("/api/app/shutdown", "{}", 600);

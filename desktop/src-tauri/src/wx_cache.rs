@@ -96,6 +96,14 @@ pub struct WxStatusView {
     /// 本机微信是否在跑。None = 不知道（插件没起，问不到），false = 明确没开。
     /// 前端只在明确 false 时提示「微信未打开」，避免插件没起时误报。
     pub wechat_running: Option<bool>,
+    /// 最近一轮采集的密钥结果（插件 /api/status 的 key_status）：
+    /// "ok" = 密钥可用；"error" = 本轮失败（含密钥获取失败/解密失败）；
+    /// 空串 = 插件刚起、还没跑过一轮，前端按「未知」处理。
+    /// 2026-11-12：UI 靠它把「系统权限都齐、只是密钥没取到」单独识别出来，
+    /// 才能把 mac 三步向导按「密钥失效」重新顶出来（见 WxMsgPanel.vue）。
+    pub key_status: String,
+    /// 密钥来源/熔断说明（复用缓存 / 已重新获取 / 熔断中），只用于展示。
+    pub key_note: String,
 }
 
 // ── 会话列表（按最新消息时间倒序）────────────────────────────────────────────
@@ -467,6 +475,18 @@ pub fn status(app: &AppHandle) -> Result<WxStatusView, String> {
         if let Ok(raw) = crate::wx_sidecar::http_get("/api/status", 1500) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
                 st.wechat_running = v.get("wechat_running").and_then(|x| x.as_bool());
+                // 2026-11-12：密钥结果透传给界面。wx_status 表里没有这两列（插件不改表结构），
+                // 只能问插件内存里的最近一轮状态；插件重启后为空 = 未知，不据此弹向导。
+                st.key_status = v
+                    .get("key_status")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                st.key_note = v
+                    .get("key_note")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
             }
         }
     }
@@ -603,6 +623,14 @@ pub async fn wx_plugin_prepare(app: tauri::AppHandle) -> Result<serde_json::Valu
 #[tauri::command]
 pub async fn wx_plugin_update_now(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
     blocking(move || crate::wx_updater::prepare(&app, true)).await
+}
+
+/// 组件逃生口（2026-11-12）：新版起不来 / 新版本身有问题时，手动退回上一版。
+/// 宿主不再自动回退（自动回退会掩盖问题、让用户以为「一直没更新成功」），
+/// 由用户显式点「回退到上一版」；这里顺带解除该版本的封禁记录。
+#[tauri::command]
+pub async fn wx_plugin_rollback(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    blocking(move || crate::wx_updater::rollback_to_prev(&app)).await
 }
 
 /// 确保插件已启动（点「Wx消息」页签时调一次；已启动则秒回）。

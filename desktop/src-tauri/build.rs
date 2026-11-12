@@ -141,6 +141,7 @@ fn main() {
             "wx_plugin_start",
             "wx_plugin_prepare",
             "wx_plugin_update_now",
+            "wx_plugin_rollback",
             "wx_plugin_stop",
             "wx_conversations",
             "wx_messages",

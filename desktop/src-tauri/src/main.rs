@@ -2526,7 +2526,12 @@ fn assist_has_live_session(pids: &[String]) -> bool {
 /// 改为打开系统浏览器触发真实下载）。
 #[tauri::command]
 async fn open_in_browser(url: String) -> Result<(), String> {
-    if !url.starts_with("https://") {
+    // 2026-11-12：除 https 外只放行 macOS 的「系统设置」deeplink（前缀白名单，其余 scheme 一律拒）。
+    // 起因：W消息 读微信向导的「打开系统设置」按钮一直是废的 —— 它传的是
+    // x-apple.systempreferences:...，被这里判成「无效地址」，前端又静默 catch，点了没反应。
+    let allowed = url.starts_with("https://")
+        || url.starts_with("x-apple.systempreferences:");
+    if !allowed {
         return Err("无效地址".into());
     }
     // 2026-11-07 二次评审 P1-3：open_checked 会等子进程退出码（Linux 三个候选串行最多
@@ -6456,6 +6461,7 @@ fn main() {
             wx_cache::wx_plugin_start,
             wx_cache::wx_plugin_prepare,
             wx_cache::wx_plugin_update_now,
+            wx_cache::wx_plugin_rollback,
             wx_cache::wx_plugin_stop,
             wx_cache::wx_conversations,
             wx_cache::wx_messages,

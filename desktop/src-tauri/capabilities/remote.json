@@ -97,6 +97,7 @@
     "allow-wx-plugin-start",
     "allow-wx-plugin-prepare",
     "allow-wx-plugin-update-now",
+    "allow-wx-plugin-rollback",
     "allow-wx-plugin-stop",
     "allow-wx-conversations",
     "allow-wx-messages",
