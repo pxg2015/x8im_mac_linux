@@ -172,7 +172,7 @@ pub fn resign_wechat() -> Result<String, String> {
     let inner = format!(
         "if ! /usr/bin/touch \"{probe}\" 2>/dev/null; then echo X8_EPERM >&2; exit 42; fi; \
          /bin/rm -f \"{probe}\"; \
-         /usr/bin/codesign --force --deep --sign - --entitlements \"{ent}\" \"{app}\"; \
+         /usr/bin/codesign --force --deep --sign - --entitlements \"{ent}\" \"{app}\" || exit $?; \
          /usr/bin/xattr -rd com.apple.quarantine \"{app}\" 2>/dev/null; true",
         probe = probe,
         ent = ent.display(),
