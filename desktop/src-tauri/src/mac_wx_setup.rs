@@ -119,12 +119,29 @@ pub fn fda_granted() -> bool {
     }
 }
 
+/// macOS 13+ 的「App 管理（App Management）」/ 完全磁盘访问拦截时给用户的指引。
+/// 2026-11-14：这是「Operation not permitted in subcomponent」的唯一真因 ——
+/// TCC 是**进程级**校验，`do shell script ... with administrator privileges` 拿到 root
+/// 也无法绕过，必须由邦信自己被授权。原来直接把 codesign stderr 抛给用户，看不懂。
+fn app_mgmt_hint() -> String {
+    "没有修改微信 App 的权限（被 macOS「App 管理」拦截）。\
+     请到 系统设置 → 隐私与安全性 → App 管理 与 完全磁盘访问 两处都勾选「邦信」，\
+     然后完全退出邦信（⌘Q）重新打开，再点「一键重签」。（TCC 权限只在进程启动时读取，\
+     重启前不会生效。）"
+        .to_string()
+}
+
 /// 重签微信：抽出原 entitlements → 去掉 Hardened Runtime（重签时不传 --options runtime）→
 /// 用本机 ad-hoc 证书重签（保留 allow-jit / debugger 等，否则微信起不来）。需管理员密码。
 ///
 /// 注意：重签只改磁盘上的二进制，运行中的微信需重启才生效（签名变更在内存里不生效）。
 pub fn resign_wechat() -> Result<String, String> {
     let app = wechat_app();
+    if !Path::new(&app).exists() {
+        return Err(format!(
+            "没找到微信（{app}）。请先从 App Store 或官网安装微信，再回来重签。"
+        ));
+    }
     // 1) 抽出原 entitlements（务必保留，含 allow-jit / debugger）
     let ent = std::env::temp_dir().join("wechat_entitlements.plist");
     let dump = Command::new("/usr/bin/codesign")
@@ -145,9 +162,19 @@ pub fn resign_wechat() -> Result<String, String> {
     // 2) 以 root 重签：不加 --options runtime（即移除 Hardened Runtime）；
     //    同时清掉下载隔离属性 —— 重签会让 Gatekeeper 在下次启动重新校验，
     //    残留 com.apple.quarantine 时微信会被拦成「Apple 无法检查是否包含恶意软件」。
+    //
+    //    2026-11-14：动手前先在同一段提权脚本里做「可写入」预检（不额外弹密码框）。
+    //    App 管理 / FDA 拦截时 codesign 只会报 Operation not permitted in subcomponent，
+    //    完全看不出是权限问题；预检失败直接回哨兵 X8_EPERM，Rust 侧翻译成人话。
+    //    另：xattr 在无隔离属性时返回非 0，原来用 && 串联会把「签名其实成功」误报成失败，
+    //    改成 ; ... ; 忽略其退出码。
+    let probe = format!("{app}/Contents/.x8w_permchk");
     let inner = format!(
-        "/usr/bin/codesign --force --deep --sign - --entitlements \"{ent}\" \"{app}\" \
-         && /usr/bin/xattr -rd com.apple.quarantine \"{app}\"",
+        "if ! /usr/bin/touch \"{probe}\" 2>/dev/null; then echo X8_EPERM >&2; exit 42; fi; \
+         /bin/rm -f \"{probe}\"; \
+         /usr/bin/codesign --force --deep --sign - --entitlements \"{ent}\" \"{app}\"; \
+         /usr/bin/xattr -rd com.apple.quarantine \"{app}\" 2>/dev/null; true",
+        probe = probe,
         ent = ent.display(),
         app = app
     );
@@ -160,10 +187,15 @@ pub fn resign_wechat() -> Result<String, String> {
         .output()
         .map_err(|e| format!("提权重签微信失败：{e}"))?;
     if !out.status.success() {
-        return Err(format!(
-            "重签微信失败：{}",
-            String::from_utf8_lossy(&out.stderr)
-        ));
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        // 预检哨兵 / codesign 原始 EPERM 都归到「权限不足」这一条人话上
+        if err.contains("X8_EPERM") || err.contains("Operation not permitted") {
+            return Err(app_mgmt_hint());
+        }
+        if err.contains("User canceled") || err.contains("-128") {
+            return Err("已取消（未输入管理员密码），微信没有被改动。".into());
+        }
+        return Err(format!("重签微信失败：{err}"));
     }
     Ok("微信已重签（已移除 Hardened Runtime 并补上调试授权 get-task-allow，隔离属性已清）。\
         请完全退出微信（⌘Q）再重新打开，否则旧签名进程仍无法被挂接。"
