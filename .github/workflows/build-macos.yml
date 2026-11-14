@@ -48,7 +48,7 @@ jobs:
     # 固定 macos-15（arm64）而非 macos-latest：latest 现已指向 macos-26，
     # Xcode 跨度更大；两个 target 仍都在 arm64 机器上（x86_64 走交叉编译）。
     runs-on: macos-15
-    timeout-minutes: 90
+    timeout-minutes: 150
     defaults:
       run:
         working-directory: desktop
@@ -187,15 +187,16 @@ jobs:
           echo "APPLE_API_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
           echo "  ✓ 公证密钥就位：$KEY_PATH"
 
-      # 签名版：Tauri 在同一进程内完成 sign app → notarize → staple → 建 dmg → sign dmg。
-      # 这里【不】设 APPLE_ID/APPLE_PASSWORD，避免与 API Key 两套凭据打架。
-      - name: Build dmg (signed + notarized)
+      # 签名版：只 codesign，不在 Tauri 内联公证。
+      # 2026-11-15 起因：Tauri 内联 notarize 无超时上限，run 43607817286 卡在公证
+      # 90 分钟被 timeout-minutes 杀掉（双架构同时）。现改为不传 APPLE_API_KEY/ISSUER
+      # 让 Tauri 只签名，公证交给下一步 notarytool 显式 --timeout，失败可见可重试。
+      # 这里【不】设 APPLE_ID/APPLE_PASSWORD，避免两套凭据打架。
+      - name: Build dmg (signed only)
         if: env.HAS_SIGNING == '1'
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
         run: npx tauri build --target ${{ matrix.target }}
 
       # 降级版：secrets 未配齐时照旧出未签名包（Gatekeeper 需 mac.sh 清隔离，历史行为）
@@ -231,7 +232,7 @@ jobs:
             ditto -c -k --keepParent "$APP" "$RUNNER_TEMP/app.zip"
             xcrun notarytool submit "$RUNNER_TEMP/app.zip" \
               --key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY" \
-              --issuer "$APPLE_API_ISSUER" --wait
+              --issuer "$APPLE_API_ISSUER" --wait --timeout 25m
             xcrun stapler staple -v "$APP"
             xcrun stapler validate -v "$APP"
           fi
@@ -250,7 +251,7 @@ jobs:
               echo "  dmg 无票据，补提交公证（幂等）"
               xcrun notarytool submit "$D" \
                 --key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY" \
-                --issuer "$APPLE_API_ISSUER" --wait
+                --issuer "$APPLE_API_ISSUER" --wait --timeout 25m
               xcrun stapler staple "$D"
               xcrun stapler validate "$D"
             fi
