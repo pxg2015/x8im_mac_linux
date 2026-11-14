@@ -206,7 +206,12 @@ jobs:
           echo "::warning::未配置签名 secrets，本次产出未签名包（用户侧需 mac.sh 清 quarantine）"
           npx tauri build --target ${{ matrix.target }}
 
-      # 签名/公证断言：失败要红在签名这一步，不能拖到用户装不上才发现
+      # 签名/公证断言。公证策略（2026-11-15 定，踩过两次坑）：
+      # 1) app.zip 与 dmg 两个 submission 【并行】提交（--no-wait 立刻拿 id），再并行轮询，
+      #    总耗时 ≈ 一次公证，而不是串行两倍；
+      # 2) 不设短超时：实测 Apple 队列 25 分钟仍 In Progress（run 43649577106 exit 124），
+      #    改为最长 80 分钟（80 x 45s）轮询，只有 Accepted 才算过；
+      # 3) 失败时打印 notarytool log，直接看到是哪条规则不满足，不用猜。
       - name: Verify signature & notarization
         if: env.HAS_SIGNING == '1'
         env:
@@ -216,6 +221,7 @@ jobs:
           set -euo pipefail
           T=${{ matrix.target }}
           APP=src-tauri/target/$T/release/bundle/macos/BangXin.app
+          AUTH=(--key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER")
 
           echo "== codesign 身份 =="
           codesign -dv --verbose=4 "$APP" 2>&1 | grep -E "Identifier|TeamIdentifier|Authority|Timestamp" || true
@@ -224,38 +230,55 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "$APP"
           echo "  ✓ 签名严格校验通过"
 
-          echo "== 公证票据（app） =="
-          if xcrun stapler validate -v "$APP"; then
-            echo "  ✓ app 已装订票据"
-          else
-            echo "::warning::app 无票据，补提交公证"
-            ditto -c -k --keepParent "$APP" "$RUNNER_TEMP/app.zip"
-            xcrun notarytool submit "$RUNNER_TEMP/app.zip" \
-              --key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY" \
-              --issuer "$APPLE_API_ISSUER" --wait --timeout 25m
-            xcrun stapler staple -v "$APP"
-            xcrun stapler validate -v "$APP"
+          echo "== 待公证产物 =="
+          ls -la src-tauri/target/$T/release/bundle/dmg/*.dmg
+          ditto -c -k --keepParent "$APP" "$RUNNER_TEMP/app.zip"
+          DMG=$(ls src-tauri/target/$T/release/bundle/dmg/*.dmg | head -1)
+          [ -e "$DMG" ] || { echo "::error::没有 dmg"; exit 1; }
+          echo "  app.zip / $(basename "$DMG")"
+
+          jget() { python3 -c "import json,sys;print(json.load(sys.stdin).get('$1',''))"; }
+          status_of() { xcrun notarytool info "$1" "${AUTH[@]}" --output-format json | jget status; }
+
+          echo "== 并行提交公证 =="
+          AID=$(xcrun notarytool submit "$RUNNER_TEMP/app.zip" "${AUTH[@]}" --no-wait --output-format json | jget id)
+          DID=$(xcrun notarytool submit "$DMG" "${AUTH[@]}" --no-wait --output-format json | jget id)
+          [ -n "$AID" ] && [ -n "$DID" ] || { echo "::error::公证提交没拿到 submission id"; exit 1; }
+          echo "  app submission id: $AID"
+          echo "  dmg submission id: $DID"
+
+          AST=""; DST=""
+          for i in $(seq 1 80); do
+            if [ "$AST" != "Accepted" ]; then AST=$(status_of "$AID" || true); fi
+            if [ "$DST" != "Accepted" ]; then DST=$(status_of "$DID" || true); fi
+            echo "[$(date +%H:%M:%S)] app=${AST:-?} dmg=${DST:-?}"
+            if [ "$AST" = "Accepted" ] && [ "$DST" = "Accepted" ]; then echo "  ✓ 两份公证均通过"; break; fi
+            case "$AST" in
+              Invalid|Rejected) echo "::error::app 公证未通过：$AST"
+                xcrun notarytool log "$AID" "${AUTH[@]}" || true; exit 1;;
+            esac
+            case "$DST" in
+              Invalid|Rejected) echo "::error::dmg 公证未通过：$DST"
+                xcrun notarytool log "$DID" "${AUTH[@]}" || true; exit 1;;
+            esac
+            sleep 45
+          done
+          if [ "$AST" != "Accepted" ] || [ "$DST" != "Accepted" ]; then
+            echo "::error::公证轮询超时 app=$AST dmg=$DST"
+            xcrun notarytool log "$AID" "${AUTH[@]}" || true
+            xcrun notarytool log "$DID" "${AUTH[@]}" || true
+            exit 1
           fi
 
-          echo "== Gatekeeper 评估（app） =="
-          spctl -a -vvv -t exec "$APP" || echo "::warning::spctl 未 accepted（联网状态/票据延迟时偶发，不阻塞）"
+          echo "== 装订票据 =="
+          xcrun stapler staple -v "$APP"
+          xcrun stapler staple -v "$DMG"
+          xcrun stapler validate -v "$APP"
+          xcrun stapler validate -v "$DMG"
 
-          echo "== dmg 逐个校验 =="
-          for D in src-tauri/target/$T/release/bundle/dmg/*.dmg; do
-            [ -e "$D" ] || { echo "::error::没有 dmg"; exit 1; }
-            echo "-- $(basename "$D")"
-            codesign --verify --strict --verbose=2 "$D" || echo "::warning::dmg 未签名（Tauri 版本差异，用户装 .app 仍可用）"
-            if xcrun stapler validate "$D" >/dev/null 2>&1; then
-              echo "  ✓ dmg 已装订票据"
-            else
-              echo "  dmg 无票据，补提交公证（幂等）"
-              xcrun notarytool submit "$D" \
-                --key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY" \
-                --issuer "$APPLE_API_ISSUER" --wait --timeout 25m
-              xcrun stapler staple "$D"
-              xcrun stapler validate "$D"
-            fi
-          done
+          echo "== Gatekeeper 评估 =="
+          spctl -a -vvv -t exec "$APP" || echo "::warning::spctl(app) 偶发未 accepted，票据已装订，不阻塞"
+          spctl -a -vvv -t open --context context:primary-signature "$DMG" || echo "::warning::spctl(dmg) 偶发未 accepted，不阻塞"
 
       - name: Assert Info.plist & version in bundle
         run: |
@@ -302,7 +325,9 @@ jobs:
             rm -rf "$MNT"
           done
 
+      # 公证失败时也要把签名包拿回来（便于先发未公证签名版、后续补票据），故 always()
       - name: Collect artifacts
+        if: always()
         run: |
           set -euo pipefail
           B=src-tauri/target/${{ matrix.target }}/release/bundle
@@ -339,6 +364,7 @@ jobs:
           echo "=== 内嵌 RustDesk 框架 ==="; ls src-tauri/target/*/release/bundle/macos/BangXin.app/Contents/Resources/bin/mac/RustDesk.app/Contents/Frameworks 2>/dev/null | head -5 || true
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: x8im-macos-${{ matrix.label }}
           # ⚠️ uses 步骤不受 defaults.run.working-directory 影响，路径相对仓库根
