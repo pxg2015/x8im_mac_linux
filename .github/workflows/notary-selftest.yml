@@ -1,0 +1,66 @@
+name: notary-selftest
+
+# 公证自检：用一个几十 KB 的最小 .app 走一遍「导入证书 → codesign → 提交公证」，
+# 用来区分「Apple 侧/账号侧慢」还是「我们自己的包有问题」。
+# 判读：最小包 15 分钟内 Accepted → 公证服务与账号都正常，问题在 x8im 的包；
+#       最小包也一直 In Progress → 账号级/服务级问题，找 Apple 或继续等。
+on:
+  workflow_dispatch:
+
+jobs:
+  selftest:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Import Developer ID certificate
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          KC="$RUNNER_TEMP/selftest.keychain-db"
+          KCPW=$(openssl rand -base64 24)
+          security create-keychain -p "$KCPW" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KCPW" "$KC"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 -D > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KCPW" "$KC" >/dev/null
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          security find-identity -v -p codesigning "$KC"
+          echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY" >> "$GITHUB_ENV"
+
+      - name: Prepare notarization API key
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: |
+          set -euo pipefail
+          KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+          printf '%s' "$APPLE_API_KEY_P8" | tr -d '\r' > "$KEY_PATH"
+          chmod 600 "$KEY_PATH"
+          echo "APPLE_API_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
+
+      - name: Build tiny app and notarize
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          rm -rf NotaryTest.app
+          mkdir -p NotaryTest.app/Contents/MacOS
+          python3 -c "import plistlib;plistlib.dump({'CFBundleExecutable':'notarytest','CFBundleIdentifier':'com.tianjian.notarytest','CFBundleName':'NotaryTest','CFBundlePackageType':'APPL','CFBundleShortVersionString':'1.0','CFBundleVersion':'1'}, open('NotaryTest.app/Contents/Info.plist','wb'))"
+          printf '#!/bin/sh\necho notary-ok\n' > NotaryTest.app/Contents/MacOS/notarytest
+          chmod +x NotaryTest.app/Contents/MacOS/notarytest
+          codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" NotaryTest.app
+          codesign --verify --strict --verbose=2 NotaryTest.app
+          ditto -c -k --keepParent NotaryTest.app NotaryTest.zip
+          ls -la NotaryTest.zip
+
+          AUTH=(--key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER")
+          echo "== 提交 =="
+          xcrun notarytool submit NotaryTest.zip "${AUTH[@]}" --wait --timeout 15m --output-format json | tee result.json || true
+          cat result.json || true
