@@ -30,6 +30,11 @@ name: build-macos
 #      早期写成 out/*.dmg 时，构建成功也会因「找不到产物」在最后一步报错。
 on:
   workflow_dispatch:
+    inputs:
+      notarize:
+        description: "提交 Apple 公证并等待（true）。false = 跳过公证，直接出未公证的签名包"
+        type: boolean
+        default: true
   push:
     tags: ["v*"]
 
@@ -217,6 +222,7 @@ jobs:
         env:
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          NOTARIZE: ${{ github.event.inputs.notarize }}
         run: |
           set -euo pipefail
           T=${{ matrix.target }}
@@ -229,6 +235,15 @@ jobs:
             echo "::error::app 未用 Developer ID 签名"; exit 1; }
           codesign --verify --deep --strict --verbose=2 "$APP"
           echo "  ✓ 签名严格校验通过"
+
+          # 2026-11-15：Apple 公证积压（Team 级审查排到数天），为不阻塞发版，
+          # 手工触发时可传 notarize=false 跳过公证并直接出包。签名仍是 Developer ID，
+          # 用户端首次打开需右键「打开」或走 mac.sh 清隔离 —— 与历史未公证版行为一致。
+          if [ "${NOTARIZE:-true}" != "true" ]; then
+            echo "::warning::notarize=false，跳过 Apple 公证，本包未装订票据"
+            echo "SKIP_NOTARY=1" >> "$GITHUB_ENV"
+            exit 0
+          fi
 
           echo "== 待公证产物 =="
           ls -la src-tauri/target/$T/release/bundle/dmg/*.dmg
