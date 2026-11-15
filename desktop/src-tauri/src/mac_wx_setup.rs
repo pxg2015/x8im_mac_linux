@@ -896,7 +896,42 @@ pub fn wx_setup_state() -> Value {
         "wechat_running": running,
         "ready": resigned && running,
         "has_backup": orig_backup_ok(),
+        // 旧版 --deep 签法留下的坏签名：逐项重签修不回来，只能重装官方微信
+        "deep_polluted": deep_polluted(&wechat_app()),
     })
+}
+
+/// 当前包是否残留旧版 `--deep` 签法留下的污染。
+///
+/// 判据：嵌套 helper（`.app` / `.xpc` / `.appex`）的 entitlements 里也带上了
+/// `get-task-allow`。官方微信的 helper 不会有这个调试授权位 —— 只有主 app 才是我们
+/// 补的。helper 也有了，说明它被 `codesign --deep` 套用了**主 bundle 的 entitlements**。
+/// 这种包再去逐项重签只会把错误固化下来（抽出来的就是被污染的那份），
+/// 唯一正路是重装官方微信再签。
+fn deep_polluted(app: &str) -> bool {
+    let script = format!(
+        "/usr/bin/find {} -maxdepth 4 \\( -name '*.app' -o -name '*.xpc' -o -name '*.appex' \\) 2>/dev/null | /usr/bin/head -8",
+        shell_quote(&format!("{app}/Contents"))
+    );
+    let out = match Command::new("/bin/sh").args(["-c", &script]).output() {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
+    for p in String::from_utf8_lossy(&out.stdout).lines() {
+        let p = p.trim();
+        if p.is_empty() {
+            continue;
+        }
+        if let Ok(o) = Command::new("/usr/bin/codesign")
+            .args(["-d", "--entitlements", ":-", p])
+            .output()
+        {
+            if String::from_utf8_lossy(&o.stdout).contains("get-task-allow") {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// 捕获密钥前「自动关微信 → 等一会 → 再打开」。
