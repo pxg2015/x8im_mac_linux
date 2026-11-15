@@ -113,6 +113,7 @@
     "allow-wx-pick-messages",
     "allow-wx-media-data",
     "allow-wx-setup-state",
-    "allow-wx-setup-run"
+    "allow-wx-setup-run",
+    "allow-wx-restore-wechat"
   ]
 }

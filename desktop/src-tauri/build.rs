@@ -158,6 +158,7 @@ fn main() {
             // macOS 读微信前置条件检测 + 提权重签
             "wx_setup_state",
             "wx_setup_run",
+            "wx_restore_wechat",
         ]),
     );
     if let Err(e) = tauri_build::try_build(attrs) {

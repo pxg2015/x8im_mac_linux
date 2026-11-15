@@ -52,8 +52,13 @@ fn wechat_container() -> Option<String> {
 ///     task_for_pid（实测：Developer mode disabled 时，非 root 与 root 一并被拒，
 ///     报 "Not allowed to attach to process"）。补上这个调试授权位才能免开开发者模式。
 pub fn wechat_resigned() -> bool {
+    wechat_resigned_at(&wechat_app())
+}
+
+/// 指定路径的 app 是否已重签到「可被调试」状态（备份校验也用它）。
+pub fn wechat_resigned_at(app: &str) -> bool {
     let out = Command::new("/usr/bin/codesign")
-        .args(["-dvvv", &wechat_app()])
+        .args(["-dvvv", app])
         .output();
     let no_runtime = match out {
         Ok(o) => {
@@ -67,13 +72,13 @@ pub fn wechat_resigned() -> bool {
     if !no_runtime {
         return false;
     }
-    has_get_task_allow()
+    has_get_task_allow(app)
 }
 
 /// 目标 app 的 entitlements 里是否已带调试授权位（get-task-allow）。
-fn has_get_task_allow() -> bool {
+fn has_get_task_allow(app: &str) -> bool {
     let out = Command::new("/usr/bin/codesign")
-        .args(["-d", "--entitlements", ":-", &wechat_app()])
+        .args(["-d", "--entitlements", ":-", app])
         .output();
     match out {
         Ok(o) => String::from_utf8_lossy(&o.stdout).contains("get-task-allow"),
@@ -196,30 +201,172 @@ fn open_wechat() {
     let _ = Command::new("/usr/bin/open").args(["-a", &wechat_app()]).output();
 }
 
-/// 用户态重签（不提权）：TCC 的负责进程就是邦信本人，权限判定与
-/// `app_mgmt_granted()` 探针完全一致，所以探针能过这里就能过。
-fn codesign_user(ent: &Path, app: &str) -> Result<(), String> {
-    let out = Command::new("/usr/bin/codesign")
-        .args(["--force", "--deep", "--sign", "-", "--entitlements"])
-        .arg(ent)
-        .arg(app)
-        .output()
-        .map_err(|e| format!("调用 codesign 失败：{e}"))?;
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+// ───────── 重签内核（2026-11-15 重做：先签副本，校验通过才换真包） ─────────
+//
+// 1.6.99 老实现的三个坑（线上实测）：
+//  1) `codesign --force --deep --sign -` 只按主 bundle 的 entitlements 递归套下去，
+//     嵌套 helper / XPC（WeChatAppEx 一类）被套上不属于自己的 entitlements →
+//     微信主进程能跑、内部子进程起不来，表现就是「微信登录不了 / 起不来 / 读不到密钥」；
+//  2) 签的是真包，签坏了没法退 —— 用户的微信就此不可用，只能重装；
+//  3) 没备份，重装是唯一出路。
+//
+// 现在：ditto 到副本 → 副本上逐项签（每项保留自己的 entitlements，不用 --deep）
+//      → codesign --verify --deep 校验 → 通过才原子换入真包；任何一步失败原包不动。
+//      首次重签前把官方原版备份一份，随时可一键还原。
+
+const BACKUP_NAME: &str = "WeChat-orig.app";
+const STAGE_NAME: &str = "wx-resign-stage";
+
+/// 邦信数据目录（备份/暂存放这，与 /Applications 同在数据卷，rename 瞬时）。
+fn bx_data_dir() -> Result<std::path::PathBuf, String> {
+    let home = std::env::var("HOME").map_err(|_| "无法定位当前用户家目录".to_string())?;
+    let d = std::path::PathBuf::from(home)
+        .join("Library")
+        .join("Application Support")
+        .join("com.x8fde.im");
+    fs::create_dir_all(&d).map_err(|e| format!("创建数据目录失败：{e}"))?;
+    Ok(d)
+}
+
+fn backup_path() -> Result<std::path::PathBuf, String> {
+    Ok(bx_data_dir()?.join(BACKUP_NAME))
+}
+
+/// 是否有一份「官方原版」备份可直接还原（备份存在且本身未被重签）。
+pub fn orig_backup_ok() -> bool {
+    match backup_path() {
+        Ok(p) => p.exists() && !wechat_resigned_at(&p.display().to_string()),
+        Err(_) => false,
     }
-    // 清隔离属性：重签会让 Gatekeeper 下次启动重新校验，残留 com.apple.quarantine
-    // 时微信会被拦成「Apple 无法检查是否包含恶意软件」。无属性时 xattr 返回非 0，忽略。
-    let _ = Command::new("/usr/bin/xattr")
-        .args(["-rd", "com.apple.quarantine", app])
-        .output();
+}
+
+/// 逐项签名脚本：不使用 --deep，每个嵌套 bundle / dylib 都抽自己的 entitlements 再签。
+/// 由内向外（find -depth 后序），最后签主 bundle。
+const SIGN_SH: &str = r#"/bin/sh
+set -u
+APP="$1"; MAINENT="$2"; W="$3"
+: > "$W/sign.log"
+
+sign_one() {
+  _it="$1"
+  _e="$W/item.ent"
+  : > "$_e"
+  /usr/bin/codesign -d --entitlements :- "$_it" >"$_e" 2>/dev/null
+  if [ -s "$_e" ] && /usr/bin/grep -q "plist" "$_e" 2>/dev/null; then
+    /usr/bin/codesign --force --sign - --timestamp=none --entitlements "$_e" "$_it" >>"$W/sign.log" 2>&1
+  else
+    /usr/bin/codesign --force --sign - --timestamp=none "$_it" >>"$W/sign.log" 2>&1
+  fi
+}
+
+/usr/bin/find "$APP/Contents" -depth \
+  \( -name '*.framework' -o -name '*.app' -o -name '*.xpc' -o -name '*.bundle' -o -name '*.appex' \) \
+  > "$W/list_bundle" 2>/dev/null
+while IFS= read -r it; do
+  [ -n "$it" ] || continue
+  sign_one "$it" || { echo "X8FAIL|bundle|$it"; exit 1; }
+done < "$W/list_bundle"
+
+/usr/bin/find "$APP/Contents" -depth \( -name '*.dylib' -o -name '*.so' \) > "$W/list_lib" 2>/dev/null
+while IFS= read -r it; do
+  [ -n "$it" ] || continue
+  sign_one "$it" || { echo "X8FAIL|lib|$it"; exit 1; }
+done < "$W/list_lib"
+
+/usr/bin/find "$APP/Contents/MacOS" -depth -type f -perm -0100 > "$W/list_bin" 2>/dev/null
+while IFS= read -r it; do
+  [ -n "$it" ] || continue
+  sign_one "$it" || { echo "X8FAIL|bin|$it"; exit 1; }
+done < "$W/list_bin"
+
+/usr/bin/codesign --force --sign - --timestamp=none --entitlements "$MAINENT" "$APP" >>"$W/sign.log" 2>&1 \
+  || { echo "X8FAIL|main|$APP"; exit 1; }
+exit 0
+"#;
+
+/// 换包脚本：原包先改名兜底，新包 ditto 进来后校验，失败自动回滚。原包永远留一条命。
+const SWAP_SH: &str = r#"/bin/sh
+set -u
+STAGE="$1"; APP="$2"; OLD="/Applications/.WeChat.app.x8old"
+if [ -e "$OLD" ]; then /bin/rm -rf "$OLD" || exit 11; fi
+if ! /bin/mv "$APP" "$OLD" 2>/dev/null; then echo "X8FAIL|move"; exit 12; fi
+if ! /usr/bin/ditto "$STAGE" "$APP" 2>/dev/null; then
+  /bin/rm -rf "$APP"; /bin/mv "$OLD" "$APP"; echo "X8FAIL|ditto"; exit 13
+fi
+if ! /usr/bin/codesign --verify --deep "$APP" >/dev/null 2>&1; then
+  /bin/rm -rf "$APP"; /bin/mv "$OLD" "$APP"; echo "X8FAIL|verify"; exit 14
+fi
+/bin/rm -rf "$OLD"
+exit 0
+"#;
+
+/// 以 sh -c 跑一段脚本（用户态）。
+fn run_sh(script: &str, a1: &str, a2: &str, a3: &str) -> Result<(), String> {
+    let out = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(script)
+        .arg("x8sh")
+        .arg(a1)
+        .arg(a2)
+        .arg(a3)
+        .output()
+        .map_err(|e| format!("执行脚本失败：{e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let e = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    let o = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    Err(if !o.is_empty() { o } else { e })
+}
+
+/// 提权跑同一段脚本（只在用户态被 TCC/权限拒绝时降级使用）。
+/// 注意：AppleScript 的 `do shell script "..."` 里不能带换行，所以脚本先落临时文件，
+/// 提权只执行 `/bin/sh <file>`。
+fn run_sh_sudo(script: &str, a1: &str, a2: &str, a3: &str) -> Result<(), String> {
+    let dir = std::env::temp_dir().join("x8_wx_sh");
+    let _ = fs::create_dir_all(&dir);
+    let f = dir.join(format!("swap_{}.sh", std::process::id()));
+    fs::write(&f, script).map_err(|e| format!("写临时脚本失败：{e}"))?;
+    let inner = format!(
+        "/bin/sh {} {} {} {}",
+        shell_quote(&f.display().to_string()),
+        shell_quote(a1),
+        shell_quote(a2),
+        shell_quote(a3)
+    );
+    let osa = format!(
+        "do shell script \"{}\" with administrator privileges",
+        escape_for_osascript(&inner)
+    );
+    let out = Command::new("/usr/bin/osascript")
+        .args(["-e", &osa])
+        .output()
+        .map_err(|e| format!("提权执行失败：{e}"))?;
+    let _ = fs::remove_file(&f);
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if err.contains("User canceled") || err.contains("-128") {
+            return Err("CANCELED".into());
+        }
+        return Err(err);
+    }
     Ok(())
 }
 
-/// 重签微信：抽出原 entitlements → 去掉 Hardened Runtime（重签时不传 --options runtime）→
-/// 用本机 ad-hoc 证书重签（保留 allow-jit / debugger 等，否则微信起不来）。需管理员密码。
-///
-/// 注意：重签只改磁盘上的二进制，运行中的微信需重启才生效（签名变更在内存里不生效）。
+fn verify_app(app: &str) -> Result<(), String> {
+    let out = Command::new("/usr/bin/codesign")
+        .args(["--verify", "--deep", "--verbose=2", app])
+        .output()
+        .map_err(|e| format!("校验调用失败：{e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let e = String::from_utf8_lossy(&out.stderr);
+    Err(e.trim().lines().take(4).collect::<Vec<_>>().join("；"))
+}
+
+/// 重签微信。全流程：备份原版 → ditto 副本 → 副本签名 + 校验 → 退出微信 → 原子换入。
+/// 任何一步失败，/Applications 上的微信保持原样。
 pub fn resign_wechat() -> Result<String, String> {
     let app = wechat_app();
     if !Path::new(&app).exists() {
@@ -227,13 +374,18 @@ pub fn resign_wechat() -> Result<String, String> {
             "没找到微信（{app}）。请先从 App Store 或官网安装微信，再回来重签。"
         ));
     }
-    // 0) 先判权限，不通过就直接报，别让用户白输一次管理员密码。
-    //    这里用「邦信自己（用户态）」的探针，与即将执行的 codesign 同一身份。
     if !app_mgmt_granted() {
         return Err(format!("PERM|{}", app_mgmt_hint()));
     }
-    // 1) 抽出原 entitlements（务必保留，含 allow-jit / debugger）
-    let ent = std::env::temp_dir().join("wechat_entitlements.plist");
+
+    // 1) 备份官方原版（只在「当前还没被重签」且「还没有备份」时做一次）。
+    //    当前已经是重签状态就别备份了 —— 那是重签版，备份下来还原也没意义。
+    let bak = backup_path()?;
+    if !bak.exists() && !wechat_resigned() {
+        let _ = Command::new("/usr/bin/ditto").arg(&app).arg(&bak).output();
+    }
+
+    // 2) 抽主 bundle 的 entitlements 并补 get-task-allow（缺它 lldb 挂不上）。
     let dump = Command::new("/usr/bin/codesign")
         .args(["-d", "--entitlements", ":-", &app])
         .output()
@@ -244,72 +396,124 @@ pub fn resign_wechat() -> Result<String, String> {
             String::from_utf8_lossy(&dump.stderr)
         ));
     }
-    // 1.5) 关键：往 entitlements 补 get-task-allow。缺它时无论 root 与否，taskgated 都会
-    //      拒掉 lldb 的 task_for_pid（除非开全局开发者模式 + 注销重登），补上即可 attach。
+    let data = bx_data_dir()?;
+    let ent = data.join("wx_main.entitlements");
+    let work = data.join("wx-sign-work");
+    let _ = fs::remove_dir_all(&work);
+    fs::create_dir_all(&work).map_err(|e| format!("创建签名工作目录失败：{e}"))?;
     let ent_xml = ensure_get_task_allow(&String::from_utf8_lossy(&dump.stdout));
     fs::write(&ent, &ent_xml).map_err(|e| format!("写 entitlements 失败：{e}"))?;
 
-    // 2) 重签前先退出微信：运行中的微信持着旧签名的内存映射，磁盘签名换了、
-    //    进程还是旧的，用户会以为「重签成功了却依然读不到消息」。
-    //    完全退出由这里代办；重签完成后 wx_setup_run 会自动把它重新打开。
-    let was_running = wechat_running();
-    if was_running && !quit_wechat() {
-        return Err("微信正在运行且退不掉（可能弹着对话框）。请手动 ⌘Q 退出微信后重试。".into());
+    // 3) 复制到副本再签（真包全程不动）。
+    let stage_root = data.join(STAGE_NAME);
+    let _ = fs::remove_dir_all(&stage_root);
+    fs::create_dir_all(&stage_root).map_err(|e| format!("创建暂存目录失败：{e}"))?;
+    let stage_app = stage_root.join("WeChat.app");
+    let cp = Command::new("/usr/bin/ditto")
+        .arg(&app)
+        .arg(&stage_app)
+        .output()
+        .map_err(|e| format!("复制微信到暂存区失败：{e}"))?;
+    if !cp.status.success() {
+        return Err("复制微信到暂存区失败（磁盘空间不足？微信约 1GB）".into());
     }
 
-    // 3) 用户态优先重签：TCC 认的负责进程就是邦信本人，免密码、也不会再出现
-    //    「① 显示权限已给、② 却报没权限」。只有真被拒才降级提权。
-    match codesign_user(&ent, &app) {
-        Ok(()) => return Ok(done_msg()),
-        Err(e) => {
-            let denied = e.contains("Operation not permitted") || e.contains("not permitted");
-            if !denied {
-                return Err(format!("重签微信失败：{e}"));
+    // 4) 副本上逐项签名。
+    let st = stage_app.display().to_string();
+    if let Err(e) = run_sh(SIGN_SH, &st, &ent.display().to_string(), &work.display().to_string()) {
+        let log = fs::read_to_string(work.join("sign.log")).unwrap_or_default();
+        let tail: String = log.lines().rev().take(3).collect::<Vec<_>>().join(" / ");
+        let _ = fs::remove_dir_all(&stage_root);
+        return Err(format!("在副本上签名失败（原微信未改动）：{e} {tail}"));
+    }
+
+    // 5) 校验副本：签名完整 + 无 Hardened Runtime + 带 get-task-allow。
+    if let Err(e) = verify_app(&st) {
+        let _ = fs::remove_dir_all(&stage_root);
+        return Err(format!("复制出来的新签名校验不通过（原微信未改动）：{e}"));
+    }
+    if !wechat_resigned_at(&st) {
+        let _ = fs::remove_dir_all(&stage_root);
+        return Err("新签名没有达到可调试状态（要么还带 Hardened Runtime，要么 get-task-allow 没写进去）。原微信未改动。".into());
+    }
+
+    // 6) 退出微信后原子换入。换包失败会自动回滚成原包。
+    if wechat_running() && !quit_wechat() {
+        let _ = fs::remove_dir_all(&stage_root);
+        return Err("微信正在运行且退不掉（可能弹着对话框）。请手动 ⌘Q 退出微信后重试。".into());
+    }
+    let swap = |sudo: bool| -> Result<(), String> {
+        if sudo {
+            run_sh_sudo(SWAP_SH, &st, &app, "")
+        } else {
+            run_sh(SWAP_SH, &st, &app, "")
+        }
+    };
+    match swap(false) {
+        Ok(()) => {}
+        Err(e) if e.contains("User canceled") || e == "CANCELED" => {
+            let _ = fs::remove_dir_all(&stage_root);
+            return Err("已取消（未输入管理员密码），微信没有被改动。".into());
+        }
+        Err(_) => {
+            // 用户态没权限动 /Applications → 提权再来一次（此时仍会自动回滚）
+            if let Err(e2) = swap(true) {
+                let _ = fs::remove_dir_all(&stage_root);
+                if e2.contains("User canceled") || e2 == "CANCELED" {
+                    return Err("已取消（未输入管理员密码），微信没有被改动。".into());
+                }
+                return Err(format!("换入新签名失败（已自动回滚为原微信）：{e2}"));
             }
         }
     }
 
-    // 4) 降级：管理员密码提权（兼容 /Applications/WeChat.app 属主为 root、用户态写不进的机器）
-    //    2026-11-14：动手前先在同一段提权脚本里做「可写入」预检（不额外弹密码框）。
-    //    App 管理 / FDA 拦截时 codesign 只会报 Operation not permitted in subcomponent，
-    //    完全看不出是权限问题；预检失败直接回哨兵 X8_EPERM，Rust 侧翻译成人话。
-    //    另：xattr 在无隔离属性时返回非 0，原来用 && 串联会把「签名其实成功」误报成失败，
-    //    改成 ; ... ; 忽略其退出码。
-    let probe = format!("{app}/Contents/.x8w_permchk");
-    let inner = format!(
-        "if ! /usr/bin/touch \"{probe}\" 2>/dev/null; then echo X8_EPERM >&2; exit 42; fi; \
-         /bin/rm -f \"{probe}\"; \
-         /usr/bin/codesign --force --deep --sign - --entitlements \"{ent}\" \"{app}\" || exit $?; \
-         /usr/bin/xattr -rd com.apple.quarantine \"{app}\" 2>/dev/null; true",
-        probe = probe,
-        ent = ent.display(),
-        app = app
-    );
-    let osa = format!(
-        "do shell script \"{}\" with administrator privileges",
-        escape_for_osascript(&inner)
-    );
-    let out = Command::new("/usr/bin/osascript")
-        .args(["-e", &osa])
-        .output()
-        .map_err(|e| format!("提权重签微信失败：{e}"))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        // 预检哨兵 / codesign 原始 EPERM 都归到「权限不足」这一条人话上
-        if err.contains("X8_EPERM") || err.contains("Operation not permitted") {
-            return Err(format!("PERM|{}", app_mgmt_hint()));
-        }
-        if err.contains("User canceled") || err.contains("-128") {
-            return Err("已取消（未输入管理员密码），微信没有被改动。".into());
-        }
-        return Err(format!("重签微信失败：{err}"));
-    }
+    // 7) 清隔离属性（否则 Gatekeeper 下次启动会拦）+ 清暂存。
+    let _ = Command::new("/usr/bin/xattr")
+        .args(["-rd", "com.apple.quarantine", &app])
+        .output();
+    let _ = fs::remove_dir_all(&stage_root);
+
     Ok(done_msg())
+}
+
+/// 用备份还原官方微信（重签把它搞坏时的唯一退路）。
+pub fn restore_wechat() -> Result<String, String> {
+    let app = wechat_app();
+    let bak = backup_path()?;
+    if !bak.exists() {
+        return Err("没有官方原版备份（这份备份只在首次重签前生成）。请到 weixin.qq.com/macwechat 重新下载安装，聊天记录不会丢。".into());
+    }
+    if app_mgmt_granted() && wechat_running() && !quit_wechat() {
+        return Err("微信正在运行且退不掉，请手动 ⌘Q 退出微信后重试。".into());
+    }
+    let b = bak.display().to_string();
+    let swap = |sudo: bool| -> Result<(), String> {
+        if sudo {
+            run_sh_sudo(SWAP_SH, &b, &app, "")
+        } else {
+            run_sh(SWAP_SH, &b, &app, "")
+        }
+    };
+    match swap(false) {
+        Ok(()) => {}
+        Err(e) if e.contains("User canceled") || e == "CANCELED" => {
+            return Err("已取消（未输入管理员密码），微信没有被改动。".into())
+        }
+        Err(_) => {
+            if let Err(e2) = swap(true) {
+                if e2.contains("User canceled") || e2 == "CANCELED" {
+                    return Err("已取消（未输入管理员密码），微信没有被改动。".into());
+                }
+                return Err(format!("还原失败（已自动回滚）：{e2}"));
+            }
+        }
+    }
+    Ok("已还原为官方微信。要再读消息，重新点一次「一键重签」即可。".to_string())
 }
 
 /// 重签成功的统一文案（不再要求用户自己重启微信——由 wx_setup_run 自动拉起）。
 fn done_msg() -> String {
-    "微信已重签（已移除 Hardened Runtime 并补上调试授权 get-task-allow，隔离属性已清）。".to_string()
+    "微信已重签（副本签名 + 校验通过后换入；已移除 Hardened Runtime 并补上 get-task-allow）。".to_string()
 }
 
 /// 以当前用户经 LaunchAgent 拉起 wxgo（用户态，无需管理员权限）。
@@ -679,7 +883,7 @@ fn escape_for_osascript(s: &str) -> String {
 
 // ─────────────────────────── Tauri 命令 ───────────────────────────
 
-/// 前端向导轮询：当前 mac 读微信的三项前置条件。
+/// 前端向导轮询：当前 mac 读微信的三项前置条件 + 是否可一键还原。
 #[tauri::command]
 pub fn wx_setup_state() -> Value {
     let resigned = wechat_resigned();
@@ -691,7 +895,22 @@ pub fn wx_setup_state() -> Value {
         "resigned": resigned,
         "wechat_running": running,
         "ready": resigned && running,
+        "has_backup": orig_backup_ok(),
     })
+}
+
+/// 一键还原官方微信（重签把它搞坏时的退路，用首次重签前备份的原版覆盖回去）。
+#[tauri::command]
+pub fn wx_restore_wechat() -> Value {
+    match restore_wechat() {
+        Ok(msg) => {
+            if !wechat_running() {
+                open_wechat();
+            }
+            json!({ "ok": true, "msg": msg })
+        }
+        Err(e) => json!({ "ok": false, "err": e }),
+    }
 }
 
 /// 前端点「一键重签」：以管理员密码提权重签微信。重签后若微信仍在跑，提示重启。
