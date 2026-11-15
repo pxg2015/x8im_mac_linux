@@ -159,6 +159,7 @@ fn main() {
             "wx_setup_state",
             "wx_setup_run",
             "wx_restore_wechat",
+            "wx_wechat_relogin",
         ]),
     );
     if let Err(e) = tauri_build::try_build(attrs) {

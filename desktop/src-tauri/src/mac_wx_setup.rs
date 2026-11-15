@@ -899,6 +899,28 @@ pub fn wx_setup_state() -> Value {
     })
 }
 
+/// 捕获密钥前「自动关微信 → 等一会 → 再打开」。
+///
+/// 为什么需要：密钥是微信**登录那一刻**由 PBKDF2 派生的，keyext 只能在登录流程里
+/// 断点捕获。让用户自己去「设置 → 退出登录 → 重新登录」对小白太重（还经常点错）。
+/// 这里代劳：优雅退出微信、等 1.2 秒、再拉起 —— 微信重开必停在扫码登录界面，
+/// 扫一下就产生密钥派生，捕获即可命中。
+#[tauri::command]
+pub fn wx_wechat_relogin() -> Value {
+    if wechat_running() && !quit_wechat() {
+        return json!({ "ok": false, "err": "微信退不掉（可能弹着对话框），请手动 ⌘Q 关掉微信后再点一次" });
+    }
+    std::thread::sleep(Duration::from_millis(1200));
+    open_wechat();
+    for _ in 0..80 {
+        if wechat_running() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    json!({ "ok": true, "running": wechat_running() })
+}
+
 /// 一键还原官方微信（重签把它搞坏时的退路，用首次重签前备份的原版覆盖回去）。
 #[tauri::command]
 pub fn wx_restore_wechat() -> Value {

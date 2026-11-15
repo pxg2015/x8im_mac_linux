@@ -62,6 +62,10 @@ mod mac_wx_setup {
     pub fn wx_restore_wechat() -> Value {
         serde_json::json!({ "ok": false, "err": "当前平台不支持" })
     }
+    #[tauri::command]
+    pub fn wx_wechat_relogin() -> Value {
+        serde_json::json!({ "ok": false, "err": "当前平台不支持" })
+    }
 }
 
 // 非 Windows：mac/linux 的升级走「下载新包手动装 / 系统包管理器」，
@@ -6482,7 +6486,8 @@ fn main() {
             // 2026-11-10 macOS 读微信前置条件检测 + 提权重签（mac 专用，其余平台恒返回 unsupported）
             mac_wx_setup::wx_setup_state,
             mac_wx_setup::wx_setup_run,
-            mac_wx_setup::wx_restore_wechat
+            mac_wx_setup::wx_restore_wechat,
+            mac_wx_setup::wx_wechat_relogin
         ])
         .setup(|app| {
             // 2026-11-07 方案 B PoC：本地静态资源拦截（未配置时直接 return，零行为变化）
