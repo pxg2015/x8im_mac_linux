@@ -148,10 +148,72 @@ pub fn app_mgmt_granted() -> bool {
 /// 也无法绕过，必须由邦信自己被授权。原来直接把 codesign stderr 抛给用户，看不懂。
 fn app_mgmt_hint() -> String {
     "没有修改微信 App 的权限（被 macOS「App 管理」拦截）。\
-     请到 系统设置 → 隐私与安全性 → App 管理 与 完全磁盘访问 两处都勾选「邦信」，\
-     然后完全退出邦信（⌘Q）重新打开，再点「一键重签」。（TCC 权限只在进程启动时读取，\
-     重启前不会生效。）"
+     请到 系统设置 → 隐私与安全性 → App 管理，把「邦信」打开后重试。\
+     勾选后必须重启邦信才生效 —— 直接点下面「已勾选，重启邦信继续」即可，\
+     重启后回到这里再点一次重签。"
         .to_string()
+}
+
+/// 优雅退出微信（等同 ⌘Q）。重签前必须先退出：运行中的微信仍持有旧签名的内存映射，
+/// 磁盘签名换了进程不换，用户会看到「重签成功但依然读不到消息」。
+/// 顺序：AppleScript quit → 最多 3s 等自退 → TERM → 最多 2s → KILL。
+fn quit_wechat() -> bool {
+    if !wechat_running() {
+        return true;
+    }
+    let _ = Command::new("/usr/bin/osascript")
+        .args(["-e", "tell application \"WeChat\" to quit"])
+        .output();
+    for _ in 0..30 {
+        if !wechat_running() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = Command::new("/usr/bin/pkill")
+        .args(["-f", "WeChat.app/Contents/MacOS/WeChat"])
+        .output();
+    for _ in 0..20 {
+        if !wechat_running() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = Command::new("/usr/bin/pkill")
+        .args(["-9", "-f", "WeChat.app/Contents/MacOS/WeChat"])
+        .output();
+    for _ in 0..10 {
+        if !wechat_running() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+/// 重新打开微信（重签后自动拉起，用户不用自己去找 Dock 图标）。
+fn open_wechat() {
+    let _ = Command::new("/usr/bin/open").args(["-a", &wechat_app()]).output();
+}
+
+/// 用户态重签（不提权）：TCC 的负责进程就是邦信本人，权限判定与
+/// `app_mgmt_granted()` 探针完全一致，所以探针能过这里就能过。
+fn codesign_user(ent: &Path, app: &str) -> Result<(), String> {
+    let out = Command::new("/usr/bin/codesign")
+        .args(["--force", "--deep", "--sign", "-", "--entitlements"])
+        .arg(ent)
+        .arg(app)
+        .output()
+        .map_err(|e| format!("调用 codesign 失败：{e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    // 清隔离属性：重签会让 Gatekeeper 下次启动重新校验，残留 com.apple.quarantine
+    // 时微信会被拦成「Apple 无法检查是否包含恶意软件」。无属性时 xattr 返回非 0，忽略。
+    let _ = Command::new("/usr/bin/xattr")
+        .args(["-rd", "com.apple.quarantine", app])
+        .output();
+    Ok(())
 }
 
 /// 重签微信：抽出原 entitlements → 去掉 Hardened Runtime（重签时不传 --options runtime）→
@@ -164,6 +226,11 @@ pub fn resign_wechat() -> Result<String, String> {
         return Err(format!(
             "没找到微信（{app}）。请先从 App Store 或官网安装微信，再回来重签。"
         ));
+    }
+    // 0) 先判权限，不通过就直接报，别让用户白输一次管理员密码。
+    //    这里用「邦信自己（用户态）」的探针，与即将执行的 codesign 同一身份。
+    if !app_mgmt_granted() {
+        return Err(format!("PERM|{}", app_mgmt_hint()));
     }
     // 1) 抽出原 entitlements（务必保留，含 allow-jit / debugger）
     let ent = std::env::temp_dir().join("wechat_entitlements.plist");
@@ -182,10 +249,27 @@ pub fn resign_wechat() -> Result<String, String> {
     let ent_xml = ensure_get_task_allow(&String::from_utf8_lossy(&dump.stdout));
     fs::write(&ent, &ent_xml).map_err(|e| format!("写 entitlements 失败：{e}"))?;
 
-    // 2) 以 root 重签：不加 --options runtime（即移除 Hardened Runtime）；
-    //    同时清掉下载隔离属性 —— 重签会让 Gatekeeper 在下次启动重新校验，
-    //    残留 com.apple.quarantine 时微信会被拦成「Apple 无法检查是否包含恶意软件」。
-    //
+    // 2) 重签前先退出微信：运行中的微信持着旧签名的内存映射，磁盘签名换了、
+    //    进程还是旧的，用户会以为「重签成功了却依然读不到消息」。
+    //    完全退出由这里代办；重签完成后 wx_setup_run 会自动把它重新打开。
+    let was_running = wechat_running();
+    if was_running && !quit_wechat() {
+        return Err("微信正在运行且退不掉（可能弹着对话框）。请手动 ⌘Q 退出微信后重试。".into());
+    }
+
+    // 3) 用户态优先重签：TCC 认的负责进程就是邦信本人，免密码、也不会再出现
+    //    「① 显示权限已给、② 却报没权限」。只有真被拒才降级提权。
+    match codesign_user(&ent, &app) {
+        Ok(()) => return Ok(done_msg()),
+        Err(e) => {
+            let denied = e.contains("Operation not permitted") || e.contains("not permitted");
+            if !denied {
+                return Err(format!("重签微信失败：{e}"));
+            }
+        }
+    }
+
+    // 4) 降级：管理员密码提权（兼容 /Applications/WeChat.app 属主为 root、用户态写不进的机器）
     //    2026-11-14：动手前先在同一段提权脚本里做「可写入」预检（不额外弹密码框）。
     //    App 管理 / FDA 拦截时 codesign 只会报 Operation not permitted in subcomponent，
     //    完全看不出是权限问题；预检失败直接回哨兵 X8_EPERM，Rust 侧翻译成人话。
@@ -213,16 +297,19 @@ pub fn resign_wechat() -> Result<String, String> {
         let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
         // 预检哨兵 / codesign 原始 EPERM 都归到「权限不足」这一条人话上
         if err.contains("X8_EPERM") || err.contains("Operation not permitted") {
-            return Err(app_mgmt_hint());
+            return Err(format!("PERM|{}", app_mgmt_hint()));
         }
         if err.contains("User canceled") || err.contains("-128") {
             return Err("已取消（未输入管理员密码），微信没有被改动。".into());
         }
         return Err(format!("重签微信失败：{err}"));
     }
-    Ok("微信已重签（已移除 Hardened Runtime 并补上调试授权 get-task-allow，隔离属性已清）。\
-        请完全退出微信（⌘Q）再重新打开，否则旧签名进程仍无法被挂接。"
-        .into())
+    Ok(done_msg())
+}
+
+/// 重签成功的统一文案（不再要求用户自己重启微信——由 wx_setup_run 自动拉起）。
+fn done_msg() -> String {
+    "微信已重签（已移除 Hardened Runtime 并补上调试授权 get-task-allow，隔离属性已清）。".to_string()
 }
 
 /// 以当前用户经 LaunchAgent 拉起 wxgo（用户态，无需管理员权限）。
@@ -612,18 +699,35 @@ pub fn wx_setup_state() -> Value {
 pub fn wx_setup_run() -> Value {
     match resign_wechat() {
         Ok(msg) => {
+            // 重签前由 resign_wechat 主动退出了微信，这里自动拉起，用户不必自己找图标。
+            if !wechat_running() {
+                open_wechat();
+                for _ in 0..50 {
+                    if wechat_running() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
             let running = wechat_running();
             json!({
                 "ok": true,
                 "resigned": true,
                 "wechat_running": running,
                 "msg": if running {
-                    format!("{msg}；微信仍在运行，请退出并重新打开微信后，再点「开始读取」。")
+                    format!("{msg}微信已自动重新打开，登录后点「开始读取」即可。")
                 } else {
-                    msg
+                    format!("{msg}微信没能自动打开，请手动打开并登录微信。")
                 }
             })
         }
-        Err(e) => json!({ "ok": false, "err": e }),
+        Err(e) => {
+            let perm = e.starts_with("PERM|");
+            json!({
+                "ok": false,
+                "perm": if perm { "app_mgmt" } else { "" },
+                "err": e.trim_start_matches("PERM|"),
+            })
+        }
     }
 }
