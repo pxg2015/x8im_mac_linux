@@ -1,0 +1,41 @@
+name: notary-probe
+
+# 公证状态探测器：只查 notarytool 结果，不构建、不产物、不动线上。
+# 用途：build-macos 里公证轮询超时（Apple 队列慢）时，隔一段时间用同一个 submission id
+# 回来查是否已 Accepted，避免为了「等结果」重复跑全量编译。
+on:
+  workflow_dispatch:
+    inputs:
+      ids:
+        description: "逗号分隔的 submission id（app/dmg 可一起传）"
+        required: true
+
+jobs:
+  probe:
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - name: Prepare notarization API key
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "${APPLE_API_KEY_P8:-}" ] || { echo "::error::APPLE_API_KEY_P8 未配置"; exit 1; }
+          KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+          printf '%s' "$APPLE_API_KEY_P8" | tr -d '\r' > "$KEY_PATH"
+          chmod 600 "$KEY_PATH"
+          echo "APPLE_API_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
+
+      - name: Probe submissions
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -uo pipefail
+          AUTH=(--key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER")
+          for id in $(echo "${{ inputs.ids }}" | tr ',' ' '); do
+            [ -n "$id" ] || continue
+            echo "===== $id ====="
+            xcrun notarytool info "$id" "${AUTH[@]}" || echo "!! info 调用失败（id 可能已过期/不属于本账号）"
+          done
