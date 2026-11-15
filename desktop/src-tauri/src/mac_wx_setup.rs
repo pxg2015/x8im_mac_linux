@@ -119,6 +119,29 @@ pub fn fda_granted() -> bool {
     }
 }
 
+/// 「App 管理（App Management，macOS 13+）」是否已授予邦信。
+///
+/// 为什么单列一个状态：重签微信要改 /Applications/WeChat.app 里的二进制，这被 TCC 的
+/// 「App 管理」保护——FDA 管不到它。缺它时 `codesign --force` 会报
+/// `Operation not permitted in subcomponent`，用户根本看不懂，只会反复点重签。
+///
+/// 探测方式与 resign_wechat 里的预检同款：往微信 App 里 touch 一个探针文件，
+/// 能写入=有 App 管理权限（写完立即删，不留痕迹）。TCC 是进程级校验，只在进程启动时
+/// 读取，故「授权后未 ⌘Q 重启」仍会探测失败——这恰好和提示语「勾选后必须重启邦信」对齐。
+pub fn app_mgmt_granted() -> bool {
+    let probe = format!("{}/Contents/.x8w_permchk", wechat_app());
+    // 用 shell 串执行 touch + rm，避免留下探针文件；touch 成功即有权，rm 兜底清理。
+    let ok = std::process::Command::new("/usr/bin/touch")
+        .arg(&probe)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if ok {
+        let _ = std::fs::remove_file(&probe);
+    }
+    ok
+}
+
 /// macOS 13+ 的「App 管理（App Management）」/ 完全磁盘访问拦截时给用户的指引。
 /// 2026-11-14：这是「Operation not permitted in subcomponent」的唯一真因 ——
 /// TCC 是**进程级**校验，`do shell script ... with administrator privileges` 拿到 root
@@ -577,6 +600,7 @@ pub fn wx_setup_state() -> Value {
     json!({
         "supported": true,
         "fda": fda_granted(),
+        "app_mgmt": app_mgmt_granted(),
         "resigned": resigned,
         "wechat_running": running,
         "ready": resigned && running,
