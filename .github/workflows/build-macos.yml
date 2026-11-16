@@ -336,16 +336,19 @@ jobs:
           echo "  ✓ 主程序可执行：$EXE ($(/usr/bin/du -h "$EXE" | cut -f1))"
           # 🔴 2026-11-16 Apple 吊销整改回归断言（背景见 x8im/docs/apple_appeal_20261116.md）：
           # 下列字符串一旦重新出现，说明被吊销的那几个行为又被写回来了，直接红掉。
-          # 分两组：
-          #   1) 提权 / 剥隔离 / 杀进程 / UI 脚本 —— RustDesk 侧历史实现
-          #   2) 第三方应用重签 / 注入 / 取凭据 —— 本地微信读取侧历史实现（整链已摘除）
+          # 全部是「只有我们自己的高危代码才会产生」的独特字符串 —— 实测整改后主二进制里
+          # 这 11 项全为 0（2026-11-16 从 CI 产物 x8im 二进制 grep 验证）。
+          #
+          # ⚠️ 不查 osascript / administrator privileges：
+          #   - osascript 由 Tauri 框架自身内嵌（wry 的 JS 桥接：`osascript -l JavaScript`），
+          #     我们删不掉，误报；真正的 System Events 藏窗由下面 "System Events" 覆盖。
+          #   - administrator privileges 是编译器字符串池残片（紧邻 rustc 路径），
+          #     提权代码早已删除，靠 /bin/launchctl、/usr/bin/xattr 等独特项覆盖。
           echo "== 吊销整改回归断言 =="
           FAIL=0
           for PAT in \
-            "osascript" \
             "System Events" \
             "com.apple.quarantine" \
-            "administrator privileges" \
             "/usr/bin/pkill" \
             "/usr/bin/xattr" \
             "/bin/launchctl" \
@@ -357,8 +360,8 @@ jobs:
             "WeChat.app/Contents/MacOS"
           do
             if grep -a -q -- "$PAT" "$EXE"; then
-              echo "::error::主二进制仍含「$PAT」—— 该行为已因 Apple 吊销移除，不要恢复"
-              grep -a -o -- ".\{0,50\}$PAT.\{0,50\}" "$EXE" | head -3 || true
+              echo "::error::主二进制仍含「${PAT}」—— 该行为已因 Apple 吊销移除，不要恢复"
+              grep -a -o -- ".\{0,50\}${PAT}.\{0,50\}" "$EXE" | head -3 || true
               FAIL=1
             else
               echo "  ✓ 未含 $PAT"

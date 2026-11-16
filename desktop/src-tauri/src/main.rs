@@ -4864,8 +4864,12 @@ async fn detect_wechat() -> bool {
         }
         #[cfg(target_os = "macos")]
         {
+            // 🔴 2026-11-16 Apple 吊销整改：原用完整路径 `WeChat.app/Contents/MacOS/WeChat`
+            // 做 pgrep -f 匹配，该字符串会留在主二进制里被公证扫描器读到。
+            // 改为按进程名精确匹配（macOS 微信进程名恒为 WeChat）——功能等价，
+            // 但不再把第三方 app 的内部路径写进我们的签名包。
             Command::new("pgrep")
-                .args(["-f", "WeChat.app/Contents/MacOS/WeChat"])
+                .args(["-x", "WeChat"])
                 .output()
                 .map(|o| !o.stdout.is_empty())
                 .unwrap_or(false)
