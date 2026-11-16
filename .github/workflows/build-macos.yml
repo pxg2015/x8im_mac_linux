@@ -35,6 +35,10 @@ on:
         description: "提交 Apple 公证并等待（true）。false = 跳过公证，直接出未公证的签名包"
         type: boolean
         default: true
+      sign:
+        description: "是否用 Developer ID 签名。🔴 2026-11-16 证书已被 Apple 吊销，恢复前必须设 false"
+        type: boolean
+        default: true
   push:
     tags: ["v*"]
 
@@ -74,7 +78,10 @@ jobs:
       RD_SERVER: ${{ secrets.RD_SERVER }}
       RD_SERVER_KEY: ${{ secrets.RD_SERVER_KEY }}
       # 签名开关：证书 + 身份都在才走签名分支，否则保持未签名（只出包不签名）。
-      HAS_SIGNING: ${{ secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_SIGNING_IDENTITY != '' && '1' || '0' }}
+      # 🔴 2026-11-16 起增加手动 sign=false：Developer ID 证书已被 Apple 吊销，
+      # 吊销期间 codesign 必然失败（"certificate has been revoked"），
+      # 只能用 sign=false 出未签名包来验证代码与「吊销整改回归断言」。
+      HAS_SIGNING: ${{ (inputs.sign == false) && '0' || (secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_SIGNING_IDENTITY != '' && '1' || '0') }}
     steps:
       - uses: actions/checkout@v4
 
@@ -309,7 +316,8 @@ jobs:
           }
           echo "  ✓ 版本：$GOT_VER"
           BAD=0
-          for K in NSMicrophoneUsageDescription NSCameraUsageDescription NSAppleEventsUsageDescription; do
+          # 🔴 2026-11-16 Apple 吊销整改 E：NSAppleEventsUsageDescription 已删除，不再断言其存在
+          for K in NSMicrophoneUsageDescription NSCameraUsageDescription; do
             V=$(/usr/libexec/PlistBuddy -c "Print :$K" "$PLIST" 2>/dev/null || true)
             if [ -n "$V" ]; then echo "  ✓ $K = $V"; else echo "  ✗ 缺 $K"; BAD=1; fi
           done
@@ -317,10 +325,46 @@ jobs:
             echo "::error::Info.plist 隐私用途声明缺失 —— 会议/藏窗会在 macOS 上被 TCC 终止进程"
             exit 1
           }
+          # 反向断言：Apple Events 声明不得回归（见 x8im/docs/apple_appeal_20261116.md）
+          if /usr/libexec/PlistBuddy -c "Print :NSAppleEventsUsageDescription" "$PLIST" >/dev/null 2>&1; then
+            echo "::error::Info.plist 又出现 NSAppleEventsUsageDescription —— 该能力已因 Apple 吊销移除，不要恢复"
+            exit 1
+          fi
           BIN=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$PLIST")
           EXE="$APP/Contents/MacOS/$BIN"
           test -x "$EXE" || { echo "::error::CFBundleExecutable 缺失或不可执行：$EXE"; exit 1; }
           echo "  ✓ 主程序可执行：$EXE ($(/usr/bin/du -h "$EXE" | cut -f1))"
+          # 🔴 2026-11-16 Apple 吊销整改回归断言（背景见 x8im/docs/apple_appeal_20261116.md）：
+          # 下列字符串一旦重新出现，说明被吊销的那几个行为又被写回来了，直接红掉。
+          # 分两组：
+          #   1) 提权 / 剥隔离 / 杀进程 / UI 脚本 —— RustDesk 侧历史实现
+          #   2) 第三方应用重签 / 注入 / 取凭据 —— 本地微信读取侧历史实现（整链已摘除）
+          echo "== 吊销整改回归断言 =="
+          FAIL=0
+          for PAT in \
+            "osascript" \
+            "System Events" \
+            "com.apple.quarantine" \
+            "administrator privileges" \
+            "/usr/bin/pkill" \
+            "/usr/bin/xattr" \
+            "/bin/launchctl" \
+            "com.x8fde.im.wxgo" \
+            "com.tencent.xinWeChat" \
+            "get-task-allow" \
+            "WeChat-orig" \
+            "wx-resign-stage" \
+            "WeChat.app/Contents/MacOS"
+          do
+            if grep -a -q -- "$PAT" "$EXE"; then
+              echo "::error::主二进制仍含「$PAT」—— 该行为已因 Apple 吊销移除，不要恢复"
+              grep -a -o -- ".\{0,50\}$PAT.\{0,50\}" "$EXE" | head -3 || true
+              FAIL=1
+            else
+              echo "  ✓ 未含 $PAT"
+            fi
+          done
+          [ "$FAIL" = 0 ] || exit 1
           # dmg 内是用户真正拿到的那份，再对 dmg 验一次（挂载只读，不改内容）
           for DMG in src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg; do
             [ -e "$DMG" ] || continue
@@ -330,7 +374,7 @@ jobs:
             test -f "$DPLIST" || { echo "::error::dmg 内找不到 Info.plist"; hdiutil detach "$MNT" -quiet; exit 1; }
             DV=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$DPLIST")
             [ "$DV" = "$EXPECT_VER" ] || { echo "::error::dmg 内版本不一致：$DV != $EXPECT_VER"; hdiutil detach "$MNT" -quiet; exit 1; }
-            for K in NSMicrophoneUsageDescription NSCameraUsageDescription NSAppleEventsUsageDescription; do
+            for K in NSMicrophoneUsageDescription NSCameraUsageDescription; do
               /usr/libexec/PlistBuddy -c "Print :$K" "$DPLIST" >/dev/null 2>&1 || {
                 echo "::error::dmg 内缺 $K"; hdiutil detach "$MNT" -quiet; exit 1
               }

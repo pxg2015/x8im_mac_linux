@@ -326,21 +326,12 @@ impl Plugin {
     }
 
     pub fn running(&self) -> bool {
-        #[cfg(target_os = "macos")]
-        {
-            // mac 上插件以 root 经提权通道拉起，本进程不持子进程句柄 → 用端口探活
-            if let Ok(addr) = format!("127.0.0.1:{}", self.spec.port).parse::<SocketAddr>() {
-                return TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok();
-            }
-            return false;
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let mut g = self.child.lock().unwrap();
-            match g.as_mut() {
-                Some(c) => matches!(c.try_wait(), Ok(None)),
-                None => false,
-            }
+        // 2026-11-16 整改：插件只在宿主直接 spawn 的模式下运行（Windows/Linux）。
+        // macOS 不再走 LaunchAgent/提权通道，因此也不需要端口探活这一套。
+        let mut g = self.child.lock().unwrap();
+        match g.as_mut() {
+            Some(c) => matches!(c.try_wait(), Ok(None)),
+            None => false,
         }
     }
 
@@ -413,15 +404,9 @@ impl Plugin {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755));
         }
-        #[cfg(target_os = "macos")]
-        {
-            // 未签名的 Go 二进制被下载后可能带 com.apple.quarantine，
-            // Gatekeeper 会直接拦下；本机自己执行的文件移除该属性即可。
-            let _ = std::process::Command::new("/usr/bin/xattr")
-                .args(["-d", "com.apple.quarantine"])
-                .arg(&target)
-                .output();
-        }
+        // 2026-11-16 整改：已删除 macOS 分支里的「剥离文件隔离属性」调用。
+        // 理由：给下载来的可执行文件剥离隔离属性属 Gatekeeper bypass，是审核红线；
+        // 且签名分发版已不再下载执行任何外部组件（见 wx_updater::prepare）。
         Ok(target)
     }
 
@@ -484,61 +469,11 @@ impl Plugin {
             return Err("应用正在退出".to_string());
         }
 
-        // ── macOS：wxgo 以当前用户经 LaunchAgent 拉起（与微信同用户，才能 lldb-attach
-        //    提取密钥），本进程不持子进程句柄，状态全靠端口探活 + 握手。 ──
+        // 🔴 2026-11-16 Apple 吊销整改：macOS 不再经 LaunchAgent / 提权通道拉起外部组件，
+        // 也不再 attach 任何第三方进程。签名分发版不包含本地微信读取能力。
         #[cfg(target_os = "macos")]
         {
-            if self.running() {
-                let tok = self.token.lock().unwrap().clone();
-                if !tok.is_empty() {
-                    return Ok(self.spec.port);
-                }
-            }
-            // 闸门：微信未重签（仍带 Hardened Runtime）则 wxgo 根本 attach 不上，
-            // 明确报错，避免看门狗徒劳重试刷屏。
-            if !crate::mac_wx_setup::wechat_resigned() {
-                return Err(
-                    "微信尚未重签（Hardened Runtime 未移除），无法读取消息。请在「Wx消息」引导里完成重签后重试。"
-                        .into(),
-                );
-            }
-            if let Err(e) = self.apply_pending() {
-                self.set_err(e);
-            }
-            let bin = self
-                .resolve()
-                .ok_or_else(|| format!("plugin_missing:{}", self.spec.id))?;
-            let data_dir = crate::mail_cache::data_dir(app)?;
-            let db = crate::mail_cache::db_path(app)?;
-            // 清掉上一轮的就绪标记：残留文件会让 wait_ready 立刻「就绪」，
-            // 结果握手打到旧进程/半启动进程上（2026-11-12）。
-            let ready = data_dir.join(READY_FILE);
-            let _ = std::fs::remove_file(&ready);
-            std::fs::create_dir_all(&data_dir).ok();
-            let root = bin.parent().unwrap_or(&self.root).display().to_string();
-            let sub = |s: &str| -> String {
-                s.replace("{data}", &data_dir.display().to_string())
-                    .replace("{db}", &db.display().to_string())
-                    .replace("{port}", &self.spec.port.to_string())
-                    .replace("{root}", &root)
-                    .replace("{id}", &self.spec.id)
-            };
-            // mac 上插件由 LaunchAgent 以当前用户拉起，无父进程管道：
-            // ① 去掉 --parent-watch（否则 wxgo 会因 stdin EOF 误判父进程已死而自退）；
-            // ② 令牌改经 X8TOKEN_FILE 临时文件注入（见 mac_wx_setup::launch_user）。
-            let args: Vec<String> = self
-                .spec
-                .args
-                .iter()
-                .filter(|a| a.as_str() != "--parent-watch")
-                .map(|a| sub(a.as_str()))
-                .collect();
-            let token = self.gen_token()?;
-            *self.token.lock().unwrap() = token.clone();
-            // 以当前用户经 LaunchAgent 拉起（无需管理员），函数内已等端口就绪；握手时
-            // pid==0 会跳过 pid 校验（用户态子进程 pid 本进程不知道），安全。
-            crate::mac_wx_setup::launch_user(&bin, &args, &token, self.spec.port, &ready)?;
-            return self.handshake();
+            return Err("当前版本未包含本地微信读取能力（签名分发版已移除该功能）".to_string());
         }
 
         // ── 非 macOS（Windows / Linux）：本进程直接 spawn 子进程，持句柄、靠 stdin 传令牌。 ──
@@ -706,41 +641,8 @@ impl Plugin {
 
     /// 2026-11-10 P1-1：先请插件优雅收尾，等 2s，超时才 TerminateProcess。
     fn stop_with(&self, graceful: bool) {
-        // ── macOS：插件以当前用户经 LaunchAgent 拉起，本进程不持句柄，
-        //    走「bootout → HTTP 优雅退出 → 端口反杀」三段收尾。 ──
-        #[cfg(target_os = "macos")]
-        {
-            // 🔴 2026-11-12：**必须先 bootout**。plist 带 KeepAlive(SuccessfulExit=false)，
-            // 直接 kill 会被 launchd 判成「异常退出」并在 5s 内把旧二进制重拉起来 ——
-            // 换包时新旧进程抢端口，紧随其后的 bootstrap 还会拿到
-            // 「Bootstrap failed: 5: Input/output error」，日志文件都不建（今天实测）。
-            let _ = Command::new("/bin/launchctl")
-                .args([
-                    "bootout",
-                    &format!("gui/{}/com.x8fde.im.wxgo", crate::mac_wx_setup::current_uid()),
-                ])
-                .output();
-            let tok = self.token.lock().unwrap().clone();
-            if graceful && !tok.is_empty() {
-                let _ = self.post("/api/app/shutdown", "{}", 600);
-                std::thread::sleep(Duration::from_millis(300));
-            }
-            crate::mac_wx_setup::kill_by_port(self.spec.port);
-            // kill 之后必须等端口真正释放：TERM → 进程退出有窗口期。若紧接着
-            // install_from + launch_user，旧进程还占着端口 → ensure 探活即复用，
-            // 结果「二进制已换、跑的还是旧进程」，且版本文件写新版后永不再更新
-            // （2026-11-11 实测：诊断版 wxgo 装不上正是这个原因）。
-            if let Ok(a) = format!("127.0.0.1:{}", self.spec.port).parse::<SocketAddr>() {
-                for _ in 0..50 {
-                    if TcpStream::connect_timeout(&a, Duration::from_millis(150)).is_err() {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-            }
-            self.pid.store(0, Ordering::Relaxed);
-            return;
-        }
+        // 🔴 2026-11-16 整改：macOS 不再使用 LaunchAgent 常驻，故删除 bootout / 端口反杀
+        // 这套 mac 专用收尾（该段曾调用系统服务管理器与按端口杀进程）。
         #[cfg(not(target_os = "macos"))]
         {
             let mut g = self.child.lock().unwrap();
