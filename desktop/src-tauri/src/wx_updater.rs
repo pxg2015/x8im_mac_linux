@@ -244,6 +244,13 @@ fn start_and_probe(app: &AppHandle) -> Result<String, String> {
 /// 打开 W消息时调一次：检查 → 缺件/有新版就装 → 拉起插件。
 /// force=true 是页面「更新组件」按钮，跳过 6h 节流。
 pub fn prepare(app: &AppHandle, force: bool) -> Result<Value, String> {
+    // 🔴 2026-11-16 Apple 吊销整改：macOS 不再下载、安装、执行任何外部组件。
+    // 原链路为「拉远端清单 → 下载 wxgo 二进制 → 剥隔离 → LaunchAgent 常驻 → lldb attach 微信」，
+    // 在公证扫描器眼里是标准的 dropper + 凭据窃取，已整链停用（代码保留于 _internal_wxlocal/）。
+    if cfg!(target_os = "macos") {
+        let _ = (app, force);
+        return Err("当前版本未包含本地微信读取能力（签名分发版已移除该功能）".to_string());
+    }
     let dir = plugin_dir(app)?;
     let local = read_local(&dir);
     let p = crate::plugin_host::get("wx");

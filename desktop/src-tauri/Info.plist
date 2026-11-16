@@ -11,8 +11,11 @@
 
   对应两处受害点：
     · 会议开麦 / 开摄像头（Agora, web/src/App.vue 起按需加载 MeetingView）
-    · 远程协助藏窗（main.rs hide_assist_windows → osascript + System Events，
-      无 NSAppleEventsUsageDescription 时 AppleEvent 被拒 -1743，静默失败）
+
+  🔴 2026-11-16 Apple 吊销整改 E：已删除 NSAppleEventsUsageDescription。
+  原先这条是为了给「远程协助藏窗」用（main.rs hide_assist_windows → osascript + System Events）。
+  该功能已整段移除，故本条目的必要性消失；保留它只会让审核方认为本 app 仍在用 UI 脚本
+  操控其他应用。若将来恢复任何 Apple Events 用法，必须同时恢复本声明并说明用途。
 
   Tauri 会自动把本文件与默认模板合并（bundle.macOS.infoPlist 的默认查找位置
   即 tauri 配置同目录），所以这里只放新增的三条，不写 CFBundle* 等已有键。
@@ -23,7 +26,5 @@
   <string>邦信需要使用麦克风，以便在会议中发言。</string>
   <key>NSCameraUsageDescription</key>
   <string>邦信需要使用摄像头，以便在会议中开启视频。</string>
-  <key>NSAppleEventsUsageDescription</key>
-  <string>邦信需要通过系统脚本控制远程协助窗口的显示与隐藏。</string>
 </dict>
 </plist>

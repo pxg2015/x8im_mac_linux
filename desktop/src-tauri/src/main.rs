@@ -44,27 +44,30 @@ mod wx_sidecar;  // WX 消息插件（Go）薄封装，转调 plugin_host
 mod wx_cache;    // 本地微信消息库（mail.db 的 wx_* 表，客户端读写）
 mod signing;     // 组件包三端共用验签（minisign，与 updater 同一把公钥）
 mod wx_updater;  // wxgo 组件自动下载 / 更新 / 编译时间上报
-// macOS 读微信前置条件检测 + 提权拉起（mac 专用；linux 回落同名同签名空实现）
-#[cfg(target_os = "macos")]
-mod mac_wx_setup;
-#[cfg(not(target_os = "macos"))]
+// 🔴 2026-11-16 Apple 开发者账号吊销整改（三端统一、无 mac 专用分支）：
+// 原 `mac_wx_setup.rs`（重签 WeChat.app / 注入 get-task-allow / lldb attach 取库密钥 /
+// 读微信沙盒容器 / 提权 LaunchAgent 拉起 wxgo）已整文件移出编译树，存放于
+// `desktop/_internal_wxlocal/`，**不参与任何签名分发构建**。
+// 理由：这些行为在 macOS 上等同于篡改第三方应用签名 + 进程注入 + 跨应用取数据，
+// 属公证扫描与人工审核的硬性拒绝项，且对腾讯客户端有法律风险。
+// 三端命令表保持完全一致（前端无需按平台分支），此处恒返回 unsupported。
 mod mac_wx_setup {
     use serde_json::Value;
     #[tauri::command]
     pub fn wx_setup_state() -> Value {
-        serde_json::json!({ "supported": false })
+        serde_json::json!({ "supported": false, "reason": "当前版本未包含本地微信读取能力" })
     }
     #[tauri::command]
     pub fn wx_setup_run() -> Value {
-        serde_json::json!({ "ok": false, "err": "当前平台不支持" })
+        serde_json::json!({ "ok": false, "err": "当前版本未包含本地微信读取能力" })
     }
     #[tauri::command]
     pub fn wx_restore_wechat() -> Value {
-        serde_json::json!({ "ok": false, "err": "当前平台不支持" })
+        serde_json::json!({ "ok": false, "err": "当前版本未包含本地微信读取能力" })
     }
     #[tauri::command]
     pub fn wx_wechat_relogin() -> Value {
-        serde_json::json!({ "ok": false, "err": "当前平台不支持" })
+        serde_json::json!({ "ok": false, "err": "当前版本未包含本地微信读取能力" })
     }
 }
 
@@ -385,11 +388,20 @@ fn kill_rustdesk_procs() {
         // 改后最坏 3s 必返回，且所有「拉起 RustDesk 前先杀旧实例」的调用点都不再干挂。
         let _ = win_run_capture_to("taskkill", &["/F", "/IM", img], 3);
     }
-    // mac/linux：官方 RustDesk 进程名恒为 rustdesk（与 Windows taskkill rustdesk.exe 同语义；
-    // 用户自装的官方 RustDesk 一并杀掉，与 Windows 行为一致）。-x 精确匹配进程名，不会误伤。
-    #[cfg(not(windows))]
+    // 🔴 2026-11-16 Apple 吊销整改 D：mac 上不再按进程名杀任何进程（含用户自装的官方端）。
+    // macOS 下 RustDesk 由本进程 exec 拉起、与客户端同生命周期；「多实例并存」主要是
+    // Windows 的服务化常驻场景，mac 无此问题，故此处不做进程清理。
+    #[cfg(target_os = "macos")]
     {
-        let _ = Command::new("pkill").args(["-x", "rustdesk"]).output();
+        // 故意留空：见上。
+    }
+    // Linux 保留按父进程过滤的精确清理（不受 Apple 审核约束）。
+    #[cfg(target_os = "linux")]
+    {
+        let me = std::process::id().to_string();
+        let _ = Command::new("/usr/bin/pkill")
+            .args(["-P", me.as_str(), "-x", "rustdesk"])
+            .output();
     }
 }
 
@@ -865,49 +877,12 @@ fn macos_cached_exe() -> Option<std::path::PathBuf> {
 }
 
 
-/// mac：尽力清掉**资源包内那份** bundle 的 quarantine（无提权、失败静默）。
-///
-/// 为什么还要清：dmg 下载会把 `com.apple.quarantine` 带给包内所有文件，
-/// Tauri 资源目录里那份 `bin/mac/RustDesk.app` 因此一直带隔离标记。
-/// 主链路已改为不启动它（见 assist_exe），但 `--get-id` 等 CLI 仍会 exec 它；
-/// 万一哪天有路径以 GUI 方式拉起，就会重演「RustDesk 已损坏」。
-/// 清不掉（属主是 root）也无所谓 —— 直接 exec 不走 Gatekeeper。
-#[cfg(target_os = "macos")]
-fn macos_clear_bundle_quarantine(exe: &std::path::Path) {
-    if let Some(bundle) = exe.parent().and_then(|p| p.parent()).and_then(|p| p.parent()) {
-        let _ = Command::new("/usr/bin/xattr")
-            .args(["-dr", "com.apple.quarantine"])
-            .arg(bundle)
-            .output();
-    }
-}
-
-/// mac：修复被打包管线弄坏的 RustDesk.app 框架符号链接时用的脚本（写入 /tmp 后由
-/// 提权 osascript 调用）。内容对应 `甘/repair-rustdesk-bundle.sh` 已实测的逻辑。
-#[cfg(target_os = "macos")]
-const RD_REPAIR_SH: &str = r#"#!/bin/bash
-# 修复被打包管线弄坏的 RustDesk.app 框架符号链接（2026-10-18 甘真机根因）
-set -u
-B="$1"
-FW="$B/Contents/Frameworks"
-for f in "$FW"/*.framework; do
-  [ -d "$f/Versions/A" ] || continue
-  if [ ! -L "$f/Versions/Current" ]; then
-    [ -e "$f/Versions/Current" ] && rm -rf "$f/Versions/Current"
-    ln -s A "$f/Versions/Current"
-  fi
-  for e in "$f/Versions/A"/*; do
-    [ -e "$e" ] || continue
-    n=$(basename "$e")
-    [ "$n" = "Versions" ] && continue
-    if [ -L "$f/$n" ]; then :
-    elif [ -e "$f/$n" ]; then rm -rf "$f/$n"; ln -s "Versions/Current/$n" "$f/$n"
-    else ln -s "Versions/Current/$n" "$f/$n"; fi
-  done
-done
-/usr/bin/xattr -dr com.apple.quarantine "$B" 2>/dev/null
-/usr/bin/codesign --force --deep --sign - "$B" 2>&1 | grep -v '^$' || true
-"#;
+// 🔴 2026-11-16 Apple 吊销整改 B：已删除 macos_clear_bundle_quarantine() 与 RD_REPAIR_SH。
+// 理由：两者都会执行 `xattr -dr com.apple.quarantine`，其中 RD_REPAIR_SH 还是经
+// 「with administrator privileges」提权后执行 —— 在 Apple 公证扫描器眼里等同于
+// Gatekeeper bypass + 提权改系统目录，是本次账号被吊销的直接触发项之一。
+// 我们自己的包经 Developer ID 签名 + 公证后不需要剥隔离标记；直接 exec 也不经过
+// LaunchServices 的隔离检查，删除后不影响远程协助主链路。
 
 /// mac：检查某 RustDesk.app 的框架符号链接是否完好（纯只读、不提权）。
 ///
@@ -950,129 +925,46 @@ fn macos_bundle_symlinks_ok(bundle: &std::path::Path) -> bool {
     true
 }
 
-/// mac：提权修复某 RustDesk.app 被打包管线弄坏的框架符号链接结构
-/// （重建 `Versions/Current -> A` 与根级符号链接，清 quarantine，ad-hoc 重签）。
-/// 仅当 `macos_bundle_symlinks_ok` 返回 false 时才调用 —— 健康包不会被打扰。
-#[cfg(target_os = "macos")]
-fn macos_repair_bundle_symlinks(bundle: &std::path::Path) -> Result<(), String> {
-    let script_path = std::path::Path::new("/tmp/x8_repair_rd.sh");
-    if !script_path.exists() {
-        std::fs::write(script_path, RD_REPAIR_SH)
-            .map_err(|e| format!("写入修复脚本失败: {e}"))?;
-    }
-    let b = bundle.to_string_lossy().to_string();
-    let script = format!(
-        "do shell script \"bash '{}' '{}'\" with administrator privileges",
-        script_path.to_string_lossy(),
-        b
-    );
-    let out = Command::new("osascript")
-        .args(["-e", &script])
-        .output()
-        .map_err(|e| format!("提权修复框架符号链接失败: {e}"))?;
-    if !out.status.success() {
-        let se = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        if se.contains("-128") || se.to_lowercase().contains("cancel") {
-            return Err(
-                "你取消了系统授权，远程协助组件修复未完成（重试并输入本机开机密码）".into(),
-            );
-        }
-        return Err(format!("远程协助组件框架修复失败：{se}"));
-    }
-    if macos_bundle_symlinks_ok(bundle) {
-        Ok(())
-    } else {
-        Err("远程协助组件框架符号链接修复后仍不完整，请重新安装或升级邦信客户端".into())
-    }
-}
+// 🔴 2026-11-16 Apple 吊销整改 C：已删除 macos_repair_bundle_symlinks()。
+// 它是 RD_REPAIR_SH 的唯一调用方（写 /tmp 脚本 → osascript 提权 bash 执行 →
+// 重签 /Applications 下的第三方 app），属同一处提权改造，一并移除。
 
-/// mac：把「启动用的」和「`--password` 用的」统一成**同一个 bundle**（A 方案，2026-10-17 老8 定）。
+/// mac：定位一个「既可用于启动、也可用于 `--password`」的 RustDesk bundle。
 ///
-/// 🩸 事故链（甘真机 2026-10-17）：`rustdesk_path()` 返回邦信资源包里的
-/// `BangXin.app/Contents/Resources/bin/mac/RustDesk.app/...`，而 `--password` 硬编码跑
-/// `/Applications/RustDesk.app/...` —— 用户机器上两处**各有一份**（启动台里两个图标），
-/// 版本还可能不同；落位逻辑又是「已存在就跳过」，于是永远用 A 启动、拿 B 设密码。
-/// 跨版本 IPC 的 `Data::Config` 结构会变（ACK 是 1.5 才加的）→ 服务端反序列化失败 →
-/// 1s 无 ACK → 只报一句「未获得系统授权」，无从定位。
+/// 🔴 2026-11-16 Apple 吊销整改 C（重大变更）：**不再自行安装/搬移任何第三方 app**。
+/// 旧实现在 /Applications 缺失或结构损坏时，会用
+/// `do shell script "… ditto … mv … xattr -dr com.apple.quarantine …" with administrator privileges`
+/// 索要管理员密码、替换 /Applications 下的应用、剥掉 Gatekeeper 隔离属性 ——
+/// 在 Apple 公证扫描器眼里等同 Gatekeeper bypass + 提权改系统目录，是本次账号被吊销的
+/// 直接触发项之一，已整体删除（同批删除的还有 RD_REPAIR_SH 与 macos_repair_bundle_symlinks）。
 ///
-/// 现在（2026-10-21 方案A，用户实证「升级后没复用之前已启用的 rustdesk」）：
-/// 已装的 `/Applications/RustDesk.app` **只要存在且结构完好就永远复用**，
-/// 不再按版本字符串去覆盖它 —— 否则 macOS「屏幕录制」TCC 授权会因二进制哈希变化而失效，
-/// 升级后被控端（要截自己屏）每次都得重设。缺失 / 结构损坏才提权把**内置这份**落位到
-/// `/Applications/RustDesk.app`，旧的那份改名成 `RustDesk.app.x8bak-<时间戳>` 留作回滚点（不做 rm -rf）。
-/// 复用已装副本还能顺带保证「启动实例」与「--password 实例」是同一 bundle（IPC 版本天然一致，
-/// 正是 2026-10-17 事故要达成的目标），比原版本号比对更稳。
-/// 返回 (canonical exe, 是否发生了替换)。
+/// 现策略（只读、无提权）：
+///   1) 用户在 /Applications 里自己装过官方 RustDesk → 直接复用（TCC 授权跨版本保留）；
+///      结构损坏时**不修**，只报可读原因让用户重装 —— 修它就得 ad-hoc 重签 + 改系统目录。
+///   2) 否则用下载到用户目录缓存（`~/Library/Application Support/BangXin/assist`）那份：
+///      只启动，不落位、不提权。注意该位置不满足 RustDesk 的 `is_installed()` 判据，
+///      `--password` 会被 CLI 静默拒绝（exit 0），调用方需按「免密不可用」降级。
+///   3) 都没有 → 报错，由前端引导用户从官网安装。
+///
+/// 返回 (canonical exe, 是否发生了替换)。第二个值恒为 false，保留仅为调用方签名兼容。
 #[cfg(target_os = "macos")]
 fn macos_canonical_exe(raw: &std::path::Path) -> Result<(std::path::PathBuf, bool), String> {
-    // raw = .../RustDesk.app/Contents/MacOS/rustdesk → 上三级即 .app bundle
-    let src = raw
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("app"))
-        .ok_or("内置 RustDesk 路径异常（不是 .app bundle）")?;
-    // 2026-10-21 方案A：不再用版本号比对决定复用（见下方逻辑）。
-    // 内置这份 RustDesk.app 的框架符号链接可能已被打包管线解引用弄坏（🩸2026-10-18 甘真机），
-    // 但**只在真正要 ditto 落位时才修它**（见下方替换分支）—— 健康已装副本被复用时绝不碰
-    // 内置这份的签名，避免任何不必要的 ad-hoc 重签。
-    let _ = macos_bundle_version(src);
     let inst_dir = std::path::Path::new("/Applications/RustDesk.app");
-    // 已经就是 /Applications 那份（调用方传错/未来重构）→ 直接返回，绝不 ditto 自己到自己
-    if src == inst_dir {
-        return macos_installed_exe().map(|p| (p, false)).ok_or_else(|| {
-            "远程协助组件异常（/Applications/RustDesk.app 内无可执行文件）".to_string()
-        });
-    }
-    let inst_exe = macos_installed_exe().unwrap_or_else(|| inst_dir.join("Contents/MacOS/rustdesk"));
-    if inst_exe.is_file() {
-        // 2026-10-21 方案A：已装副本**健康即永远复用**，绝不碰它的签名/内容 → TCC 授权跨版本保留。
+    if let Some(exe) = macos_installed_exe() {
         if macos_bundle_symlinks_ok(inst_dir) {
-            return Ok((inst_exe, false));
+            return Ok((exe, false));
         }
-        // 已装副本结构损坏（框架符号链接断）才尝试修复；修复会 ad-hoc 重签（必然丢 TCC），
-        // 但损坏副本本就无法启动，修好比保留授权更优先。修复后仍完好则复用，否则落到下方替换。
-        if macos_repair_bundle_symlinks(inst_dir).is_ok() && macos_bundle_symlinks_ok(inst_dir) {
-            return Ok((inst_exe, false));
-        }
-        // 修复失败 → 落到下方整包替换（TCC 必然失效，但已是「无可用副本」时的唯一出路）
+        return Err(
+            "已安装的 RustDesk 结构不完整，请在「应用程序」里删除它后从官网重新安装".into(),
+        );
     }
-    // 进入替换分支：先确保内置这份 RustDesk.app 结构完好（框架符号链接断会导致启动即崩），
-    // 坏了就提权自愈（ad-hoc 重签，必然丢 TCC，但这是「无可用副本」时的唯一出路，可接受）。
-    if !macos_bundle_symlinks_ok(src) {
-        let _ = macos_repair_bundle_symlinks(src);
+    if let Some(exe) = macos_cached_exe() {
+        return Ok((exe, false));
     }
-    // 先 ditto 到隐藏的临时目录，校验可执行后再换位 —— 换位失败时用户的旧 app 仍可用
-    // 顺手清掉**源**（资源包那份）的隔离标记：否则以后任何以 GUI 方式拉起它的路径
-    // 都会重演「RustDesk 已损坏」（直接 exec 不受影响，故失败即忽略）。
-    macos_clear_bundle_quarantine(raw);
-    let mk = format!(
-        "do shell script \"/bin/rm -rf /Applications/.X8RD.incoming ; \
-         /usr/bin/ditto '{}' /Applications/.X8RD.incoming ; \
-         [ -x /Applications/.X8RD.incoming/Contents/MacOS/rustdesk ] || exit 3 ; \
-         BAK=/Applications/RustDesk.app.x8bak-`/bin/date +%s` ; \
-         /bin/mv /Applications/RustDesk.app $BAK 2>/dev/null ; \
-         /bin/mv /Applications/.X8RD.incoming /Applications/RustDesk.app ; \
-         /usr/bin/xattr -dr com.apple.quarantine /Applications/RustDesk.app || true\" \
-         with administrator privileges",
-        src.to_string_lossy()
-    );
-    let out = Command::new("osascript")
-        .args(["-e", &mk])
-        .output()
-        .map_err(|e| format!("提权执行失败: {e}"))?;
-    if !out.status.success() {
-        let se = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        if se.contains("-128") || se.to_lowercase().contains("cancel") {
-            return Err("你取消了系统授权，远程协助组件未安装（重试并输入本机开机密码）".into());
-        }
-        return Err(format!("远程协助组件落位失败（/Applications 写入被拒或包不完整）：{se}"));
+    if raw.is_file() {
+        return Ok((raw.to_path_buf(), false));
     }
-    // 落位后重新按 CFBundleExecutable 取（名字可能是 RustDesk 而非 rustdesk）
-    let landed = macos_installed_exe().ok_or_else(|| {
-        "远程协助组件落位失败（/Applications/RustDesk.app 内无可执行文件）".to_string()
-    })?;
-    Ok((landed, true))
+    Err("远程协助组件未就绪，请重新下载或升级邦信客户端".into())
 }
 
 /// mac/linux：提权把永久密码写进官方 RustDesk。Err 里带**真实原因**（stdout/stderr）。
@@ -1088,7 +980,10 @@ fn macos_canonical_exe(raw: &std::path::Path) -> Result<(std::path::PathBuf, boo
 /// ⚠️ 2026-10-17（老8 定 A 方案）：返回类型从 `bool` 改成 `Result<(), String>`，
 /// 把所有失败原因**分档上抛**。旧实现三种完全不同的故障（用户取消 / 位置校验不过 /
 /// IPC 无 ACK）被压成同一句「未获得系统授权」，甘真机因此卡了两轮、我们都看不出问题在哪。
-#[cfg(not(windows))]
+/// 🔴 2026-11-16 Apple 吊销整改：本函数现在**只用于 Linux**。mac 分支（osascript 提权写密码）
+/// 已整段删除 —— 它是本次账号被吊销的触发项之一，且 mac 组件不再落位 /Applications 后
+/// 该路径本就不满足 RustDesk 的 `is_installed()` 判据。mac 上密码改为用户手动输入。
+#[cfg(all(unix, not(target_os = "macos")))]
 fn unix_set_permanent_password(exe: &std::path::Path, pw: &str) -> Result<(), String> {
     // 兜底校验：pw 会被拼进 osascript/pkexec 的 shell 字符串（无引号包裹转义），
     // 只放行前端生成的 [A-Za-z0-9] 随机密码（与服务端 setid 校验同口径），
@@ -1096,52 +991,8 @@ fn unix_set_permanent_password(exe: &std::path::Path, pw: &str) -> Result<(), St
     if pw.len() < 8 || !pw.chars().all(|c| c.is_ascii_alphanumeric()) {
         return Err("密码格式不合法".into());
     }
-    #[cfg(target_os = "macos")]
-    {
-        // A 方案（2026-10-17 老8 定）：落位已前置到 macos_canonical_exe()，
-        // 这里拿到的 exe 必须已经在 /Applications/RustDesk.app 内 —— 与启动实例是同一份 bundle、
-        // 同一版本，否则跨版本 IPC 拿不到 ACK（见 macos_canonical_exe 的注释）。
-        let p = exe.to_string_lossy().to_string();
-        if !p.starts_with("/Applications/RustDesk.app/") {
-            return Err(format!(
-                "远程协助组件未就位（{p}），请重试以完成安装到 /Applications"
-            ));
-        }
-        let script = format!(
-            "do shell script \"'{}' --password {}\" with administrator privileges",
-            p, pw
-        );
-        let out = Command::new("osascript")
-            .args(["-e", &script])
-            .output()
-            .map_err(|e| format!("提权执行失败: {e}"))?;
-        let so = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        let se = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        if !out.status.success() {
-            if se.contains("-128") || se.to_lowercase().contains("cancel") {
-                return Err("你取消了系统授权，远程协助密码未写入（重试并在弹框输入本机开机密码）".into());
-            }
-            return Err(format!(
-                "提权写密码失败：{}",
-                if se.is_empty() { so.as_str() } else { se.as_str() }
-            ));
-        }
-        if so.contains("Done!") {
-            return Ok(());
-        }
-        if so.contains("Installation and administrative privileges") {
-            // is_installed() 不过：路径对了但 APP_NAME 不符，或落到别的副本上
-            return Err(format!(
-                "RustDesk 未通过安装位置校验（{p}），远程协助组件必须是 /Applications/RustDesk.app"
-            ));
-        }
-        if so.is_empty() {
-            return Err(
-                "远程协助密码写入无响应（RustDesk 未在运行或版本不匹配），请重试".into()
-            );
-        }
-        return Err(format!("远程协助密码写入失败：{so}"));
-    }
+    // 🔴 2026-11-16 Apple 吊销整改：原 mac 分支（osascript 提权执行 `rustdesk --password`）
+    // 已整段删除，本函数现在只有 Linux 分支。mac 侧不再索要管理员权限、不再写永久密码。
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         let p = exe.to_string_lossy().to_string();
@@ -1591,14 +1442,26 @@ fn ensure_rustdesk_blocking(app: tauri::AppHandle, expected_rid: String, passwor
                 "RustDesk 启动超时，远程协助暂未就绪".into()
             });
         }
-        // Err 里带真实原因（用户取消 / 位置校验不过 / IPC 无 ACK），不再压成一句万能文案
+        // 🔴 2026-11-16 Apple 吊销整改：mac 不再自动写永久密码。
+        // 原实现是 `do shell script "… --password …" with administrator privileges`（osascript 提权），
+        // 是本次账号被吊销的触发项之一。且 mac 侧组件现在不再落位 /Applications，
+        // 本就不满足 RustDesk 的 `is_installed()` 判据，这条路已失效。
+        // 现改为跳过：密码由用户在 RustDesk 连接界面查看/手动输入，客户端不再索要管理员权限。
+        #[cfg(all(unix, not(target_os = "macos")))]
         unix_set_permanent_password(&exe, pw)?;
+        #[cfg(target_os = "macos")]
+        let _ = (&exe, pw);
         // 清理临时实例（open_rustdesk 之后按需再拉；与 Windows 就绪链路同套路）
         kill_rustdesk_procs();
         // 密码就绪后才切审批模式（免 Accept 按钮；官方无 hide_cm，面板 3s 自最小化）
         let _ = ensure_approve_mode();
         let id = rustdesk_get_id(&app)?;
-        return Ok(EnsureOut { id, password: Some(pw.to_string()), changed: true, multi: false });
+        // mac：不再对外宣称「密码已就绪」（见上），交给前端引导用户手输
+        #[cfg(target_os = "macos")]
+        let pw_out: Option<String> = None;
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let pw_out: Option<String> = Some(pw.to_string());
+        return Ok(EnsureOut { id, password: pw_out, changed: true, multi: false });
     }
 }
 
@@ -1737,11 +1600,11 @@ fn mac_install_rustdesk() -> Result<String, String> {
     if !dt.success() {
         return Err("组件落位失败，请重试".into());
     }
-    // 清隔离标记：不清会触发 Gatekeeper「已损坏」。用户对自己的文件有 xattr 权限，无需提权。
-    let _ = Command::new("/usr/bin/xattr")
-        .args(["-dr", "com.apple.quarantine"])
-        .arg(&dst)
-        .output();
+    // 🔴 2026-11-16 Apple 吊销整改 B：已删除原先这里的
+    //   `xattr -dr com.apple.quarantine <dst>`
+    // 说明：我们对缓存里的组件一律用 CLI 直接 exec，不经过 LaunchServices，因此不会触发
+    // Gatekeeper 的隔离检查；而「主动剥隔离属性」在公证扫描器眼里是绕过 Gatekeeper 的动作，
+    // 是本次被吊销的触发项之一。若将来改为 GUI 拉起，应走正常签名/公证，不得再 xattr 去掉。
     if macos_cached_exe().is_none() {
         return Err("组件安装后未找到可执行文件，请到下载页手动安装".into());
     }
@@ -2437,23 +2300,15 @@ fn park_pid_windows(pids: &std::collections::HashSet<u32>) {
 }
 
 /// mac/linux 对应实现：隐藏官方 RustDesk 的全部窗口（等价 Windows EnumWindows+SW_HIDE）。
-///   mac：osascript 让 System Events 把 rustdesk 进程的所有窗口设为不可见。需邦信在
-///        「系统设置-隐私与安全性-辅助功能」获授权；未授权时静默失败（窗口照常显示，
-///        远程功能本身不受影响）。
+///   mac：**2026-11-16 已停用**。原实现是
+///        `osascript -e 'tell application "System Events" to set visible of process "rustdesk" to false'`，
+///        即用 UI 脚本把另一个进程的窗口设为不可见 —— 这在 Apple 公证扫描器眼里是
+///        隐蔽远控的典型特征（也是本次账号被吊销的触发项之一），已整段删除。
+///        代价：被控端待控时，官方 RustDesk 的连接面板会显示出来（功能不受影响，只是视觉回退）。
+///        后续如需隐藏，只能用 NSRunningApplication.hide()（进程内 API），不得再用 AppleScript。
 ///   linux：wmctrl 可用时把 rustdesk 类窗口置 hidden（发行版未装 wmctrl 则跳过）。
-/// 被控端待控期间可反复调用（见 hide_assist_windows_while_running）——官方客户端无
-/// hide_cm，对端连入时连接管理器窗口会晚于启动期出现，只有持续隐藏才盖得住。
 #[cfg(not(windows))]
 fn hide_assist_windows() {
-    #[cfg(target_os = "macos")]
-    {
-        let _ = Command::new("osascript")
-            .args([
-                "-e",
-                "tell application \"System Events\" to set visible of process \"rustdesk\" to false",
-            ])
-            .output();
-    }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         // wmctrl -lx 行：`0x04200000  0 rustdesk.Rustdesk  host  title`，第 3 列是类名
@@ -2478,6 +2333,8 @@ fn hide_assist_windows() {
 /// ⚠️ 仅用于**被控端待控**分支（空 target，拉起后还没会话窗口）。
 /// 控制端（--connect）**不得**调用：局域网打洞快，远程画面会话窗口常在 6s 内弹出即被永久藏死。
 fn hide_assist_windows_retried() {
+    // mac 已于 2026-11-16 停用窗口隐藏（见 hide_assist_windows 注释），不再起该线程。
+    #[cfg(all(unix, not(target_os = "macos")))]
     std::thread::spawn(|| {
         for _ in 0..12 {
             hide_assist_windows();
@@ -2493,6 +2350,7 @@ fn hide_assist_windows_retried() {
 /// 实例被回收（close_rustdesk / assist_idle_reap / 会话结束）后循环自行退出。
 #[cfg(not(windows))]
 fn hide_assist_windows_while_running() {
+    #[cfg(all(unix, not(target_os = "macos")))]
     std::thread::spawn(|| loop {
         if !unix_rustdesk_running() {
             break;
@@ -6483,7 +6341,8 @@ fn main() {
             wx_cache::wx_set_active,
             wx_cache::wx_pick_messages,
             wx_cache::wx_media_data,
-            // 2026-11-10 macOS 读微信前置条件检测 + 提权重签（mac 专用，其余平台恒返回 unsupported）
+            // 2026-11-16 整改：本地微信读取链已从签名分发版摘除，四个命令恒返回 unsupported
+            // （命令表保留是为了三端一致，前端调用不报 unknown command）
             mac_wx_setup::wx_setup_state,
             mac_wx_setup::wx_setup_run,
             mac_wx_setup::wx_restore_wechat,
