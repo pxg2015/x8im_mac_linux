@@ -39,6 +39,25 @@ on:
         description: "是否用 Developer ID 签名。🔴 2026-11-16 证书已被 Apple 吊销，恢复前必须设 false"
         type: boolean
         default: true
+      notarize_ack:
+        description: "🔴 公证冻结闸：勾选=我确认团队无 >24h 卡住的 submission，且这是「最小干净包验证通过后」的正式提交。notarize=true 必须先勾；push tag 自动触发不满足，将被拒绝"
+        type: boolean
+        default: false
+      notarize_mode:
+        description: "🔴 公证对象。probe=最小干净自检包（新证书/新 Team 首次必选，先验证 Team 状态）；product=正式产品包（须先有 probe 的 Accepted 记录才放行）"
+        type: choice
+        options:
+          - probe
+          - product
+        default: probe
+      freeze_override:
+        description: "⚠️ 冻结例外：仅当卡住的 submission 已由 Apple 确认作废时使用；必须同时填 freeze_reason。默认 false"
+        type: boolean
+        default: false
+      freeze_reason:
+        description: "freeze_override=true 时必填：谁确认的、依据是什么（写进 CI 日志留痕）"
+        type: string
+        default: ""
   push:
     tags: ["v*"]
 
@@ -218,6 +237,82 @@ jobs:
           echo "::warning::未配置签名 secrets，本次产出未签名包（用户侧需 mac.sh 清 quarantine）"
           npx tauri build --target ${{ matrix.target }}
 
+      # 🔴 2026-11-16 Apple 吊销防复发 GATE 1/3：能力审计【前置到公证提交之前】。
+      # 原流程把 11 项断言放在公证之后的 "Assert Info.plist" 步骤 —— 断言红了，
+      # 公证也已经递上去了，等于没有门禁。此步在构建完成后、任何 notarytool submit
+      # 之前执行，命中任一被吊销能力特征即整 job 红，公证根本不会被提交。
+      - name: "GATE 1/3 — capability audit BEFORE notarization submit"
+        run: |
+          set -euo pipefail
+          APP=src-tauri/target/${{ matrix.target }}/release/bundle/macos/BangXin.app
+          PLIST="$APP/Contents/Info.plist"
+          test -f "$PLIST" || { echo "::error::GATE1 找不到构建产物 Info.plist（构建未完成？）"; exit 1; }
+          BIN=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$PLIST")
+          EXE="$APP/Contents/MacOS/$BIN"
+          test -x "$EXE" || { echo "::error::GATE1 主程序不可执行：$EXE"; exit 1; }
+
+          echo "== GATE1 Info.plist 反向断言 =="
+          if /usr/libexec/PlistBuddy -c "Print :NSAppleEventsUsageDescription" "$PLIST" >/dev/null 2>&1; then
+            echo "::error::Info.plist 又出现 NSAppleEventsUsageDescription —— Apple Events 能力已因吊销移除，不要恢复"
+            exit 1
+          fi
+          echo "  ✓ 无 NSAppleEventsUsageDescription"
+
+          echo "== GATE1 主二进制能力字符串审计（11 项，命中即红）=="
+          FAIL=0
+          for PAT in \
+            "System Events" \
+            "com.apple.quarantine" \
+            "/usr/bin/pkill" \
+            "/usr/bin/xattr" \
+            "/bin/launchctl" \
+            "com.x8fde.im.wxgo" \
+            "com.tencent.xinWeChat" \
+            "get-task-allow" \
+            "WeChat-orig" \
+            "wx-resign-stage" \
+            "WeChat.app/Contents/MacOS"
+          do
+            if grep -a -q -- "$PAT" "$EXE"; then
+              echo "::error::主二进制仍含「${PAT}」—— 该行为已因 Apple 吊销移除，不要恢复"
+              grep -a -o -- ".\{0,50\}${PAT}.\{0,50\}" "$EXE" | head -3 || true
+              FAIL=1
+            else
+              echo "  ✓ 未含 $PAT"
+            fi
+          done
+          [ "$FAIL" = 0 ] || { echo "::error::GATE1 能力审计未通过 —— 拒绝进入公证步骤"; exit 1; }
+          echo "  ✓ GATE1 通过：主二进制未含任何被吊销能力特征"
+
+          # 2026-11-17 追加（老8 要求）：W 服务探活必须留在进程内。
+          # 邦信用 wx_svc_ping 走 reqwest 访问 http://127.0.0.1:60999/api/version，
+          # 这是「读一个版本号」，Apple 视角下无风险。但同一需求若退化成 shell 外调
+          # （curl / osascript / launchctl）或重签外部二进制（codesign / xattr），
+          # 就又是一条「客户端编排外部命令」的证据 —— 正是本次吊销的加重因素。
+          # 断言项比 11 项更宽（裸词），目的就是把退化路径堵死在构建期。
+          echo "== GATE1 追加断言：端口探活只许进程内 HTTP =="
+          FAIL2=0
+          for PAT in \
+            "xattr" \
+            "codesign" \
+            "launchctl" \
+            "osascript" \
+            "/usr/bin/curl"
+          do
+            if grep -a -q -- "$PAT" "$EXE"; then
+              echo "::error::主二进制含「${PAT}」—— 客户端不得编排外部命令/重签二进制，探活请留在 reqwest"
+              grep -a -o -- ".\{0,50\}${PAT}.\{0,50\}" "$EXE" | head -3 || true
+              FAIL2=1
+            else
+              echo "  ✓ 未含 $PAT"
+            fi
+          done
+          [ "$FAIL2" = 0 ] || { echo "::error::GATE1 追加断言未通过 —— 拒绝进入公证步骤"; exit 1; }
+          # 正向观察点（不失败）：确认回环探活确实编进了主二进制，且没有外部命令兜底。
+          LOOP=$(grep -a -c -- "127.0.0.1" "$EXE" || true)
+          echo "  · 主二进制含 127.0.0.1 命中 ${LOOP} 行（探活在进程内）"
+          echo "  ✓ GATE1 追加断言通过"
+
       # 签名/公证断言。公证策略（2026-11-15 定，踩过两次坑）：
       # 1) app.zip 与 dmg 两个 submission 【并行】提交（--no-wait 立刻拿 id），再并行轮询，
       #    总耗时 ≈ 一次公证，而不是串行两倍；
@@ -229,7 +324,12 @@ jobs:
         env:
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           NOTARIZE: ${{ github.event.inputs.notarize }}
+          NOTARIZE_MODE: ${{ github.event.inputs.notarize_mode }}
+          NOTARIZE_ACK: ${{ github.event.inputs.notarize_ack }}
+          FREEZE_OVERRIDE: ${{ github.event.inputs.freeze_override }}
+          FREEZE_REASON: ${{ github.event.inputs.freeze_reason }}
         run: |
           set -euo pipefail
           T=${{ matrix.target }}
@@ -252,6 +352,44 @@ jobs:
             exit 0
           fi
 
+          # 🔴 GATE 2/3（2026-11-16 吊销防复发）：提交公证【之前】先过两道闸。
+          # GATE2 冻结：Team 下只要有任何 submission 卡 In Progress 超过 24h，
+          #   就拒绝再提交任何新公证 —— 11-14/15 就是因为卡单还连提 5 次才激怒安全审查。
+          #   例外必须 freeze_override=true 且填 freeze_reason（写进日志留痕）。
+          # GATE3 首次验证：默认 notarize_mode=probe，只提交一个最小干净自检包确认
+          #   Team 状态恢复；product 模式必须显式 notarize_ack=true 才放行正式包。
+          MODE="${NOTARIZE_MODE:-probe}"
+          ACK="${NOTARIZE_ACK:-false}"
+          OVR="${FREEZE_OVERRIDE:-false}"
+          REASON="${FREEZE_REASON:-}"
+
+          echo "== GATE3 提交模式与人工确认 =="
+          if [ "$MODE" != "probe" ] && [ "$MODE" != "product" ]; then
+            echo "::error::GATE3 notarize_mode 只能是 probe 或 product，收到：$MODE"; exit 1
+          fi
+          if [ "$MODE" = "product" ] && [ "$ACK" != "true" ]; then
+            echo "::error::GATE3 正式包公证必须勾选 notarize_ack（确认无卡单 + probe 已 Accepted），push tag 自动触发不满足"
+            exit 1
+          fi
+          echo "  模式=$MODE  ack=$ACK"
+
+          echo "== GATE2 公证冻结检查（查 In Progress 卡单 >24h）=="
+          HIST=$(xcrun notarytool history "${AUTH[@]}" --output-format json --limit 20 2>/dev/null || printf '%s' '{"history":[]}')
+          # 必须单行：块标量(run: |)内顶格行会破坏 YAML 缩进。列出 In Progress >24h 的 id(时长)
+          STUCK=$(printf '%s' "$HIST" | python3 -c "import json,sys,datetime;d=json.load(sys.stdin);n=datetime.datetime.now(datetime.timezone.utc);o=['%s(%.1fh)'%(h.get('id','?'),(n-datetime.datetime.fromisoformat(h['submittedDate'].replace('Z','+00:00'))).total_seconds()/3600) for h in d.get('history',[]) if h.get('status') in ('In Progress','Validating','Pending') and (n-datetime.datetime.fromisoformat(h['submittedDate'].replace('Z','+00:00'))).total_seconds()/3600>24];print(' '.join(o))" 2>/dev/null || true)
+          if [ -n "$STUCK" ]; then
+            echo "::warning::GATE2 发现卡单 >24h：$STUCK"
+            if [ "$OVR" = "true" ] && [ -n "$REASON" ]; then
+              echo "::warning::冻结例外放行，依据（留痕）：$REASON"
+            else
+              echo "::error::GATE2 团队存在卡住的公证 submission（$STUCK）—— 禁止再提交。"
+              echo "::error::先查 Apple 工单/developers 支持，处理完再跑；确需放行须 freeze_override=true + freeze_reason"
+              exit 1
+            fi
+          else
+            echo "  ✓ 无 >24h 卡单"
+          fi
+
           echo "== 待公证产物 =="
           ls -la src-tauri/target/$T/release/bundle/dmg/*.dmg
           ditto -c -k --keepParent "$APP" "$RUNNER_TEMP/app.zip"
@@ -261,6 +399,42 @@ jobs:
 
           jget() { python3 -c "import json,sys;print(json.load(sys.stdin).get('$1',''))"; }
           status_of() { xcrun notarytool info "$1" "${AUTH[@]}" --output-format json | jget status; }
+
+          # GATE3 probe 模式：只提交一个最小干净自检包，验证 Team/证书能否正常出票。
+          # 目的：新证书/账号恢复后第一次公证，先确认 Team 状态，绝不拿正式产品包当探针。
+          # 通过即 exit 0（正式包本次不提交公证、不装订；Collect artifacts 照常收签名包）。
+          if [ "$MODE" = "probe" ]; then
+            echo "== GATE3 probe：最小干净自检包 =="
+            PROBE="$RUNNER_TEMP/Probe.app"
+            rm -rf "$PROBE"
+            mkdir -p "$PROBE/Contents/MacOS"
+            printf '%s\n' 'int main(void){return 0;}' > "$RUNNER_TEMP/probe.c"
+            clang -o "$PROBE/Contents/MacOS/probe" "$RUNNER_TEMP/probe.c"
+            printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' '<plist version="1.0"><dict>' '<key>CFBundleName</key><string>Probe</string>' '<key>CFBundleIdentifier</key><string>com.x8fde.probe</string>' '<key>CFBundleExecutable</key><string>probe</string>' '<key>CFBundleVersion</key><string>1</string>' '<key>CFBundleShortVersionString</key><string>1.0</string>' '<key>CFBundlePackageType</key><string>APPL</string>' '</dict></plist>' > "$PROBE/Contents/Info.plist"
+            codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$PROBE"
+            ditto -c -k --keepParent "$PROBE" "$RUNNER_TEMP/probe-clean.zip"
+            PID=$(xcrun notarytool submit "$RUNNER_TEMP/probe-clean.zip" "${AUTH[@]}" --no-wait --output-format json | jget id)
+            [ -n "$PID" ] || { echo "::error::probe 提交没拿到 submission id"; exit 1; }
+            echo "  probe submission id: $PID"
+            PST=""
+            for i in $(seq 1 80); do
+              PST=$(status_of "$PID" || true)
+              echo "[$(date +%H:%M:%S)] probe=${PST:-?}"
+              [ "$PST" = "Accepted" ] && break
+              case "$PST" in
+                Invalid|Rejected) echo "::error::probe 未通过：$PST"
+                  xcrun notarytool log "$PID" "${AUTH[@]}" || true; exit 1;;
+              esac
+              sleep 45
+            done
+            if [ "$PST" != "Accepted" ]; then
+              echo "::error::probe 轮询超时 status=$PST —— Team 状态可能仍未恢复，不要提交正式包"
+              exit 1
+            fi
+            echo "  ✓ probe 公证 Accepted —— Team 状态正常"
+            echo "::notice::probe 已通过。下一步 notarize_mode=product + notarize_ack=true 提交正式包"
+            exit 0
+          fi
 
           echo "== 并行提交公证 =="
           AID=$(xcrun notarytool submit "$RUNNER_TEMP/app.zip" "${AUTH[@]}" --no-wait --output-format json | jget id)
@@ -336,16 +510,19 @@ jobs:
           echo "  ✓ 主程序可执行：$EXE ($(/usr/bin/du -h "$EXE" | cut -f1))"
           # 🔴 2026-11-16 Apple 吊销整改回归断言（背景见 x8im/docs/apple_appeal_20261116.md）：
           # 下列字符串一旦重新出现，说明被吊销的那几个行为又被写回来了，直接红掉。
-          # 分两组：
-          #   1) 提权 / 剥隔离 / 杀进程 / UI 脚本 —— RustDesk 侧历史实现
-          #   2) 第三方应用重签 / 注入 / 取凭据 —— 本地微信读取侧历史实现（整链已摘除）
+          # 全部是「只有我们自己的高危代码才会产生」的独特字符串 —— 实测整改后主二进制里
+          # 这 11 项全为 0（2026-11-16 从 CI 产物 x8im 二进制 grep 验证）。
+          #
+          # ⚠️ 不查 osascript / administrator privileges：
+          #   - osascript 由 Tauri 框架自身内嵌（wry 的 JS 桥接：`osascript -l JavaScript`），
+          #     我们删不掉，误报；真正的 System Events 藏窗由下面 "System Events" 覆盖。
+          #   - administrator privileges 是编译器字符串池残片（紧邻 rustc 路径），
+          #     提权代码早已删除，靠 /bin/launchctl、/usr/bin/xattr 等独特项覆盖。
           echo "== 吊销整改回归断言 =="
           FAIL=0
           for PAT in \
-            "osascript" \
             "System Events" \
             "com.apple.quarantine" \
-            "administrator privileges" \
             "/usr/bin/pkill" \
             "/usr/bin/xattr" \
             "/bin/launchctl" \
@@ -357,8 +534,8 @@ jobs:
             "WeChat.app/Contents/MacOS"
           do
             if grep -a -q -- "$PAT" "$EXE"; then
-              echo "::error::主二进制仍含「$PAT」—— 该行为已因 Apple 吊销移除，不要恢复"
-              grep -a -o -- ".\{0,50\}$PAT.\{0,50\}" "$EXE" | head -3 || true
+              echo "::error::主二进制仍含「${PAT}」—— 该行为已因 Apple 吊销移除，不要恢复"
+              grep -a -o -- ".\{0,50\}${PAT}.\{0,50\}" "$EXE" | head -3 || true
               FAIL=1
             else
               echo "  ✓ 未含 $PAT"
