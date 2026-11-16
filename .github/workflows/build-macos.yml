@@ -270,9 +270,12 @@ jobs:
           # ⚠️ 只查「内嵌的外部命令绝对路径」和 Command::new 字面量，不查裸词：
           #   - 裸 osascript 会命中 wry 自带的 JS 桥接（`osascript -l JavaScript`），删不掉，误报；
           #   - 裸 xattr / codesign 可能与工具链符号表撞名。断言要能长期稳定，不许靠人工放行。
+          #   - /usr/bin/curl 本轮实测【必然命中】：远程协助组件下载（main.rs:1521/1548
+          #     拉 latest-assist.json + RustDesk 包）是既有功能，不在本次门禁范围，故不入列。
+          #     探活是否退化成 curl，改由 GATE1-D 的「wx_cache.rs 内禁止 Command::new」精准覆盖。
           echo "== GATE1-C 二进制：内嵌外部命令路径 =="
           FAILC=0
-          for PAT in "/usr/bin/curl" "/usr/bin/codesign" "/usr/bin/xattr" "/bin/launchctl"; do
+          for PAT in "/usr/bin/codesign" "/usr/bin/xattr" "/bin/launchctl"; do
             if grep -a -q -- "$PAT" "$EXE"; then
               echo "::error::主二进制含「${PAT}」—— 客户端不得编排外部命令，探活请用 reqwest"
               grep -a -o -- ".\{0,50\}${PAT}.\{0,50\}" "$EXE" | head -3 || true
@@ -298,6 +301,16 @@ jobs:
             fi
           done
           [ "$FAILD" = 0 ] || { echo "::error::GATE1-D 未通过 —— 拒绝进入公证步骤"; exit 1; }
+
+          # GATE1-E：W 服务探活（wx_svc_ping）必须全程留在进程内用 reqwest。
+          # 该命令就定义在 src/wx_cache.rs；一旦这里出现 Command::new，就说明有人把手
+          # 伸向了 shell（curl / lsof / nc 之类），届时既违反本门禁，也会在公证台账上
+          # 留下「客户端编排外部命令」的记录。
+          if grep -n --include='*.rs' -F "Command::new" src/wx_cache.rs; then
+            echo "::error::wx_cache.rs 出现 Command::new —— 探活必须用 reqwest，不得走 shell"
+            exit 1
+          fi
+          echo "  ✓ wx_cache.rs 无外部命令调用"
 
           # 正向观察点（不失败）：确认回环探活确实编进主二进制。
           LOOP=$(grep -a -c -- "127.0.0.1" "$EXE" || true)
