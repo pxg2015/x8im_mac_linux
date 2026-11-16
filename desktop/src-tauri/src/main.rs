@@ -6328,7 +6328,6 @@ fn main() {
             //   AppManifest / capabilities/remote.json / 命令定义处）
             wx_cache::plugins_list,
             wx_cache::wx_plugin_info,
-            // 2026-11-17 本机 W 服务探活（127.0.0.1:60999，绕开 WKWebView 的混合内容限制）
             wx_cache::wx_svc_ping,
             wx_cache::wx_plugin_start,
             wx_cache::wx_plugin_prepare,
