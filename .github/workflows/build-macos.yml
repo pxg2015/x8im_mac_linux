@@ -218,6 +218,92 @@ jobs:
           echo "::warning::未配置签名 secrets，本次产出未签名包（用户侧需 mac.sh 清 quarantine）"
           npx tauri build --target ${{ matrix.target }}
 
+      # 🔴 GATE 1/3：能力审计必须在【任何 notarytool submit 之前】跑。
+      # 历史教训：断言原本放在公证之后，红了也已经把包递上去了，等于没有门禁。
+      # 此步紧跟构建、先于公证步骤，命中即整 job 红。
+      - name: "GATE 1/3 — capability audit BEFORE notarization submit"
+        run: |
+          set -euo pipefail
+          APP=src-tauri/target/${{ matrix.target }}/release/bundle/macos/BangXin.app
+          PLIST="$APP/Contents/Info.plist"
+          test -f "$PLIST" || { echo "::error::GATE1 找不到构建产物 Info.plist（构建未完成？）"; exit 1; }
+          BIN=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$PLIST")
+          EXE="$APP/Contents/MacOS/$BIN"
+          test -x "$EXE" || { echo "::error::GATE1 主程序不可执行：$EXE"; exit 1; }
+
+          echo "== GATE1-A Info.plist 反向断言 =="
+          if /usr/libexec/PlistBuddy -c "Print :NSAppleEventsUsageDescription" "$PLIST" >/dev/null 2>&1; then
+            echo "::error::Info.plist 又出现 NSAppleEventsUsageDescription —— Apple Events 能力已因吊销移除，不要恢复"
+            exit 1
+          fi
+          echo "  ✓ 无 NSAppleEventsUsageDescription"
+
+          echo "== GATE1-B 主二进制：11 项被吊销能力特征（与整改断言同源）=="
+          FAIL=0
+          for PAT in \
+            "System Events" \
+            "com.apple.quarantine" \
+            "/usr/bin/pkill" \
+            "/usr/bin/xattr" \
+            "/bin/launchctl" \
+            "com.x8fde.im.wxgo" \
+            "com.tencent.xinWeChat" \
+            "get-task-allow" \
+            "WeChat-orig" \
+            "wx-resign-stage" \
+            "WeChat.app/Contents/MacOS"
+          do
+            if grep -a -q -- "$PAT" "$EXE"; then
+              echo "::error::主二进制仍含「${PAT}」—— 该行为已因 Apple 吊销移除，不要恢复"
+              grep -a -o -- ".\{0,50\}${PAT}.\{0,50\}" "$EXE" | head -3 || true
+              FAIL=1
+            else
+              echo "  ✓ 未含 $PAT"
+            fi
+          done
+          [ "$FAIL" = 0 ] || { echo "::error::GATE1-B 未通过 —— 拒绝进入公证步骤"; exit 1; }
+
+          # GATE1-C（2026-11-17 追加）：W 服务探活必须留在进程内（reqwest 直连 127.0.0.1:60999）。
+          # 同一需求若退化成 shell 外调（curl/osascript/launchctl）或重签外部二进制
+          # （codesign/xattr），就又是一条「客户端编排外部命令」的证据 —— 本次吊销的加重因素。
+          #
+          # ⚠️ 只查「内嵌的外部命令绝对路径」和 Command::new 字面量，不查裸词：
+          #   - 裸 osascript 会命中 wry 自带的 JS 桥接（`osascript -l JavaScript`），删不掉，误报；
+          #   - 裸 xattr / codesign 可能与工具链符号表撞名。断言要能长期稳定，不许靠人工放行。
+          echo "== GATE1-C 二进制：内嵌外部命令路径 =="
+          FAILC=0
+          for PAT in "/usr/bin/curl" "/usr/bin/codesign" "/usr/bin/xattr" "/bin/launchctl"; do
+            if grep -a -q -- "$PAT" "$EXE"; then
+              echo "::error::主二进制含「${PAT}」—— 客户端不得编排外部命令，探活请用 reqwest"
+              grep -a -o -- ".\{0,50\}${PAT}.\{0,50\}" "$EXE" | head -3 || true
+              FAILC=1
+            else
+              echo "  ✓ 未含 $PAT"
+            fi
+          done
+          [ "$FAILC" = 0 ] || { echo "::error::GATE1-C 未通过 —— 拒绝进入公证步骤"; exit 1; }
+
+          echo "== GATE1-D 源码：Command::new 不得调度上述外部命令 =="
+          # curl 不在源码断言里：linux_download() 是 Linux 专属逻辑（cfg(target_os = "linux")），
+          # 靠 curl/wget 下载 rustdesk 包，不能一刀切。mac 侧由 GATE1-C 的 /usr/bin/curl 兜底。
+          FAILD=0
+          for LIT in '"xattr' '"codesign' '"osascript' '"launchctl'; do
+            HITS=$(grep -rn --include='*.rs' -F "Command::new($LIT" src/ || true)
+            if [ -n "$HITS" ]; then
+              echo "::error::源码出现 Command::new($LIT —— 客户端不得编排外部命令，探活请用 reqwest"
+              printf '%s\n' "$HITS" | head -5
+              FAILD=1
+            else
+              echo "  ✓ 无 Command::new($LIT"
+            fi
+          done
+          [ "$FAILD" = 0 ] || { echo "::error::GATE1-D 未通过 —— 拒绝进入公证步骤"; exit 1; }
+
+          # 正向观察点（不失败）：确认回环探活确实编进主二进制。
+          LOOP=$(grep -a -c -- "127.0.0.1" "$EXE" || true)
+          echo "  · 主二进制命中 127.0.0.1 共 ${LOOP} 行（W 服务探活在进程内）"
+          echo "  ✓ GATE1 全部通过：未含被吊销能力，探活未退化为 shell 外调"
+
       # 签名/公证断言。公证策略（2026-11-15 定，踩过两次坑）：
       # 1) app.zip 与 dmg 两个 submission 【并行】提交（--no-wait 立刻拿 id），再并行轮询，
       #    总耗时 ≈ 一次公证，而不是串行两倍；

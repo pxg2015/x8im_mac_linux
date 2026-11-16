@@ -95,6 +95,7 @@
     "allow-mail-secret-get",
     "allow-plugins-list",
     "allow-wx-plugin-info",
+    "allow-wx-svc-ping",
     "allow-wx-plugin-start",
     "allow-wx-plugin-prepare",
     "allow-wx-plugin-update-now",

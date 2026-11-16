@@ -611,6 +611,64 @@ pub fn wx_plugin_info(app: tauri::AppHandle) -> serde_json::Value {
     v
 }
 
+/// 本机 W 服务探活（2026-11-17 老8 定）。
+/// 为什么放在宿主里：页面跑在 WKWebView 中，https 页面去 fetch http://127.0.0.1:60999
+/// 会被混合内容 / WKWebView 策略拦掉（wxgo 也不发 CORS 头），探活必须由 Rust 做 ——
+/// 回环 HTTP 是宿主的地盘，与 WebView 策略无关。
+///
+/// 判定：**任何 HTTP 响应（哪怕 401）都算「服务在听」**。wxgo 独立版的 /api/* 要令牌，
+/// 页面拿不到，401 恰好证明进程活着、端口在听；只有连接被拒 / 超时才判没起来。
+///
+/// 只探回环 127.0.0.1，不接受任意主机；端口固定 60999（wxgo 独立版 launchd 常驻）。
+#[tauri::command]
+pub async fn wx_svc_ping() -> serde_json::Value {
+    blocking(|| Ok(svc_ping(SVC_PORT, "/api/version", 1200)))
+        .await
+        .unwrap_or_else(|e| serde_json::json!({ "ok": false, "error": e }))
+}
+
+/// mac 上 W 服务（wxgo 独立版）的固定端口，与 wxgo-mac.sh 的 launchd plist 一致。
+const SVC_PORT: u16 = 60999;
+
+fn svc_ping(port: u16, path: &str, timeout_ms: u64) -> serde_json::Value {
+    use std::time::Instant;
+    let t0 = Instant::now();
+    let p = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+    let url = format!("http://127.0.0.1:{port}{p}");
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy() // 回环绝不能被系统 / 环境代理接管
+        .build()
+        .unwrap_or_else(|_| reqwest::blocking::Client::new());
+    match client
+        .get(&url)
+        .timeout(std::time::Duration::from_millis(timeout_ms))
+        .send()
+    {
+        Ok(r) => {
+            let status = r.status().as_u16();
+            let body = r.text().unwrap_or_default();
+            serde_json::json!({
+                "ok": true,
+                "port": port,
+                "status": status,
+                "ms": t0.elapsed().as_millis() as u64,
+                "body": body.chars().take(300).collect::<String>(),
+            })
+        }
+        Err(e) => serde_json::json!({
+            "ok": false,
+            "port": port,
+            "status": 0,
+            "ms": t0.elapsed().as_millis() as u64,
+            "error": e.to_string(),
+        }),
+    }
+}
+
 /// 打开 W消息时调一次：缺件自动安装、有新版自动更新，然后拉起插件。
 /// 每次打开都查版本清单（微信大版本换密钥后要能立刻推），失败后 60s 冷却；
 /// 断网 / CDN 故障时保留旧版并照常启动，绝不阻断页面。

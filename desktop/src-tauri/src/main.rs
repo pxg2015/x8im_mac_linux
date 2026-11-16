@@ -6328,6 +6328,7 @@ fn main() {
             //   AppManifest / capabilities/remote.json / 命令定义处）
             wx_cache::plugins_list,
             wx_cache::wx_plugin_info,
+            wx_cache::wx_svc_ping,
             wx_cache::wx_plugin_start,
             wx_cache::wx_plugin_prepare,
             wx_cache::wx_plugin_update_now,
