@@ -145,7 +145,7 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           # 浮窗页 + 头像（自包含单页，只有一张图的外部依赖）
-          cp -f pet/fde-float.html pet/fde-avatar.png dist/
+          cp -f pet/fde-float.html pet/fde-avatar.png pet/fde-avatar.mp4 dist/
           [ -f dist/index.html ] || printf '%s\n' '<!doctype html><meta charset="utf-8"><title>X8.IM</title>' > dist/index.html
           echo "== frontendDist =="; ls -l dist | head
           grep -c fde-avatar dist/fde-float.html

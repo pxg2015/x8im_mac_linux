@@ -303,21 +303,31 @@
     if (s && typeof s.avatar === 'string') setAvatar(s.avatar);
   }, function () { /* 老客户端没有这个命令：静默忽略 */ });
 
-  // 形象可配（2026-11-16 老8）：空串 = 内置卡通精灵；否则用主窗传来的 data URL。
-  // 图片（data:image/…）= 静态头像；视频（data:video/…）= 循环静音播（2026-11-17）。
+  // 形象可配（2026-11-18 老8 定默认）：空串 = 内置默认视频（随包 fde-avatar.mp4）；
+  // "sprite" = 卡通精灵；data:image/… = 静态头像；data:video/… = 自选视频（循环静音播）。
   // 加载失败一律回退卡通，不让精灵开天窗。
   var faceImg = document.querySelector('.face img');
   var petVideo = document.getElementById('petVideo');
   var DEFAULT_FACE = 'fde-avatar.png';
+  var DEFAULT_VIDEO = 'fde-avatar.mp4';
   function toSprite() {
     petVideo.hidden = true;
     try { petVideo.pause(); petVideo.removeAttribute('src'); petVideo.load(); } catch (e) {}
     faceImg.style.display = '';
     if (faceImg.src.indexOf(DEFAULT_FACE) < 0) faceImg.src = DEFAULT_FACE;
   }
+  // 播内置默认视频：失败回退卡通。
+  function toDefaultVideo() {
+    faceImg.style.display = 'none';
+    petVideo.onerror = function () { petVideo.onerror = null; toSprite(); };
+    petVideo.hidden = false;
+    petVideo.src = DEFAULT_VIDEO;
+    try { petVideo.currentTime = 0; var pr = petVideo.play(); if (pr && pr.catch) pr.catch(function () {}); } catch (e) {}
+  }
   function setAvatar(u) {
     u = (u || '').trim();
-    if (!u) { toSprite(); return; }
+    if (u === 'sprite') { toSprite(); return; }
+    if (!u) { toDefaultVideo(); return; }
     if (u.indexOf('data:video/') === 0) {
       // 视频形象：隐藏图片、循环静音播；失败回退卡通
       faceImg.style.display = 'none';
