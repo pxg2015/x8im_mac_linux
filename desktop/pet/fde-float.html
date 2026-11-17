@@ -152,6 +152,15 @@
     return n;
   }
 
+  // 跳三下 + 光环脉冲（2026-11-17：抽出成函数，供 __fdeBump 显式调用）
+  function doHop() {
+    bob.classList.remove('hop');
+    ring.classList.remove('on');
+    void bob.offsetWidth;
+    bob.classList.add('hop');
+    ring.classList.add('on');
+  }
+
   // 入场：弹一下 + 光环脉冲；未读数变化时再跳三下
   // keep=true：**不挂淡出计时**。托盘「召唤 AI邦」用 —— 那时没有未读（n=0），
   // 旧逻辑 8 秒就把自己淡没了，用户点完一抬头屏上已经什么都没有，判成「召唤没反应」。
@@ -159,13 +168,7 @@
     wrap.classList.remove('in', 'out');
     void wrap.offsetWidth;
     wrap.classList.add('in');
-    if (lastN >= 0 && n !== lastN) {
-      bob.classList.remove('hop');
-      ring.classList.remove('on');
-      void bob.offsetWidth;
-      bob.classList.add('hop');
-      ring.classList.add('on');
-    }
+    if (lastN >= 0 && n !== lastN) doHop();
     lastN = n;
     // 有未读 → 常驻（Rust 侧同样不挂自动收起）；只有纯提示（n=0）才淡出
     if (fadeTimer) { clearTimeout(fadeTimer); fadeTimer = null }
@@ -196,6 +199,14 @@
 
   // Rust 复用已开窗口时调用：原地更新数字/文案，不整窗刷新（避免白闪）
   window.__fdeUpdate = function (n, t, keep) { entrance(render(n, t), keep); };
+  // 2026-11-17 老8：群里 @我 / 私聊来消息，即使未读数没变（人正开着那个会话）也要跳。
+  // Rust 侧 eval 调用：只跳不重建，也不挂淡出常驻（keep=1）。
+  window.__fdeBump = function (t) {
+    if (typeof t === 'string' && t) { tip.textContent = t.slice(0, 120); tip.hidden = false; }
+    wrap.classList.remove('out');
+    wrap.classList.add('in');
+    doHop();
+  };
   window.__fdeOut = function () {
     wrap.classList.remove('in');
     wrap.classList.add('out');

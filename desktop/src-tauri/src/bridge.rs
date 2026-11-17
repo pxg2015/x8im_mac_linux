@@ -291,6 +291,7 @@ pub(crate) fn x8bridge_dispatch(
             bridge_argv(a, "count").and_then(|x| x.as_i64()),
             osv("tip"),
             ob("silent"),
+            ob("bump"),
         )),
         "fde_float_hide" => {
             fde_float_hide(app.clone());

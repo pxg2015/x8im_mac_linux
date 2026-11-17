@@ -5034,9 +5034,33 @@ fn fde_float_show(
     count: Option<i64>,
     tip: Option<String>,
     silent: Option<bool>,
+    // 2026-11-17 老8：群里 @我 / 私聊来消息，即使未读数没变（人正开着那个会话）也要跳。
+    // bump 走**独立的延迟 eval**：常规提醒链路（notify_unread → show_impl）一律不动，
+    // 避免影响已上线行为；本地页首次建窗 JS 要几百毫秒才就绪，420ms 后 eval 才落得到。
+    bump: Option<bool>,
 ) -> Result<(), String> {
     let t = tip.unwrap_or_default();
     fde_float_show_impl(&app, count.unwrap_or(0), &t, silent.unwrap_or(false));
+    if bump.unwrap_or(false) {
+        let h = app.clone();
+        let tip_eval = js_str(&t);
+        nav_write(&format!("[pet] bump 请求 tip={}", &t));
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(420));
+            let js = format!("window.__fdeBump && window.__fdeBump({tip_eval})");
+            let h2 = h.clone();
+            if let Err(e) = h.run_on_main_thread(move || {
+                if let Some(w) = h2.get_webview_window("fde-float") {
+                    let _ = w.eval(&js);
+                    let _ = w.show();
+                } else {
+                    nav_write("[pet] bump 时窗口不存在");
+                }
+            }) {
+                nav_write(&format!("[pet] bump 投主线程失败: {e}"));
+            }
+        });
+    }
     Ok(())
 }
 
