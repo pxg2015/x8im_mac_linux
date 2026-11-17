@@ -38,6 +38,8 @@
   /* 头像加载失败兜底：至少是个看得见的蓝圆，不能只剩一块白 */
   .pet .face.noface{background:radial-gradient(circle at 50% 42%,#9ad4ff 0%,#0082fc 72%)}
   .pet .face img,.pet .face video{width:100%;height:100%;object-fit:cover;display:block}
+  /* 视频是独立合成层，父级 .face 的 border-radius 在 WebView2 里裁不住 → 四角漏白，video 自身再裁一次圆 */
+  .pet .face video{border-radius:50%}
   /* 视频形象（2026-11-17）：默认隐藏，setAvatar 识别到 data:video/ 才显示 */
   .pet .face video[hidden]{display:none}
   .bob{animation:bob 2.8s ease-in-out infinite}
