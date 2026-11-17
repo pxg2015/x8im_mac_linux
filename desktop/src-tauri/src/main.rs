@@ -4476,13 +4476,13 @@ fn start_tray_heal(app: tauri::AppHandle) {
 // 内容走线上页 https://im.x8fde.com/app/fde-float.html —— 跟主窗同一套架构：
 // 改浮窗样式只发 web，不用重新发客户端。
 
-/// 浮窗尺寸（逻辑像素）：2026-11-16 升级为「AI邦」精灵 —— 96px 精灵 + 气泡两行。
+/// 浮窗尺寸（逻辑像素）：2026-11-16 升级为「AI 邦灵」精灵 —— 96px 精灵 + 气泡两行。
 const FDE_FLOAT_W: f64 = 148.0;
 const FDE_FLOAT_H: f64 = 196.0;
 /// 🔴 必须与 tauri.conf.json 主窗 `additionalBrowserArgs` **逐字一致**。
 /// WebView2 同一进程只接受一套 Environment 参数：第二次 `CreateCoreWebView2EnvironmentWithOptions`
 /// 若 args 不同，直接返回 ERROR_INVALID_STATE(0x8007139F)「组或资源的状态不是执行请求操作的正确状态」。
-/// 2026-11-17 真机定位：AI邦 浮窗在**任何**机器上都建不出来（历史版本同样，只是当时失败被静默吞掉），
+/// 2026-11-17 真机定位：AI 邦灵 浮窗在**任何**机器上都建不出来（历史版本同样，只是当时失败被静默吞掉），
 /// 主窗能建、第二窗必挂，就是因为代码创建时漏了这个参数。改主窗参数时这里要一起改。
 const X8_WEBVIEW_ARGS: &str = "--disable-background-networking --disable-component-update --no-first-run --disable-safebrowsing --disable-features=msEdgeComponentUpdates,msEdgeShoppingAssistant,EdgeReadingList";
 /// 自动收起延时：**只对「无未读的临时提示」生效**（升级提示等）。
@@ -4491,12 +4491,12 @@ const X8_WEBVIEW_ARGS: &str = "--disable-background-networking --disable-compone
 const FDE_FLOAT_AUTO_HIDE_MS: u64 = 9_200;
 /// 浮窗世代号：每次显示 +1，上一轮的自动隐藏计时发现自己过期就放弃（同 TRAY_FLASH_GEN 套路）。
 static FDE_FLOAT_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// 精灵「钉住」：托盘「召唤 AI邦」置 true —— 出来后**永不自动收**，
+/// 精灵「钉住」：托盘「召唤 AI 邦灵」置 true —— 出来后**永不自动收**，
 /// 只有用户手工关（点精灵唤起主窗 / 页面 ✕ / 右键收起）才失效。
-/// 老8 2026-11-17 明确：召唤出来的 AI邦 不要自己消失，一直挂着，想关我再关。
+/// 老8 2026-11-17 明确：召唤出来的 AI 邦灵 不要自己消失，一直挂着，想关我再关。
 static PET_PIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-// ─────────────────────── AI邦 精灵配置（2026-11-16）───────────────────────
+// ─────────────────────── AI 邦灵 精灵配置（2026-11-16）───────────────────────
 //
 // 落盘 %LOCALAPPDATA%\BangXin\pet.json（与 file_retention.json 同目录，升级不受影响）：
 //   { "x": 1720, "y": 700,      // 用户拖过的落点（逻辑像素），换屏/拔屏后自动作废
@@ -4614,7 +4614,7 @@ fn primary_work_area() -> Option<(i32, i32, i32, i32)> {
 
 /// 把逻辑坐标夹进指定显示器的可视区（留 8px 边距）。
 ///
-/// 🔴 2026-11-17 mac 1.7.13「AI邦 根本没出来」的兜底：macOS 的显示器 API 受主线程约束，
+/// 🔴 2026-11-17 mac 1.7.13「AI 邦灵 根本没出来」的兜底：macOS 的显示器 API 受主线程约束，
 /// 拿不到屏时下面会回落成 1920×1080 / sf=1 的假设值 → 算出的 x=1756 在 Retina 逻辑宽
 /// 1512 的屏上是**屏外**，窗口建出来却永远看不见（置顶也一样）。
 /// 所以非 Windows 平台一律把落点夹回「当前屏可视区」，宁可位置不完美也要在屏上。
@@ -4741,7 +4741,7 @@ fn js_str(s: &str) -> String {
 
 /// 关闭浮窗（若在显示）并作废自动隐藏计时。
 ///
-/// 🔴 2026-11-17 老8：召唤出来的 AI邦 不要自动消失，一直挂着、要关再手工关。
+/// 🔴 2026-11-17 老8：召唤出来的 AI 邦灵 不要自动消失，一直挂着、要关再手工关。
 /// 所以「钉住」期间（托盘召唤后）这里直接不干活 —— 未读清零、主窗回前台、
 /// 自动收起计时全都不生效；只有点精灵 / 页面 ✕ 这两条手工路径会先清钉再收。
 fn fde_float_close(app: &tauri::AppHandle) {
@@ -4757,7 +4757,7 @@ fn fde_float_close(app: &tauri::AppHandle) {
 
 /// 显示/刷新精灵窗。count=0 时只显示精灵不显示角标（消息落在已打开会话里，未读数没涨）。
 ///
-/// 2026-11-16 AI邦：
+/// 2026-11-16 AI 邦灵：
 ///   · pet.json 里 enabled=false → 整层不出现（回滚旧行为的唯一开关）
 ///   · count>0 → **常驻**，不再挂自动收起计时；由 notify_unread(0) / pet_close 收
 ///   · count=0 → 临时提示（升级通知等），保留 9.2s 自动收起
@@ -4767,10 +4767,10 @@ fn fde_float_show_impl(app: &tauri::AppHandle, count: i64, tip: &str, silent: bo
 }
 
 /// force = true 时忽略 pet.json 的 enabled 总开关。
-/// 只给托盘「召唤 AI邦」用：用户关掉精灵是「别拿新消息打扰我」，不代表不许手动叫出来。
-/// 建 AI邦 浮窗：三级降级 + 失败留痕（2026-11-17）。
+/// 只给托盘「召唤 AI 邦灵」用：用户关掉精灵是「别拿新消息打扰我」，不代表不许手动叫出来。
+/// 建 AI 邦灵 浮窗：三级降级 + 失败留痕（2026-11-17）。
 ///
-/// 起因：老8 新电脑点「AI邦形象 → 卡通精灵」毫无反应。实测 EnumWindows 枚举该进程
+/// 起因：老8 新电脑点「AI 邦灵形象 → 卡通精灵」毫无反应。实测 EnumWindows 枚举该进程
 /// 顶层窗口只有 main + tray_icon_app，**fde-float 根本没被建出来**；而原代码收尾是
 /// `Err(_) => {}` —— 建窗失败连一行日志都没有，等于黑盒（旧机器上也可能是同样静默失败）。
 /// 三级尝试：① 原样（透明 + 无边框 + 置顶）→ ② 不透明（透明窗在部分显卡/远程桌面/
@@ -4801,7 +4801,7 @@ fn fde_build_window(
     // 🔴 2026-11-17 mac：本仓没开 tauri 的 macos-private-api（Cargo.toml）也没开
     // macOSPrivateApi（tauri.conf.json）—— 这种组合下 macOS 的 transparent 档很容易
     // 建出「全透明空窗」：窗口存在、visible=true，但一个像素都不画，用户看到的就是
-    // 「AI邦 根本没出来」（Windows 的等价坑见下面 WebView2 那段注释）。
+    // 「AI 邦灵 根本没出来」（Windows 的等价坑见下面 WebView2 那段注释）。
     // 所以 mac 从**不透明**档起试，先保证看得见；要透明美化得先把 private api 打开。
     // 2026-11-17 1.7.16 老8 选定方案 A：已开 macos-private-api + macOSPrivateApi，
     // mac 恢复透明优先。1.7.14/1.7.15 的不透明优先只为排查「白块看不见」，那次的真因
@@ -4821,7 +4821,7 @@ fn fde_build_window(
     for (i, (transparent, shadow, on_top)) in attempts.into_iter().enumerate() {
         let tip_for_load = tip_js.clone();
         let r = tauri::WebviewWindowBuilder::new(app, "fde-float", mk_url())
-        .title("AI邦")
+        .title("AI 邦灵")
         .additional_browser_args(X8_WEBVIEW_ARGS)
         // 🔴 2026-11-17 真机根因（第三轮）：WebView2 规定「同一个 user data folder 里，
         // 只要 Environment options 有任何差异，第二次建 controller 就报 0x8007139F」。
@@ -4900,7 +4900,7 @@ fn fde_build_window(
     // 所以要么是某个窗口属性触发，要么同进程第二个 webview 根本建不出来。
     // L4 建成 → 是属性问题，逐个加回即可；L4 也失败 → 必须换实现（不要第二个 webview）。
     let r = tauri::WebviewWindowBuilder::new(app, "fde-float", mk_url())
-    .title("AI邦")
+    .title("AI 邦灵")
     .additional_browser_args(X8_WEBVIEW_ARGS)
     .data_directory(bangxin_user_dir().join("pet-webview"))
     .inner_size(320.0, 420.0)
@@ -4933,7 +4933,7 @@ fn fde_float_show_ex(app: &tauri::AppHandle, count: i64, tip: &str, silent: bool
     // 🔴 2026-11-17 mac：落点计算必须**在主线程内**做。
     // fde_float_pos 要调 current_monitor / primary_monitor，macOS 上这些是 AppKit 接口，
     // 在后台线程调用会静默返回 None（Windows 无此限制）→ 上次的真机表现就是
-    // pet_autoshow（thread::spawn 里跑的）把窗口算到屏外，然后「AI邦 一直没出来」。
+    // pet_autoshow（thread::spawn 里跑的）把窗口算到屏外，然后「AI 邦灵 一直没出来」。
     // 所以整段显示逻辑（取坐标 → eval → show / 建窗）统一投到主线程闭包里，不在这里先算。
     if app.get_webview_window("fde-float").is_some() {
         // 已存在：原地更新数字/文案 + 重播入场动画。不整窗 reload——reload 会白闪一下
@@ -5080,15 +5080,15 @@ fn fde_float_click(app: tauri::AppHandle) {
     show_main(&app);
 }
 
-/// 托盘「召唤 AI邦」：无条件把精灵叫到屏上并**常驻**。
+/// 托盘「召唤 AI 邦灵」：无条件把精灵叫到屏上并**常驻**。
 ///
 /// 为什么需要这个入口：精灵原来只有一条出镜路径 —— 前端 notify_unread 判定「人在别处/
-/// 不在当前会话」才弹。老8 2026-11-17 反馈「还是没看到 AI邦」时，能做的只有等一条
+/// 不在当前会话」才弹。老8 2026-11-17 反馈「还是没看到 AI 邦灵」时，能做的只有等一条
 /// 不属于当前会话的新消息；主窗开着、正看着那个会话时它永远不出现，等于不可验证。
 /// 召唤路径不看 enabled、不等消息、也不挂 9.2s 自动收起 —— 要看到就必须看得到。
 fn pet_summon(app: &tauri::AppHandle) {
     use std::sync::atomic::Ordering;
-    // 🔴 2026-11-17 真机第二次踩坑（老8 点托盘「召唤 AI邦」没反应）：
+    // 🔴 2026-11-17 真机第二次踩坑（老8 点托盘「召唤 AI 邦灵」没反应）：
     //   早先这里「先 destroy 再重建」，想清掉可能的透明空窗。但 destroy 是**投递主线程异步执行**的，
     //   轮询 1.5s 后 tauri 侧句柄往往还在 → fde_float_show_ex 走「已存在」分支 →
     //   对**已排队待销毁的死窗** eval/show 全静默失败 → 窗口没了、屏上再也没有。
@@ -5108,7 +5108,7 @@ fn pet_summon(app: &tauri::AppHandle) {
     si_log("[pet] summon from tray");
 }
 
-/// 启动即把 AI邦 挂到屏上并常驻（2026-11-17 老8：**默认打开着**，加个小 ✕ 手工关，
+/// 启动即把 AI 邦灵 挂到屏上并常驻（2026-11-17 老8：**默认打开着**，加个小 ✕ 手工关，
 /// 平时不再自动收）。
 ///
 /// 与 pet_summon 的区别只有一处：召唤是用户主动点托盘（不看 enabled、也不改任何配置），
@@ -5124,7 +5124,7 @@ fn pet_autoshow(app: &tauri::AppHandle) {
     // 中间那几十毫秒里任何一次 close（前端收起升级提示、未读清零）都可能把刚建好的窗收掉。
     // 真机 13:35 那轮就是这么丢的：日志里建成 visible=true，几秒后 WS_VISIBLE 没了。
     PET_PIN.store(true, Ordering::SeqCst);
-    fde_float_show_ex(app, 0, "AI邦 · 点我打开邦信", true, false);
+    fde_float_show_ex(app, 0, "AI 邦灵 · 点我打开邦信", true, false);
     FDE_FLOAT_GEN.fetch_add(1, Ordering::SeqCst);
     si_log("[pet] autoshow on boot");
     // 诊断：2s 后回看窗口是否真在屏上（曾出现「建窗 visible=true、几秒后变 hidden」）
@@ -5141,7 +5141,7 @@ fn pet_autoshow(app: &tauri::AppHandle) {
     });
 }
 
-// ── AI邦 精灵的前端接口（2026-11-16，四处同步：本体 / generate_handler! /
+// ── AI 邦灵 精灵的前端接口（2026-11-16，四处同步：本体 / generate_handler! /
 //    build.rs 名单 / capabilities/remote.json）──────────────────────────────
 
 /// 手动收起精灵（不改变未读）：用户右键「收起」或点 ✕ 时调用。
@@ -5218,7 +5218,7 @@ fn pet_status() -> serde_json::Value {
     })
 }
 
-/// AI邦 用哪个形象（pet.json: avatar）：空串 = 内置卡通精灵；data:/http(s) = 用户自己的头像。
+/// AI 邦灵 用哪个形象（pet.json: avatar）：空串 = 内置卡通精灵；data:/http(s) = 用户自己的头像。
 ///
 /// 为什么存 data URL 而不是头像链接：精灵窗是**独立 webview**，没有主窗的登录 token，
 /// MM 头像接口要 Bearer 才给图（主窗拿到的是 blob:，跨窗不可用）。所以由主窗把头像
@@ -5231,7 +5231,7 @@ fn pet_avatar() -> String {
         .to_string()
 }
 
-/// 设置 AI邦 形象；传空串 = 换回卡通精灵。返回落盘后的值。
+/// 设置 AI 邦灵 形象；传空串 = 换回卡通精灵。返回落盘后的值。
 #[tauri::command]
 fn pet_set_avatar(app: tauri::AppHandle, url: String) -> String {
     let v = url.trim().to_string();
@@ -5726,7 +5726,7 @@ fn notify_unread(
                 }
             } else {
                 // 未读清零：停掉可能在闪的托盘图标循环，再把图标还原默认 logo；
-                // 右下角 AI邦 精灵也一并收起（人已经处理完了，精灵再挂着就是噪音）
+                // 右下角 AI 邦灵 精灵也一并收起（人已经处理完了，精灵再挂着就是噪音）
                 stop_tray_flash();
                 fde_float_close(&app);
                 if let Some(ic) = def_icon {
@@ -5745,7 +5745,7 @@ fn notify_unread(
             let away = !w.is_focused().unwrap_or(true)
                 || !w.is_visible().unwrap_or(true)
                 || w.is_minimized().unwrap_or(false);
-            // 2026-11-16 老8「看不到 AI邦」：旧判据只认窗口状态 —— 只要主窗在前台，
+            // 2026-11-16 老8「看不到 AI 邦灵」：旧判据只认窗口状态 —— 只要主窗在前台，
             // 任何会话的新消息都被当成「人正在看」，精灵/气泡/闪烁一律不弹，只剩左侧小红点。
             // 改为：消息不属于当前正在看的会话（in_current=false）同样要提醒；
             // 当前会话的消息仍然完全静默（自己正聊的那条不该反复骚扰）。
@@ -5756,7 +5756,7 @@ fn notify_unread(
                 if cn > 0 {
                     // 2026-10-22：托盘图标「一暗一亮」闪烁，闪到窗口回前台 / 已读清零为止。
                     start_tray_flash(app.clone(), cn);
-                    // 2026-11-16：AI邦 精灵（原 FDE 浮窗）—— 有未读就停在屏上，不再 9.2s 自动消失
+                    // 2026-11-16：AI 邦灵 精灵（原 FDE 浮窗）—— 有未读就停在屏上，不再 9.2s 自动消失
                     let ftip = title
                         .clone()
                         .filter(|s| !s.trim().is_empty())
@@ -7573,7 +7573,7 @@ fn x8_nav(app: tauri::AppHandle, target: String) -> Result<String, String> {
 fn nav_log_path() -> std::path::PathBuf {
     // 🔴 2026-11-17 真机（mac 1.7.13）：这里原先只有 Windows 路径 —— mac 上 ProgramData
     // 环境变量不存在 → 回落字面量 `C:\ProgramData` → 在 unix 上是个**相对路径**，
-    // create_dir_all 一般失败 → nav.log 一行都写不出去。后果是 mac 上「AI邦 不出来 /
+    // create_dir_all 一般失败 → nav.log 一行都写不出去。后果是 mac 上「AI 邦灵 不出来 /
     // 托盘点了没反应」这类问题**完全没有证据可查**（这次就是靠读二进制才排到落点问题）。
     // 统一落到 bangxin_user_dir()：mac = ~/Library/Application Support/BangXin/nav.log。
     if cfg!(windows) {
@@ -8039,7 +8039,7 @@ fn main() {
             fde_float_show,
             fde_float_hide,
             fde_float_click,
-            // 2026-11-16 AI邦 卡通精灵：手动收起 / 拖动 + 位置记忆 / 免打扰 / 状态查询
+            // 2026-11-16 AI 邦灵 卡通精灵：手动收起 / 拖动 + 位置记忆 / 免打扰 / 状态查询
             pet_close,
             pet_drag_begin,
             pet_pos_save,
@@ -8261,10 +8261,10 @@ fn main() {
             }
 
             let open = MenuItem::with_id(app, "open", "打开邦信", true, None::<&str>)?;
-            // 2026-11-17 老8：托盘加「召唤 AI邦」+「开机自启动」勾选开关。
+            // 2026-11-17 老8：托盘加「召唤 AI 邦灵」+「开机自启动」勾选开关。
             // 召唤 = 精灵唯一的手动出镜入口（原来只能等一条不属于当前会话的新消息，
             // 主窗开着正看那个会话时永远不出现，用户无从验证它到底在不在）。
-            let summon = MenuItem::with_id(app, "summon", "召唤 AI邦", true, None::<&str>)?;
+            let summon = MenuItem::with_id(app, "summon", "召唤 AI 邦灵", true, None::<&str>)?;
             // 勾选态取系统实际值（用户可能在任务管理器里禁用过），不是配置文件里的意图
             let autostart = CheckMenuItem::with_id(
                 app,
@@ -8307,7 +8307,7 @@ fn main() {
                 .show_menu_on_left_click(false)
                 .on_menu_event(move |app, event| match event.id.as_ref() {
                     "open" => show_main(app),
-                    // 召唤 AI邦：不看消息、不看 enabled，点了就必须在屏上出现
+                    // 召唤 AI 邦灵：不看消息、不看 enabled，点了就必须在屏上出现
                     "summon" => pet_summon(app),
                     // 开机自启动：点一下翻转，落盘 + 写系统项；勾选态一律按**写后的系统实际值**回填，
                     // 写失败（注册表被策略锁死等）时不会出现「勾上了其实没生效」的假象
@@ -8422,12 +8422,12 @@ fn main() {
                     upgrade_selfcheck(&h);
                 });
             }
-            // 2026-11-17：AI邦 浮窗**取消启动期预建**。
+            // 2026-11-17：AI 邦灵 浮窗**取消启动期预建**。
             // 预建走的是 `visible(false)` 建窗 → 真机上窗口 vis=1、rect 正确、非 cloaked，
             // 但 WebView2 一点内容都不画（连不透明档该有的白底都没有）＝隐藏期初始化合成层失败。
             // 现在运行期建窗已能成功（靠独立 data_directory，见 fde_build_window），
             // 所以改为「要显示时就地建一个可见窗口」，最直观也最不容易出这种歪状态。
-            // 2026-11-17 晚：AI邦 **默认打开着**（老8：平时不需要自动关，想关有 ✕）。
+            // 2026-11-17 晚：AI 邦灵 **默认打开着**（老8：平时不需要自动关，想关有 ✕）。
             // 延迟 3s 等主窗首屏先出来，别跟登录页抢焦点；建的是可见窗口（见 fde_build_window
             // 里「隐藏期建窗不画内容」的坑），出来就钉住，只有 ✕ / 右键收起 / 点精灵才收。
             {

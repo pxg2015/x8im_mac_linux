@@ -277,7 +277,7 @@ pub(crate) fn x8bridge_dispatch(
             ou32("id").unwrap_or(0),
         ))),
 
-        // ── 角标 / 浮窗 / AI邦卡通精灵（IPC 桥失效时角标不刷、进度窗不弹）──
+        // ── 角标 / 浮窗 / AI 邦灵卡通精灵（IPC 桥失效时角标不刷、进度窗不弹）──
         "notify_unread" => bridge_to_json(notify_unread(
             app.clone(),
             iv("count", 0),

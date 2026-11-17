@@ -3,9 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AI邦</title>
+<title>AI 邦灵</title>
 <!--
-  AI邦 · 卡通精灵新消息提醒（2026-11-16 老8：托盘提示不明显，要个会动的精灵）
+  AI 邦灵 · 卡通精灵新消息提醒（2026-11-16 老8：托盘提示不明显，要个会动的精灵）
 
   由 Rust 侧 fde_float_show_impl 以无边框透明置顶窗口加载，窗口 148x196（逻辑像素）。
   参数：?n=未读数&t=提示文案（会话名 或「发送人：内容」）。
@@ -55,7 +55,7 @@
     box-shadow:0 0 0 2px #fff,0 2px 6px rgba(255,59,48,.4)}
   .badge[hidden]{display:none}
 
-  /* 关闭按钮（2026-11-17 二改 老8：平时不显示，鼠标移到 AI邦 上才出现，
+  /* 关闭按钮（2026-11-17 二改 老8：平时不显示，鼠标移到 AI 邦灵 上才出现，
      移开后延迟 1000ms 再自动隐藏；隐藏态 pointer-events:none 保证点不到、不挡拖动）。
      放左上角避开右上角的未读角标。 */
   .x{position:absolute;left:-8px;top:-3px;width:18px;height:18px;border-radius:50%;z-index:7;
@@ -67,7 +67,7 @@
   .pet:hover .x{opacity:1;pointer-events:auto;transition-delay:0s}
   .x:hover{background:#ff3b30;color:#fff;transform:scale(1.12)}
 
-  /* 名字牌：贴在精灵底部，一眼知道这是 AI邦 */
+  /* 名字牌：贴在精灵底部，一眼知道这是 AI 邦灵 */
   .name{position:absolute;left:50%;bottom:-7px;transform:translateX(-50%);
     padding:0 8px;height:16px;border-radius:8px;background:linear-gradient(135deg,#0082FC,#00a6ff);
     color:#fff;font:700 10px/16px "Microsoft YaHei",sans-serif;letter-spacing:.5px;white-space:nowrap;
@@ -100,15 +100,15 @@
 </head>
 <body>
 <div id="wrap">
-  <div class="pet" id="pet" title="AI邦 · 点一下打开邦信">
+  <div class="pet" id="pet" title="AI 邦灵 · 点一下打开邦信">
     <span class="ring" id="ring"></span>
     <div class="face bob" id="bob">
-      <img src="fde-avatar.png" alt="AI邦" draggable="false"
+      <img src="fde-avatar.png" alt="AI 邦灵" draggable="false"
            onerror="this.style.display='none';this.parentNode.classList.add('noface')">
     </div>
     <span class="badge" id="badge">1</span>
-    <span class="x" id="closeBtn" title="关闭 AI邦（托盘「召唤 AI邦」可再叫出来）">✕</span>
-    <span class="name">AI邦</span>
+    <span class="x" id="closeBtn" title="关闭 AI 邦灵（托盘「召唤 AI 邦灵」可再叫出来）">✕</span>
+    <span class="name">AI 邦灵</span>
   </div>
   <div class="tip" id="tip">有新消息</div>
   <div class="menu" id="menu">
@@ -162,7 +162,7 @@
   }
 
   // 入场：弹一下 + 光环脉冲；未读数变化时再跳三下
-  // keep=true：**不挂淡出计时**。托盘「召唤 AI邦」用 —— 那时没有未读（n=0），
+  // keep=true：**不挂淡出计时**。托盘「召唤 AI 邦灵」用 —— 那时没有未读（n=0），
   // 旧逻辑 8 秒就把自己淡没了，用户点完一抬头屏上已经什么都没有，判成「召唤没反应」。
   function entrance(n, keep) {
     wrap.classList.remove('in', 'out');
