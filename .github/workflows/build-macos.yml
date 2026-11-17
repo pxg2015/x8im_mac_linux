@@ -136,12 +136,19 @@ jobs:
         run: npm ci
 
       # 主窗口加载的是远端 https://im.x8fde.com/app/，本地 frontendDist 仅为满足
-      # Tauri 打包要求（路径必须存在），放一个占位页即可，不参与实际运行
+      # Tauri 打包要求（路径必须存在），放一个占位页即可，不参与实际运行。
+      # 🔴 但 AI邦 精灵浮窗走的是**本地 asset 协议**（WebviewUrl::App("fde-float.html")，
+      # 不走远端），必须真打进 frontendDist —— 1.7.14 及之前这里只放占位页，导致 mac 上
+      # 浮窗 404、屏幕上只剩一块 148×196 的白块（Windows 包用的是完整 dist，所以只有 mac 中招）。
       - name: Prepare frontendDist placeholder
         run: |
           set -euo pipefail
           mkdir -p dist
-          printf '%s\n' '<!doctype html><meta charset="utf-8"><title>X8.IM</title>' > dist/index.html
+          # 浮窗页 + 头像（自包含单页，只有一张图的外部依赖）
+          cp -f pet/fde-float.html pet/fde-avatar.png dist/
+          [ -f dist/index.html ] || printf '%s\n' '<!doctype html><meta charset="utf-8"><title>X8.IM</title>' > dist/index.html
+          echo "== frontendDist =="; ls -l dist | head
+          grep -c fde-avatar dist/fde-float.html
 
       # ===== 签名前置：把 p12 装进临时钥匙串 =====
       # 只在 HAS_SIGNING=1 时执行。p12 必须用 openssl 带链导出（叶证书 + G2 中间证书），

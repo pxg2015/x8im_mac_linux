@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI邦</title>
+<!--
+  AI邦 · 卡通精灵新消息提醒（2026-11-16 老8：托盘提示不明显，要个会动的精灵）
+
+  由 Rust 侧 fde_float_show_impl 以无边框透明置顶窗口加载，窗口 148x196（逻辑像素）。
+  参数：?n=未读数&t=提示文案（会话名 或「发送人：内容」）。
+
+  与 2026-10-22 版浮窗的差别（针对「提示不明显」的三条根因）：
+    ① 有未读就**不自动收起**——停在屏上到未读清零 / 手动收起（旧版 9.2s 消失，人一走开就错过）
+    ② 提示音交给 Rust（PlaySoundW 系统通知音），这里只管视觉
+    ③ 位置可拖动并记忆（Rust pet_drag_begin → pet.json），多屏跟随主窗所在屏
+
+  交互：
+    单击精灵  → 唤起主窗（fde_float_click）
+    按住/拖   → 移动位置（pet_drag_begin，松手自动记忆）
+    右键      → 小菜单：静音提示音 / 收起
+-->
+<style>
+  html,body{margin:0;padding:0;width:100%;height:100%;background:transparent;overflow:hidden;
+    user-select:none;-webkit-user-select:none;font-family:"Microsoft YaHei","PingFang SC",system-ui,sans-serif}
+  #wrap{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;
+    padding:4px 4px 6px;box-sizing:border-box;opacity:0;transform:translateY(26px) scale(.86);
+    transition:opacity .26s cubic-bezier(.2,.8,.3,1),transform .42s cubic-bezier(.2,1.3,.4,1)}
+  #wrap.in{opacity:1;transform:none}
+  #wrap.out{opacity:0;transform:translateY(10px) scale(.9);transition-duration:.24s}
+
+  /* 精灵本体 */
+  .pet{position:relative;width:92px;height:92px;flex:0 0 auto;cursor:pointer}
+  .pet .ring{position:absolute;inset:-5px;border-radius:50%;
+    background:radial-gradient(circle,rgba(0,130,252,.34) 0%,rgba(0,130,252,0) 68%);opacity:0}
+  .pet .face{position:absolute;inset:0;border-radius:50%;overflow:hidden;background:#fff;
+    box-shadow:0 8px 22px rgba(16,22,38,.28),0 0 0 2.5px #fff,0 0 0 4px rgba(0,130,252,.22)}
+  /* 头像加载失败兜底：至少是个看得见的蓝圆，不能只剩一块白 */
+  .pet .face.noface{background:radial-gradient(circle at 50% 42%,#9ad4ff 0%,#0082fc 72%)}
+  .pet .face img{width:100%;height:100%;object-fit:cover;display:block}
+  .bob{animation:bob 2.8s ease-in-out infinite}
+  @keyframes bob{0%,100%{transform:translateY(0)}50%{transform:translateY(-4px)}}
+  /* 新消息：跳三下（比静态角标明显得多，但不夸张） */
+  .hop{animation:hop .62s cubic-bezier(.28,1.4,.4,1) 3}
+  @keyframes hop{0%{transform:translateY(0) scale(1)}
+    22%{transform:translateY(-12px) scale(1.05,.96)}
+    52%{transform:translateY(0) scale(.96,1.05)}
+    100%{transform:translateY(0) scale(1)}}
+  /* 新消息：光环脉冲三下 */
+  .ring.on{animation:ring 1.1s ease-out 3}
+  @keyframes ring{0%{opacity:.9;transform:scale(.86)}70%{opacity:0;transform:scale(1.35)}100%{opacity:0}}
+
+  .badge{position:absolute;right:-3px;top:-3px;min-width:20px;height:20px;padding:0 5px;border-radius:10px;
+    background:#ff3b30;color:#fff;font:700 11px/20px "Microsoft YaHei",sans-serif;text-align:center;
+    box-shadow:0 0 0 2px #fff,0 2px 6px rgba(255,59,48,.4)}
+  .badge[hidden]{display:none}
+
+  /* 关闭按钮（2026-11-17 二改 老8：平时不显示，鼠标移到 AI邦 上才出现，
+     移开后延迟 1000ms 再自动隐藏；隐藏态 pointer-events:none 保证点不到、不挡拖动）。
+     放左上角避开右上角的未读角标。 */
+  .x{position:absolute;left:-8px;top:-3px;width:18px;height:18px;border-radius:50%;z-index:7;
+    background:rgba(255,255,255,.94);color:#5b6676;text-align:center;cursor:pointer;
+    font:700 13px/18px "Microsoft YaHei",sans-serif;
+    box-shadow:0 1px 4px rgba(16,22,38,.3),0 0 0 1px rgba(16,22,38,.07);
+    opacity:0;pointer-events:none;
+    transition:opacity .15s ease 1s,background .15s,color .15s,transform .15s}
+  .pet:hover .x{opacity:1;pointer-events:auto;transition-delay:0s}
+  .x:hover{background:#ff3b30;color:#fff;transform:scale(1.12)}
+
+  /* 名字牌：贴在精灵底部，一眼知道这是 AI邦 */
+  .name{position:absolute;left:50%;bottom:-7px;transform:translateX(-50%);
+    padding:0 8px;height:16px;border-radius:8px;background:linear-gradient(135deg,#0082FC,#00a6ff);
+    color:#fff;font:700 10px/16px "Microsoft YaHei",sans-serif;letter-spacing:.5px;white-space:nowrap;
+    box-shadow:0 2px 6px rgba(0,130,252,.42)}
+
+  /* 文案气泡 */
+  .tip{margin-top:11px;max-width:136px;padding:5px 9px;border-radius:10px;border-bottom-left-radius:3px;
+    background:rgba(16,22,38,.9);color:#fff;font:500 11px/15px "Microsoft YaHei",sans-serif;
+    display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;
+    word-break:break-all;box-shadow:0 4px 12px rgba(16,22,38,.3)}
+  .tip[hidden]{display:none}
+
+  /* 右键小菜单（窗口只有 148 宽，菜单就盖在精灵身上） */
+  .menu{position:absolute;left:6px;right:6px;top:34px;padding:4px;border-radius:9px;background:#fff;
+    box-shadow:0 8px 24px rgba(16,22,38,.26),0 0 0 1px rgba(16,22,38,.06);display:none;z-index:9}
+  .menu.on{display:block}
+  .menu div{padding:5px 8px;border-radius:6px;font-size:11.5px;color:#3b4654;cursor:pointer;white-space:nowrap}
+  .menu div:hover{background:#eef4ff;color:#0082FC}
+
+  /* 兼容老客户端（1.6.99 及以前窗口是 132×148）：页面先发、客户端后发也不会被裁。
+     小窗下精灵缩一档、名字牌让位、气泡收窄，保证不出滚动条、不被截断。 */
+  @media (max-height:170px),(max-width:140px){
+    .pet{width:74px;height:74px}
+    .name{display:none}
+    .tip{margin-top:7px;max-width:112px;font-size:10.5px;line-height:14px;padding:4px 8px}
+    .menu{top:26px}
+    .x{width:16px;height:16px;left:-6px;top:-2px;font-size:11px;line-height:16px}
+  }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div class="pet" id="pet" title="AI邦 · 点一下打开邦信">
+    <span class="ring" id="ring"></span>
+    <div class="face bob" id="bob">
+      <img src="fde-avatar.png" alt="AI邦" draggable="false"
+           onerror="this.style.display='none';this.parentNode.classList.add('noface')">
+    </div>
+    <span class="badge" id="badge">1</span>
+    <span class="x" id="closeBtn" title="关闭 AI邦（托盘「召唤 AI邦」可再叫出来）">✕</span>
+    <span class="name">AI邦</span>
+  </div>
+  <div class="tip" id="tip">有新消息</div>
+  <div class="menu" id="menu">
+    <div data-act="mute" id="muteItem">静音提示音</div>
+    <div data-act="close">收起</div>
+  </div>
+</div>
+<script>
+(function () {
+  var wrap  = document.getElementById('wrap');
+  var pet   = document.getElementById('pet');
+  var bob   = document.getElementById('bob');
+  var ring  = document.getElementById('ring');
+  var badge = document.getElementById('badge');
+  var tip   = document.getElementById('tip');
+  var menu  = document.getElementById('menu');
+  var muteItem = document.getElementById('muteItem');
+  var fadeTimer = null;
+  var muted = false;
+  var lastN = -1;
+
+  function inv(cmd, args) {
+    try {
+      var c = window.__TAURI__ && window.__TAURI__.core;
+      if (c && c.invoke) return c.invoke(cmd, args || {});
+    } catch (e) {}
+    return { then: function () {} };
+  }
+
+  function render(n, t) {
+    n = (n | 0) > 0 ? (n | 0) : 0;
+    if (n > 0) {
+      badge.hidden = false;
+      badge.textContent = n > 99 ? '99+' : String(n);
+    } else {
+      badge.hidden = true;
+    }
+    t = (t || '').trim();
+    tip.hidden = !t;
+    tip.textContent = t || '';
+    return n;
+  }
+
+  // 入场：弹一下 + 光环脉冲；未读数变化时再跳三下
+  // keep=true：**不挂淡出计时**。托盘「召唤 AI邦」用 —— 那时没有未读（n=0），
+  // 旧逻辑 8 秒就把自己淡没了，用户点完一抬头屏上已经什么都没有，判成「召唤没反应」。
+  function entrance(n, keep) {
+    wrap.classList.remove('in', 'out');
+    void wrap.offsetWidth;
+    wrap.classList.add('in');
+    if (lastN >= 0 && n !== lastN) {
+      bob.classList.remove('hop');
+      ring.classList.remove('on');
+      void bob.offsetWidth;
+      bob.classList.add('hop');
+      ring.classList.add('on');
+    }
+    lastN = n;
+    // 有未读 → 常驻（Rust 侧同样不挂自动收起）；只有纯提示（n=0）才淡出
+    if (fadeTimer) { clearTimeout(fadeTimer); fadeTimer = null }
+    if (n <= 0 && !keep) {
+      fadeTimer = setTimeout(function () {
+        wrap.classList.remove('in');
+        wrap.classList.add('out');
+      }, 8000);
+    }
+  }
+
+  var q = new URLSearchParams(location.search);
+  var keepOpen = q.get('k') === '1';
+  entrance(render(parseInt(q.get('n') || '0', 10), q.get('t') || ''), keepOpen);
+
+  // 🔴 兜底（2026-11-17 mac 白块）：mac 上浮窗出现过「窗口 rect 正常、内容一片空白」——
+  // #wrap 初始 opacity:0，只有 JS 跑到 entrance() 才会亮。这条定时器保证：即使脚本被
+  // 拦、参数拿不到、或者 CSS 动画没跑到，600ms 后也一定把精灵显示出来，绝不只剩白块。
+  setTimeout(function () {
+    if (!wrap.classList.contains('in')) {
+      wrap.classList.remove('out');
+      wrap.classList.add('in');
+    }
+  }, 600);
+
+  // Rust 侧建窗后走 IPC 注入（不依赖 URL query，mac 的 asset 协议对 query 处理与 win 不同）
+  window.__fdeInit = function (n, t, keep) { entrance(render(n, t), keep); };
+
+  // Rust 复用已开窗口时调用：原地更新数字/文案，不整窗刷新（避免白闪）
+  window.__fdeUpdate = function (n, t, keep) { entrance(render(n, t), keep); };
+  window.__fdeOut = function () {
+    wrap.classList.remove('in');
+    wrap.classList.add('out');
+  };
+
+  // ── 拖动 / 单击 ─────────────────────────────────────────────
+  // 规则：按下后 200ms 内没有明显位移 → 当单击（唤起主窗）；一旦位移超 4px 或按住超 200ms
+  // 仍在按 → 交原生拖动（pet_drag_begin）。小窗既能点又能拖，不用去找小把手。
+  var downAt = 0, downX = 0, downY = 0, moved = false, dragStarted = false, holdTimer = null;
+
+  function startDrag() {
+    if (dragStarted) return;
+    dragStarted = true;
+    inv('pet_drag_begin');
+  }
+
+  pet.addEventListener('mousedown', function (e) {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    downAt = Date.now(); downX = e.clientX; downY = e.clientY;
+    moved = false; dragStarted = false;
+    clearTimeout(holdTimer);
+    holdTimer = setTimeout(function () { startDrag(); }, 200);
+  });
+
+  document.addEventListener('mousemove', function (e) {
+    if (!downAt) return;
+    if (Math.abs(e.clientX - downX) > 4 || Math.abs(e.clientY - downY) > 4) {
+      moved = true;
+      clearTimeout(holdTimer);
+      startDrag();
+    }
+  });
+
+  document.addEventListener('mouseup', function (e) {
+    if (!downAt) return;
+    clearTimeout(holdTimer);
+    var quick = Date.now() - downAt < 400;
+    var wasDrag = dragStarted;
+    downAt = 0;
+    if (!moved && quick && !wasDrag) {
+      inv('fde_float_click');   // 单击 → 唤起主窗
+    } else if (wasDrag) {
+      setTimeout(function () { inv('pet_pos_save', {}) }, 260);
+    }
+  });
+
+  // ── 关闭按钮（✕）───────────────────────────────────────────
+  // 必须 stopPropagation：pet 上的 mousedown 会启动「按住 200ms 转拖动、松手当单击唤起主窗」，
+  // 点 ✕ 只是关掉精灵，不能顺手把主窗也叫起来。
+  var closeBtn = document.getElementById('closeBtn');
+  closeBtn.addEventListener('mousedown', function (e) {
+    e.stopPropagation();
+    e.preventDefault();
+  });
+  closeBtn.addEventListener('click', function (e) {
+    e.stopPropagation();
+    inv('pet_close');
+  });
+
+  // ── 右键菜单 ───────────────────────────────────────────────
+  document.addEventListener('contextmenu', function (e) {
+    e.preventDefault();
+    menu.classList.add('on');
+  });
+  document.addEventListener('mousedown', function (e) {
+    if (e.button === 2) return;
+    if (!menu.contains(e.target)) menu.classList.remove('on');
+  }, true);
+
+  menu.addEventListener('click', function (e) {
+    var act = e.target && e.target.getAttribute('data-act');
+    if (!act) return;
+    menu.classList.remove('on');
+    if (act === 'mute') {
+      muted = !muted;
+      muteItem.textContent = muted ? '开启提示音' : '静音提示音';
+      inv('pet_set_muted', { on: muted });
+    } else if (act === 'close') {
+      inv('pet_close');
+    }
+  });
+
+  inv('pet_status').then(function (s) {
+    if (s && typeof s.muted === 'boolean') {
+      muted = s.muted;
+      muteItem.textContent = muted ? '开启提示音' : '静音提示音';
+    }
+    if (s && typeof s.avatar === 'string') setAvatar(s.avatar);
+  }, function () { /* 老客户端没有这个命令：静默忽略 */ });
+
+  // 形象可配（2026-11-16 老8）：空串 = 内置卡通精灵；否则用主窗传来的头像（data URL）。
+  // 头像加载失败（防盗链 / 链接过期 / 文件被删）一律回退卡通，不让精灵开天窗。
+  var faceImg = document.querySelector('.face img');
+  var DEFAULT_FACE = 'fde-avatar.png';
+  function setAvatar(u) {
+    u = (u || '').trim();
+    if (!u) { if (faceImg.src.indexOf(DEFAULT_FACE) < 0) faceImg.src = DEFAULT_FACE; return; }
+    faceImg.onerror = function () { faceImg.onerror = null; faceImg.src = DEFAULT_FACE; };
+    faceImg.src = u;
+  }
+  window.__fdeAvatar = setAvatar;
+
+  document.addEventListener('dragstart', function (e) { e.preventDefault(); });
+})();
+</script>
+</body>
+</html>

@@ -4782,11 +4782,21 @@ fn fde_build_window(
     x: f64,
     y: f64,
     show_after: bool,
+    n: i64,
+    tip: &str,
 ) -> Option<tauri::WebviewWindow> {
     // 2026-11-17 二改：改用**本地打包页**（dist/fde-float.html）而不是远程 External URL。
     // 真机实测：External(https://…) 建第二个 webview 一律 0x8007139F（L1~L4 全败），
     // 而主窗（App 协议 + 本地资源）正常 —— 差距就在 URL 形态上，故先按本地页验证。
     let mk_url = || tauri::WebviewUrl::App(path.into());
+    // 🔴 2026-11-17 mac 白块（第四轮，老8 实测）：窗口建成、visible=true、rect 正确、
+    // 不透明档，屏幕上就是一块 148×196 的纯白 —— 页面里 #wrap 初始 opacity:0，靠 JS
+    // 加 .in 才显示，说明 **页面 JS 根本没跑起来**（Safari 直接开同一个线上页是正常的，
+    // 排除页面/图片/WebKit 渲染，也排除虚拟机）。mac 的 asset 协议对 URL query 的处理
+    // 与 Windows 的 http://tauri.localhost 不同，故这里不再依赖 query：
+    //   ① on_page_load 把加载事件与最终 URL 写进 nav.log（下次一眼看出是没加载还是没画）；
+    //   ② 加载完成瞬间用 eval 注入参数并重画，参数通道由 query 改为 IPC 注入。
+    let tip_js = js_str(tip);
     // (transparent, shadow, always_on_top)
     // 🔴 2026-11-17 mac：本仓没开 tauri 的 macos-private-api（Cargo.toml）也没开
     // macOSPrivateApi（tauri.conf.json）—— 这种组合下 macOS 的 transparent 档很容易
@@ -4806,6 +4816,7 @@ fn fde_build_window(
         (false, true, false),
     ];
     for (i, (transparent, shadow, on_top)) in attempts.into_iter().enumerate() {
+        let tip_for_load = tip_js.clone();
         let r = tauri::WebviewWindowBuilder::new(app, "fde-float", mk_url())
         .title("AI邦")
         .additional_browser_args(X8_WEBVIEW_ARGS)
@@ -4830,6 +4841,24 @@ fn fde_build_window(
         // 该有的白底都没有）。改为「要显示就以 visible(true) 建窗」，让 WebView2 在
         // 可见窗口上初始化合成层；预建（show_after=false）仍然隐藏建。
         .visible(show_after)
+        // 页面加载事件落日志 + 加载完成即注入参数重画（不依赖 URL query，见函数头）
+        .on_page_load(move |w, payload| {
+            nav_write(&format!(
+                "[pet] page_load {:?} {}",
+                payload.event(),
+                payload.url()
+            ));
+            if matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
+                let js = format!(
+                    "window.__fdeUpdate ? (window.__fdeUpdate({n}, {}, 1), 'ok') : 'no-fn'",
+                    tip_for_load
+                );
+                match w.eval(&js) {
+                    Ok(_) => nav_write("[pet] 加载完成，已注入参数重画"),
+                    Err(e) => nav_write(&format!("[pet] 注入参数失败: {e}")),
+                }
+            }
+        })
         .build();
         match r {
             Ok(w) => {
@@ -4842,6 +4871,20 @@ fn fde_build_window(
                     let _ = w.set_size(tauri::LogicalSize::new(FDE_FLOAT_W + 1.0, FDE_FLOAT_H));
                     let _ = w.set_size(tauri::LogicalSize::new(FDE_FLOAT_W, FDE_FLOAT_H));
                     let _ = w.set_position(tauri::LogicalPosition::new(x, y));
+                }
+                // 🔴 mac：WKWebView 首次布局偶发 0x0 视口（窗口 rect 正常、内容一片空白）。
+                // 上面那两次 set_size 是建窗当下同步抖的，赶不上首次布局 → 220ms 后再抖一次。
+                #[cfg(target_os = "macos")]
+                if show_after {
+                    let hw = w.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(220));
+                        let _ = hw.set_size(tauri::LogicalSize::new(FDE_FLOAT_W, FDE_FLOAT_H + 1.0));
+                        std::thread::sleep(std::time::Duration::from_millis(90));
+                        let _ = hw.set_size(tauri::LogicalSize::new(FDE_FLOAT_W, FDE_FLOAT_H));
+                        let _ = hw.set_position(tauri::LogicalPosition::new(x, y));
+                        nav_write("[pet] mac 二次抖动尺寸完成");
+                    });
                 }
                 return Some(w);
             }
@@ -4926,7 +4969,7 @@ fn fde_float_show_ex(app: &tauri::AppHandle, count: i64, tip: &str, silent: bool
             let (x, y) = fde_float_pos(&h_main);
             // 建窗才记一行：区分「命令根本没到」与「到了但建窗失败」（见 fde_build_window 头注）
             nav_write(&format!("[pet] 建 fde-float n={n} pos=({x:.0},{y:.0})"));
-            fde_build_window(&h_main, &path, x, y, true);
+            fde_build_window(&h_main, &path, x, y, true, n, &tip_owned);
             pet_show_probe(h_main.clone());
         }) {
             nav_write(&format!("[pet] 投主线程失败（建窗）: {e}"));

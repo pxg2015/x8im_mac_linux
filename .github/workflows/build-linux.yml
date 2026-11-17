@@ -149,7 +149,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          printf '%s\n' '<!doctype html><meta charset="utf-8"><title>X8.IM</title>' > dist/index.html
+          # 🔴 AI邦 精灵浮窗走本地 asset 协议，必须真打进 frontendDist（Windows 包用完整
+          # dist，所以只有 mac/linux 中招：浮窗 404 → 屏幕上一块白块）
+          cp -f pet/fde-float.html pet/fde-avatar.png dist/
+          [ -f dist/index.html ] || printf '%s\n' '<!doctype html><meta charset="utf-8"><title>X8.IM</title>' > dist/index.html
 
       - name: Build deb + rpm
         run: npx tauri build --bundles deb,rpm
