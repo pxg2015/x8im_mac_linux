@@ -4612,6 +4612,23 @@ fn primary_work_area() -> Option<(i32, i32, i32, i32)> {
     }
 }
 
+/// 把逻辑坐标夹进指定显示器的可视区（留 8px 边距）。
+///
+/// 🔴 2026-11-17 mac 1.7.13「AI邦 根本没出来」的兜底：macOS 的显示器 API 受主线程约束，
+/// 拿不到屏时下面会回落成 1920×1080 / sf=1 的假设值 → 算出的 x=1756 在 Retina 逻辑宽
+/// 1512 的屏上是**屏外**，窗口建出来却永远看不见（置顶也一样）。
+/// 所以非 Windows 平台一律把落点夹回「当前屏可视区」，宁可位置不完美也要在屏上。
+fn clamp_to_monitor(x: f64, y: f64, sf: f64, mpx: i32, mpy: i32, mw: u32, mh: u32) -> (f64, f64) {
+    let sf = if sf > 0.1 { sf } else { 1.0 };
+    let left = mpx as f64 / sf;
+    let top = mpy as f64 / sf;
+    let right = (mpx as f64 + mw as f64) / sf;
+    let bottom = (mpy as f64 + mh as f64) / sf;
+    let max_x = (right - FDE_FLOAT_W - 8.0).max(left);
+    let max_y = (bottom - FDE_FLOAT_H - 8.0).max(top);
+    (x.clamp(left, max_x), y.clamp(top, max_y))
+}
+
 /// 精灵落点（2026-11-16 重写）：
 ///   ① 用户拖过的位置优先（pet.json），但落点必须仍在某块屏的工作区内，否则作废回落
 ///   ② 回落位置 = **主窗所在那块屏**的工作区右下角（距右 16 / 距底 8 逻辑像素）
@@ -4621,7 +4638,18 @@ fn fde_float_pos(app: &tauri::AppHandle) -> (f64, f64) {
     let mon = app
         .get_webview_window("main")
         .and_then(|w| w.current_monitor().ok().flatten())
-        .or_else(|| app.primary_monitor().ok().flatten());
+        .or_else(|| app.primary_monitor().ok().flatten())
+        // 🔴 2026-11-17 mac：上面两条在非主线程 / AppKit 尚未就绪时会**双双返回 None**
+        // （Windows 不受此限，所以只有 mac 出问题）。退一步把枚举到的屏里最大的那块当主屏，
+        // 比死守 1920×1080 假设靠谱——后者在 Retina 上直接把窗口算到屏外。
+        .or_else(|| {
+            app.available_monitors().ok().and_then(|v| {
+                v.into_iter().max_by_key(|m| {
+                    let s = m.size();
+                    s.width as u64 * s.height as u64
+                })
+            })
+        });
     let mut sf = 1.0_f64;
     let mut mpx = 0_i32;
     let mut mpy = 0_i32;
@@ -4635,6 +4663,8 @@ fn fde_float_pos(app: &tauri::AppHandle) -> (f64, f64) {
         mpy = p.y;
         mw = s.width;
         mh = s.height;
+    } else {
+        nav_write("[pet] 落点: 拿不到任何显示器信息，回落 1920x1080 假设");
     }
 
     if let Some((sx, sy)) = pet_saved_pos() {
@@ -4649,7 +4679,14 @@ fn fde_float_pos(app: &tauri::AppHandle) -> (f64, f64) {
         }
         #[cfg(not(target_os = "windows"))]
         {
-            return (sx, sy);
+            // mac/linux：拖过的点也要夹回当前屏（换屏 / 缩放变了之后老坐标会跑出屏外）
+            let (cx, cy) = clamp_to_monitor(sx, sy, sf, mpx, mpy, mw, mh);
+            if (cx - sx).abs() > 1.0 || (cy - sy).abs() > 1.0 {
+                nav_write(&format!(
+                    "[pet] 落点: 记忆点 ({sx:.0},{sy:.0}) 不在屏内 → 夹到 ({cx:.0},{cy:.0})"
+                ));
+            }
+            return (cx, cy);
         }
     }
 
@@ -4664,10 +4701,13 @@ fn fde_float_pos(app: &tauri::AppHandle) -> (f64, f64) {
         }
     }
     // 非 Windows / 取不到工作区：退回显示器整块，额外让出 56px 当任务栏
-    (
-        (mpx as f64 + mw as f64) / sf - FDE_FLOAT_W - 16.0,
-        (mpy as f64 + mh as f64) / sf - FDE_FLOAT_H - 8.0 - 56.0,
-    )
+    let x = (mpx as f64 + mw as f64) / sf - FDE_FLOAT_W - 16.0;
+    let y = (mpy as f64 + mh as f64) / sf - FDE_FLOAT_H - 8.0 - 56.0;
+    if cfg!(windows) {
+        (x, y)
+    } else {
+        clamp_to_monitor(x, y, sf, mpx, mpy, mw, mh)
+    }
 }
 
 /// 百分号编码（只用于把中文提示塞进 URL query）
@@ -4748,6 +4788,18 @@ fn fde_build_window(
     // 而主窗（App 协议 + 本地资源）正常 —— 差距就在 URL 形态上，故先按本地页验证。
     let mk_url = || tauri::WebviewUrl::App(path.into());
     // (transparent, shadow, always_on_top)
+    // 🔴 2026-11-17 mac：本仓没开 tauri 的 macos-private-api（Cargo.toml）也没开
+    // macOSPrivateApi（tauri.conf.json）—— 这种组合下 macOS 的 transparent 档很容易
+    // 建出「全透明空窗」：窗口存在、visible=true，但一个像素都不画，用户看到的就是
+    // 「AI邦 根本没出来」（Windows 的等价坑见下面 WebView2 那段注释）。
+    // 所以 mac 从**不透明**档起试，先保证看得见；要透明美化得先把 private api 打开。
+    #[cfg(target_os = "macos")]
+    let attempts: [(bool, bool, bool); 3] = [
+        (false, false, true),
+        (false, true, true),
+        (true, false, true),
+    ];
+    #[cfg(not(target_os = "macos"))]
     let attempts: [(bool, bool, bool); 3] = [
         (true, false, true),
         (false, false, true),
@@ -4829,24 +4881,33 @@ fn fde_float_show_ex(app: &tauri::AppHandle, count: i64, tip: &str, silent: bool
         return;
     }
     let n = count.max(0);
-    let (x, y) = fde_float_pos(app);
+    // keep 恒 1：页面不要挂 8 秒淡出，精灵出来就一直在（老8 2026-11-17）
+    let keep = 1;
 
-    if let Some(w) = app.get_webview_window("fde-float") {
+    // 🔴 2026-11-17 mac：落点计算必须**在主线程内**做。
+    // fde_float_pos 要调 current_monitor / primary_monitor，macOS 上这些是 AppKit 接口，
+    // 在后台线程调用会静默返回 None（Windows 无此限制）→ 上次的真机表现就是
+    // pet_autoshow（thread::spawn 里跑的）把窗口算到屏外，然后「AI邦 一直没出来」。
+    // 所以整段显示逻辑（取坐标 → eval → show / 建窗）统一投到主线程闭包里，不在这里先算。
+    if app.get_webview_window("fde-float").is_some() {
         // 已存在：原地更新数字/文案 + 重播入场动画。不整窗 reload——reload 会白闪一下
-        // keep 恒 1：页面不要挂 8 秒淡出，精灵出来就一直在（老8 2026-11-17）
-        let keep = 1;
         let js = format!(
             "window.__fdeUpdate && window.__fdeUpdate({n}, {}, {keep})",
             js_str(tip)
         );
-        let _ = w.eval(&js);
-        let _ = w.set_position(tauri::LogicalPosition::new(x, y));
-        let _ = w.show();
+        let h_main = app.clone();
+        if let Err(e) = app.run_on_main_thread(move || {
+            let (x, y) = fde_float_pos(&h_main);
+            if let Some(w) = h_main.get_webview_window("fde-float") {
+                let _ = w.eval(&js);
+                let _ = w.set_position(tauri::LogicalPosition::new(x, y));
+                let _ = w.show();
+            }
+        }) {
+            nav_write(&format!("[pet] 投主线程失败（更新已有窗口）: {e}"));
+        }
     } else {
-        // 建窗才记一行：区分「命令根本没到」与「到了但建窗失败」（见 fde_build_window 头注）
-        nav_write(&format!("[pet] 建 fde-float n={n} pos=({x:.0},{y:.0})"));
         // 本地打包页（dist/fde-float.html），带首次渲染所需的参数；后续更新走 __fdeUpdate
-        let keep = 1;
         let path = format!("fde-float.html?n={}&t={}&k={keep}", n, url_encode(tip));
         let tip_owned = tip.to_string();
         let h_main = app.clone();
@@ -4857,13 +4918,18 @@ fn fde_float_show_ex(app: &tauri::AppHandle, count: i64, tip: &str, silent: bool
                     "window.__fdeUpdate && window.__fdeUpdate({n}, {}, {keep})",
                     js_str(&tip_owned)
                 ));
+                let (x, y) = fde_float_pos(&h_main);
                 let _ = w.set_position(tauri::LogicalPosition::new(x, y));
                 let _ = w.show();
                 return;
             }
+            let (x, y) = fde_float_pos(&h_main);
+            // 建窗才记一行：区分「命令根本没到」与「到了但建窗失败」（见 fde_build_window 头注）
+            nav_write(&format!("[pet] 建 fde-float n={n} pos=({x:.0},{y:.0})"));
             fde_build_window(&h_main, &path, x, y, true);
+            pet_show_probe(h_main.clone());
         }) {
-            nav_write(&format!("[pet] 投主线程失败: {e}"));
+            nav_write(&format!("[pet] 投主线程失败（建窗）: {e}"));
         }
     }
 
@@ -4875,6 +4941,43 @@ fn fde_float_show_ex(app: &tauri::AppHandle, count: i64, tip: &str, silent: bool
     // 🔴 2026-11-17 老8：精灵出来就不要自己消失，一直在，等手工关（点它 / ✕ / 右键收起）。
     // 所以这里**不再挂任何自动收起计时** —— 未读常驻、召唤常驻、登录问候也常驻。
     FDE_FLOAT_GEN.fetch_add(1, Ordering::SeqCst);
+}
+
+/// 建窗后 1.2s 回读窗口的真实状态（位置 / 尺寸 / 所在屏 / 可见性）。
+///
+/// 为什么必须回读：mac 上「窗口建出来了但落在屏外」和「压根没建出来」在用户眼里完全一样
+/// （都是没东西）。这两条日志一句话就能分开，下次再有这类反馈不用靠读二进制猜。
+fn pet_show_probe(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        match app.get_webview_window("fde-float") {
+            Some(w) => {
+                let vis = w.is_visible().unwrap_or(false);
+                let pos = w
+                    .outer_position()
+                    .map(|p| format!("({},{})", p.x, p.y))
+                    .unwrap_or_else(|e| format!("err:{e}"));
+                let size = w
+                    .outer_size()
+                    .map(|s| format!("{}x{}", s.width, s.height))
+                    .unwrap_or_else(|e| format!("err:{e}"));
+                let mon = w
+                    .current_monitor()
+                    .ok()
+                    .flatten()
+                    .map(|m| {
+                        let p = m.position();
+                        let s = m.size();
+                        format!("mon({},{} {}x{} sf={})", p.x, p.y, s.width, s.height, m.scale_factor())
+                    })
+                    .unwrap_or_else(|| "mon=None".into());
+                nav_write(&format!(
+                    "[pet] 1.2s 回读: visible={vis} pos={pos} size={size} {mon}"
+                ));
+            }
+            None => nav_write("[pet] 1.2s 回读: 窗口不存在（建窗失败）"),
+        }
+    });
 }
 
 /// 前端接口：显示右下角 FDE 浮动提醒（由 notify_unread / away_notice 内部调用，
@@ -4929,18 +5032,9 @@ fn pet_summon(app: &tauri::AppHandle) {
     // 作废上面为「纯提示」排的自动收起计时：召唤出来的精灵要留着，
     // 直到点它 / 主窗回前台 / 未读清零（与未读常驻同一套收起条件）。
     FDE_FLOAT_GEN.fetch_add(1, Ordering::SeqCst);
-    // 诊断：show 是异步投递的，这里只做「事后回看」——真看不到时日志能说清是没建窗还是没显示。
-    let h = app.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(700));
-        match h.get_webview_window("fde-float") {
-            Some(w) => {
-                let vis = w.is_visible().unwrap_or(false);
-                nav_write(&format!("[pet] summon 后 700ms: 窗口存在 visible={vis}"));
-            }
-            None => nav_write("[pet] summon 后 700ms: 窗口不存在（建窗失败）"),
-        }
-    });
+    // 诊断：show 是异步投递的，这里只做「事后回看」——真看不到时日志能说清是没建窗、
+    // 还是建了但落在屏外（2026-11-17 mac：后者正是「召唤没反应」的真相）。
+    pet_show_probe(app.clone());
     si_log("[pet] summon from tray");
 }
 
@@ -7407,8 +7501,18 @@ fn x8_nav(app: tauri::AppHandle, target: String) -> Result<String, String> {
 // 全程只有用户点击才触发，不带任何自动刷新。
 
 fn nav_log_path() -> std::path::PathBuf {
-    let base = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into());
-    let dir = std::path::Path::new(&base).join("BangXin");
+    // 🔴 2026-11-17 真机（mac 1.7.13）：这里原先只有 Windows 路径 —— mac 上 ProgramData
+    // 环境变量不存在 → 回落字面量 `C:\ProgramData` → 在 unix 上是个**相对路径**，
+    // create_dir_all 一般失败 → nav.log 一行都写不出去。后果是 mac 上「AI邦 不出来 /
+    // 托盘点了没反应」这类问题**完全没有证据可查**（这次就是靠读二进制才排到落点问题）。
+    // 统一落到 bangxin_user_dir()：mac = ~/Library/Application Support/BangXin/nav.log。
+    if cfg!(windows) {
+        let base = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into());
+        let dir = std::path::Path::new(&base).join("BangXin");
+        let _ = std::fs::create_dir_all(&dir);
+        return dir.join("nav.log");
+    }
+    let dir = bangxin_user_dir();
     let _ = std::fs::create_dir_all(&dir);
     dir.join("nav.log")
 }
@@ -7789,7 +7893,6 @@ async fn x8_rebuild_ui(app: tauri::AppHandle) -> Result<String, String> {
     nav_write("rebuild_ui eval 未 commit → 进程级重启");
     restart_in_place(&app).await
 }
-
 
 fn main() {
     // 2026-10-23 老8：先上硬单实例锁，再初始化任何 GUI/WebView（顺序不能反，
