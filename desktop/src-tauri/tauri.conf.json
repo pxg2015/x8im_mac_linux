@@ -1,6 +1,6 @@
 {
   "productName": "BangXin",
-  "version": "1.7.2",
+  "version": "1.7.13",
   "identifier": "com.x8fde.im",
   "build": {
     "frontendDist": "../dist"
@@ -11,13 +11,14 @@
       {
         "label": "main",
         "title": "邦信",
-        "url": "https://im.x8fde.com/app/?v=1.6.88",
+        "url": "https://im.x8fde.com/app/?v=1.7.13",
         "width": 1180,
         "height": 800,
         "minWidth": 800,
         "minHeight": 600,
         "decorations": true,
-        "theme": "Dark",
+        "theme": "Light",
+        "backgroundColor": "#F4F6F9",
         "additionalBrowserArgs": "--disable-background-networking --disable-component-update --no-first-run --disable-safebrowsing --disable-features=msEdgeComponentUpdates,msEdgeShoppingAssistant,EdgeReadingList"
       }
     ],

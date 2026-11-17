@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-wx-status"
+description = "Enables the wx_status command without any pre-configured scope."
+commands.allow = ["wx_status"]
+
+[[permission]]
+identifier = "deny-wx-status"
+description = "Denies the wx_status command without any pre-configured scope."
+commands.deny = ["wx_status"]

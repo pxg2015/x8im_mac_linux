@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-wx-follow-set"
+description = "Enables the wx_follow_set command without any pre-configured scope."
+commands.allow = ["wx_follow_set"]
+
+[[permission]]
+identifier = "deny-wx-follow-set"
+description = "Denies the wx_follow_set command without any pre-configured scope."
+commands.deny = ["wx_follow_set"]

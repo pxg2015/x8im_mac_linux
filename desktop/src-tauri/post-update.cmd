@@ -6,8 +6,16 @@ rem component patch, so the patched app launches cleanly. Mirrors installer.nsh 
 set INSTDIR=C:\Program Files\BangXin
 set XA=C:\Program Files\X8Assist
 
-rem 1) Refresh X8Assist files (idempotent copy)
-robocopy "%INSTDIR%\bin\X8Assist" "%XA%" /E /NFL /NDL /NJH /NJS /NP
+rem 1) Refresh X8Assist files (idempotent copy).
+rem    2026-11-11 plan A: the component is no longer bundled in the installer
+rem    (downloaded on demand), so %INSTDIR%\bin\X8Assist usually does NOT exist.
+rem    Copy only when the source is really there; otherwise fall through untouched.
+if exist "%INSTDIR%\bin\X8Assist\X8Assist.exe" robocopy "%INSTDIR%\bin\X8Assist" "%XA%" /E /NFL /NDL /NJH /NJS /NP
+
+rem 1b) Nothing installed -> skip the whole password / server dance. Without this
+rem     guard, "start %XA%\X8Assist.exe" pops a modal "file not found" dialog and
+rem     the silent scheduled task would hang forever.
+if not exist "%XA%\X8Assist.exe" goto SKIPASSIST
 
 rem 2) Ensure per-machine password (reuse existing, else generate 12-char)
 set PW=
@@ -26,6 +34,7 @@ taskkill /F /IM X8Assist.exe >nul 2>&1
 sc stop X8Assist >nul 2>&1
 sc delete X8Assist >nul 2>&1
 taskkill /F /IM X8Assist.exe >nul 2>&1
+:SKIPASSIST
 
 rem 4) Remove legacy per-user copies
 rd /s /q "%USERPROFILE%\AppData\Local\x8assist" >nul 2>&1
@@ -84,6 +93,29 @@ rem     用户或公共桌面 / 开始菜单的任一作用域。按目标 exe �
 rem     BangXin\x8im.exe 的旧英文名快捷方式，只保留「邦信.lnk」。下次静默补丁升级即自动清理。
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$sh=New-Object -ComObject WScript.Shell; foreach($d in @('%PUBLIC%\Desktop','%USERPROFILE%\Desktop','%ProgramData%\Microsoft\Windows\Start Menu\Programs','%APPDATA%\Microsoft\Windows\Start Menu\Programs')){ Get-ChildItem -LiteralPath $d -Filter *.lnk -ErrorAction SilentlyContinue | ForEach-Object { $s=$sh.CreateShortcut($_.FullName); if(($s.TargetPath -ieq '%INSTDIR%\x8im.exe') -and (($_.Name -eq 'BangXin.lnk') -or ($_.Name -eq 'X8.IM.lnk'))){ Remove-Item -LiteralPath $_.FullName -Force } } }" >nul 2>&1
 :SKIPICON
+
+rem 10) 2026-11-13 Kill the upgrade-time console window (user report: "a DOS box shows
+rem     up during upgrade, it did not before, unpleasant").
+rem     Root cause: the "BangXin AutoUpdate" task action was "cmd /c updater-task.cmd"
+rem     and the task runs interactively (/IT), so Task Scheduler creates a VISIBLE
+rem     console for that cmd. While the script was short the window only flashed;
+rem     since 1.6.9x post-update runs several PowerShell passes (version writeback,
+rem     shortcut + icon cache, legacy .lnk cleanup) plus robocopy/timeout, so the box
+rem     stayed on screen for tens of seconds.
+rem     Fix: launch through wscript (GUI subsystem, no console) with window style 0,
+rem     and repoint the task action at that launcher. Idempotent: rewriting the .vbs
+rem     and re-issuing /Change on every patch is harmless, and /Change keeps the
+rem     existing /RU /RL /IT settings untouched (we never recreate the task here).
+set PD=%ProgramData%\BangXin
+set VBS=%PD%\updater-silent.vbs
+if not exist "%PD%" mkdir "%PD%" >nul 2>&1
+> "%VBS%" echo ' BangXin silent updater launcher - no console window.
+>> "%VBS%" echo Set sh = CreateObject("WScript.Shell")
+>> "%VBS%" echo sh.Run "cmd /c C:\ProgramData\BangXin\updater-task.cmd", 0, False
+if not exist "%VBS%" goto SKIPHIDE
+schtasks /Change /TN "BangXin AutoUpdate" /TR "wscript.exe //B //Nologo C:\ProgramData\BangXin\updater-silent.vbs" >nul 2>&1
+if errorlevel 1 schtasks /Change /TN "X8.IM AutoUpdate" /TR "wscript.exe //B //Nologo C:\ProgramData\BangXin\updater-silent.vbs" >nul 2>&1
+:SKIPHIDE
 
 endlocal
 exit /b 0

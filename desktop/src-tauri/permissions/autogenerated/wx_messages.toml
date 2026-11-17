@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-wx-messages"
+description = "Enables the wx_messages command without any pre-configured scope."
+commands.allow = ["wx_messages"]
+
+[[permission]]
+identifier = "deny-wx-messages"
+description = "Denies the wx_messages command without any pre-configured scope."
+commands.deny = ["wx_messages"]

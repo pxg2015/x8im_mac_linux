@@ -1095,7 +1095,8 @@ fn in_work_window() -> bool {
 
 fn emit_unseen(app: &AppHandle, n: u32, reason: &str) {
     let payload = serde_json::json!({ "unseen": n, "reason": reason });
-    let _ = app.emit(EVENT_MAIL, payload);
+    // 2026-11-16：emit + 入队。IPC 回程失效时前端收不到 emit，靠 HTTP 轮询补投。
+    crate::evq::push(app, EVENT_MAIL, payload);
 }
 
 /// 在 setup() 里调用一次。固定相位（0~10min）+ 每 30 分钟一次 + 启动补查 + 失败退避。

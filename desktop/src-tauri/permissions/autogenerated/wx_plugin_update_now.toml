@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-wx-plugin-update-now"
+description = "Enables the wx_plugin_update_now command without any pre-configured scope."
+commands.allow = ["wx_plugin_update_now"]
+
+[[permission]]
+identifier = "deny-wx-plugin-update-now"
+description = "Denies the wx_plugin_update_now command without any pre-configured scope."
+commands.deny = ["wx_plugin_update_now"]

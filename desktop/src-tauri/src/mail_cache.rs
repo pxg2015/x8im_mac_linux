@@ -17,12 +17,7 @@ use std::path::PathBuf;
 use tauri::{AppHandle, Manager};
 
 pub fn db_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("无法定位应用数据目录：{e}"))?;
-    std::fs::create_dir_all(&dir).map_err(|e| format!("创建数据目录失败：{e}"))?;
-    Ok(dir.join("mail.db"))
+    Ok(data_dir(app)?.join("mail.db"))
 }
 
 /// 应用数据目录（app_data_dir），确保存在。
@@ -62,15 +57,18 @@ pub fn open(app: &AppHandle) -> Result<Connection, String> {
     Ok(c)
 }
 
-/// 清除邮箱配置时调用：删整库（WAL 附属文件一并删）
+/// 清除邮箱配置时调用：只清 mail_* 三张表的数据。
+///
+/// 🔴 2026-11-10 起不能删整库：同一个 mail.db 里还有 wxgo 插件的
+/// wx_messages / wx_contacts / wx_customers / wx_follow / wx_status 五张表
+/// （见 wx_cache.rs）。旧实现删整库会把本地微信归档一并抹掉。
 pub fn clear(app: &AppHandle) {
-    if let Ok(p) = db_path(app) {
-        for suffix in ["", "-wal", "-shm"] {
-            let mut q = p.clone().into_os_string();
-            q.push(suffix);
-            let _ = std::fs::remove_file(PathBuf::from(q));
-        }
-    }
+    let Ok(p) = db_path(app) else { return };
+    let Ok(c) = Connection::open(&p) else { return };
+    let _ = c.busy_timeout(std::time::Duration::from_secs(3));
+    let _ = c.execute_batch(
+        "DELETE FROM mail_bodies; DELETE FROM mail_heads; DELETE FROM mail_meta;",
+    );
 }
 
 // ── meta（uidvalidity / last_max_uid / last_sync / 实际文件夹名）────────────

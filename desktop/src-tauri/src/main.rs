@@ -7,7 +7,7 @@ use std::process::Command;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use tauri::{
-    menu::{Menu, MenuItem, PredefinedMenuItem},
+    menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
     tray::{TrayIconBuilder, TrayIconEvent},
     Emitter, Manager, UserAttentionType,
 };
@@ -34,23 +34,11 @@ mod upd_ui;
 // 2026-11-07 方案 B PoC：主窗 origin 不变，/app/assets/* 由随包 dist 响应。
 // 未配置 X8_LOCAL_ASSETS_DIR 且 resource_dir()/app-assets 不存在时整个模块不激活。
 #[cfg(windows)]
-mod local_assets;
-mod p2p_sidecar;
-mod mail;   // 2026-11-07 内置邮件（Rust 原生 IMAP/SMTP，方案 A）
-mod mail_cache; // 2026-11-08 客户端 SQLite 邮件缓存（清单/正文秒开）
-// 2026-11-10 WX 消息插件机制（与 Windows 同源，三端命令表一致）
-mod plugin_host; // 通用插件宿主：找到 → 拉起 → 验契约 → 看门狗 → 退出回收
-mod wx_sidecar;  // WX 消息插件（Go）薄封装，转调 plugin_host
-mod wx_cache;    // 本地微信消息库（mail.db 的 wx_* 表，客户端读写）
-mod signing;     // 组件包三端共用验签（minisign，与 updater 同一把公钥）
-mod wx_updater;  // wxgo 组件自动下载 / 更新 / 编译时间上报
-// 🔴 2026-11-16 Apple 开发者账号吊销整改（三端统一、无 mac 专用分支）：
-// 原 `mac_wx_setup.rs`（重签 WeChat.app / 注入 get-task-allow / lldb attach 取库密钥 /
-// 读微信沙盒容器 / 提权 LaunchAgent 拉起 wxgo）已整文件移出编译树，存放于
-// `desktop/_internal_wxlocal/`，**不参与任何签名分发构建**。
-// 理由：这些行为在 macOS 上等同于篡改第三方应用签名 + 进程注入 + 跨应用取数据，
-// 属公证扫描与人工审核的硬性拒绝项，且对腾讯客户端有法律风险。
-// 三端命令表保持完全一致（前端无需按平台分支），此处恒返回 unsupported。
+/// 🔴 2026-11-16 Apple 吊销整改：mac 本地微信读取向导的**桩实现**。
+/// 原 `mac_wx_setup.rs`（重签 WeChat.app / 注入 get-task-allow / lldb attach 取库密钥 /
+/// 恢复原签名）已整体停用，文件留在 `_internal_wxlocal/` 以备申诉后复审。
+/// 这 4 个命令名保持注册，是为了让前端 `useWxMsg.js` 的探测有确定返回值（恒 unsupported），
+/// 而不是 `command not found`；前端据此永不弹向导。
 mod mac_wx_setup {
     use serde_json::Value;
     #[tauri::command]
@@ -70,6 +58,17 @@ mod mac_wx_setup {
         serde_json::json!({ "ok": false, "err": "当前版本未包含本地微信读取能力" })
     }
 }
+
+mod local_assets;
+mod p2p_sidecar;
+mod mail;   // 2026-11-07 内置邮件（Rust 原生 IMAP/SMTP，方案 A）
+mod mail_cache; // 2026-11-08 客户端 SQLite 邮件缓存（清单/正文秒开）
+mod plugin_host; // 2026-11-10 通用插件宿主：找到 → 拉起 → 验契约 → 看门狗 → 退出回收
+mod wx_sidecar; // 2026-11-10 WX 消息插件（Go）的薄封装，转调 plugin_host
+mod wx_cache;   // 2026-11-10 本地微信消息库（mail.db 的 wx_* 表，客户端读写）
+mod signing;    // 2026-11-10 组件包三端共用验签（minisign，与 updater 同一把公钥）
+mod wx_updater; // 2026-11-10 wxgo 组件自动下载 / 自动更新 / 编译时间上报
+mod ipc_probe;  // 2026-11-16 IPC 卡死定性探针（双 ping + ENTER/EXIT 埋点，只观测不改业务）
 
 // 非 Windows：mac/linux 的升级走「下载新包手动装 / 系统包管理器」，
 // 不参与这套 Windows 自主升级状态机（它依赖 schtasks / NSIS / Win32 原生窗）。
@@ -100,11 +99,13 @@ mod updater {
 /// Windows 侧一个字都不动。
 mod mac_updater;
 
-/// 内置 RustDesk 路径（bundle.resources 捆绑，安装后随包分发）
-/// - Windows: `bin/rustdesk.exe`（便携单文件）
-/// - macOS:   `bin/mac/RustDesk.app/Contents/MacOS/rustdesk`（官方 dmg 内的 app bundle，保留签名）
-/// - Linux:   不内置（官方 deb/rpm 的 rustdesk 强依赖一堆发行版专属 .so，抽单文件跑不起来），
-///            回落系统 PATH 里的 `rustdesk`（未装则远程协助退化为手填 ID）
+/// 远程协助组件（RustDesk/X8Assist）可执行文件路径。
+///
+/// 2026-11-11 方案 A：组件**不再打进安装包**，改为按需下载（安装包 28~34MB → ~6MB）。
+/// - Windows: `C:\Program Files\X8Assist\X8Assist.exe`（品牌客户端，安装期或运行期下载）
+/// - macOS:   `~/Library/Application Support/BangXin/assist/bin/mac/RustDesk.app`（运行期下载缓存）
+///            → 历史落位 `/Applications/RustDesk.app` → 安装包内资源（老版本才有）
+/// - Linux:   系统 PATH / 常见位置（官方 deb/rpm，一键安装）
 fn rustdesk_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     #[cfg(target_os = "linux")]
     {
@@ -388,20 +389,11 @@ fn kill_rustdesk_procs() {
         // 改后最坏 3s 必返回，且所有「拉起 RustDesk 前先杀旧实例」的调用点都不再干挂。
         let _ = win_run_capture_to("taskkill", &["/F", "/IM", img], 3);
     }
-    // 🔴 2026-11-16 Apple 吊销整改 D：mac 上不再按进程名杀任何进程（含用户自装的官方端）。
-    // macOS 下 RustDesk 由本进程 exec 拉起、与客户端同生命周期；「多实例并存」主要是
-    // Windows 的服务化常驻场景，mac 无此问题，故此处不做进程清理。
-    #[cfg(target_os = "macos")]
+    // mac/linux：官方 RustDesk 进程名恒为 rustdesk（与 Windows taskkill rustdesk.exe 同语义；
+    // 用户自装的官方 RustDesk 一并杀掉，与 Windows 行为一致）。-x 精确匹配进程名，不会误伤。
+    #[cfg(not(windows))]
     {
-        // 故意留空：见上。
-    }
-    // Linux 保留按父进程过滤的精确清理（不受 Apple 审核约束）。
-    #[cfg(target_os = "linux")]
-    {
-        let me = std::process::id().to_string();
-        let _ = Command::new("/usr/bin/pkill")
-            .args(["-P", me.as_str(), "-x", "rustdesk"])
-            .output();
+        let _ = Command::new("pkill").args(["-x", "rustdesk"]).output();
     }
 }
 
@@ -876,13 +868,13 @@ fn macos_cached_exe() -> Option<std::path::PathBuf> {
     macos_bundle_exe(&dir.join("RustDesk.app"))
 }
 
-
 // 🔴 2026-11-16 Apple 吊销整改 B：已删除 macos_clear_bundle_quarantine() 与 RD_REPAIR_SH。
 // 理由：两者都会执行 `xattr -dr com.apple.quarantine`，其中 RD_REPAIR_SH 还是经
 // 「with administrator privileges」提权后执行 —— 在 Apple 公证扫描器眼里等同于
 // Gatekeeper bypass + 提权改系统目录，是本次账号被吊销的直接触发项之一。
 // 我们自己的包经 Developer ID 签名 + 公证后不需要剥隔离标记；直接 exec 也不经过
 // LaunchServices 的隔离检查，删除后不影响远程协助主链路。
+
 
 /// mac：检查某 RustDesk.app 的框架符号链接是否完好（纯只读、不提权）。
 ///
@@ -1442,26 +1434,14 @@ fn ensure_rustdesk_blocking(app: tauri::AppHandle, expected_rid: String, passwor
                 "RustDesk 启动超时，远程协助暂未就绪".into()
             });
         }
-        // 🔴 2026-11-16 Apple 吊销整改：mac 不再自动写永久密码。
-        // 原实现是 `do shell script "… --password …" with administrator privileges`（osascript 提权），
-        // 是本次账号被吊销的触发项之一。且 mac 侧组件现在不再落位 /Applications，
-        // 本就不满足 RustDesk 的 `is_installed()` 判据，这条路已失效。
-        // 现改为跳过：密码由用户在 RustDesk 连接界面查看/手动输入，客户端不再索要管理员权限。
-        #[cfg(all(unix, not(target_os = "macos")))]
+        // Err 里带真实原因（用户取消 / 位置校验不过 / IPC 无 ACK），不再压成一句万能文案
         unix_set_permanent_password(&exe, pw)?;
-        #[cfg(target_os = "macos")]
-        let _ = (&exe, pw);
         // 清理临时实例（open_rustdesk 之后按需再拉；与 Windows 就绪链路同套路）
         kill_rustdesk_procs();
         // 密码就绪后才切审批模式（免 Accept 按钮；官方无 hide_cm，面板 3s 自最小化）
         let _ = ensure_approve_mode();
         let id = rustdesk_get_id(&app)?;
-        // mac：不再对外宣称「密码已就绪」（见上），交给前端引导用户手输
-        #[cfg(target_os = "macos")]
-        let pw_out: Option<String> = None;
-        #[cfg(all(unix, not(target_os = "macos")))]
-        let pw_out: Option<String> = Some(pw.to_string());
-        return Ok(EnsureOut { id, password: pw_out, changed: true, multi: false });
+        return Ok(EnsureOut { id, password: Some(pw.to_string()), changed: true, multi: false });
     }
 }
 
@@ -1484,17 +1464,133 @@ async fn install_rustdesk() -> Result<String, String> {
         {
             linux_install_rustdesk()
         }
+        #[cfg(windows)]
+        {
+            win_install_assist()
+        }
         #[cfg(target_os = "macos")]
         {
             mac_install_rustdesk()
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        {
-            Ok("already".to_string())
-        }
     })
     .await
     .map_err(|e| format!("远程协助组件安装线程异常：{e}"))?
+}
+
+/// Windows：按需下载安装品牌化 X8Assist（2026-11-11 方案 A：组件不再打进安装包）。
+///
+/// 安装期 installer.nsh 已经尝试下载安装；本函数是**运行期兜底**（安装时断网/内网/
+/// 网络抖动会导致组件缺失）。用户点「远程协助」时触发一次，会弹一次 UAC。
+///
+/// 链路：curl 下载 zip → elevate.exe 提权 PowerShell（解压到 Program Files → 生成
+/// 每机随机密码落 x8pwd.txt → 起 `--server` 让 IPC 就绪 → `--password` 写入 → 收尾）。
+///
+/// PowerShell 用 `-EncodedCommand`（Base64/UTF-16LE）传：彻底规避中文用户名路径、
+/// NTFS 空格与三层引号转义（历史上 `--password` 内联引号踩过静默空密码）。
+///
+/// 返回 "already"（本来就有）/ "installed"（本次装好）。
+#[cfg(windows)]
+fn win_install_assist() -> Result<String, String> {
+    if installed_assist_path().is_some() {
+        return Ok("already".into());
+    }
+    // 1) 取组件清单（版本化 URL + sha256），再下载组件包。
+    //    清单放 ProgramData：提权后的 PowerShell 用 $env:ProgramData 也能定位到同一份；
+    //    放用户 %TEMP% 会因提权后 $env:TEMP 变成管理员的 Temp 而找不到文件。
+    let base = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into());
+    let dir = std::path::Path::new(&base).join("BangXin").join("assist");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建组件下载目录失败：{e}"))?;
+    let zip = dir.join("x8assist.zip");
+    let man = dir.join("latest-assist.json");
+    let _ = std::fs::remove_file(&zip);
+    let _ = Command::new("curl.exe")
+        .args(["-L", "--fail", "-s", "--max-time", "60", "-o"])
+        .arg(&man)
+        .arg("https://im.x8fde.com/app/latest-assist.json")
+        .status();
+
+    let mut url = String::new();
+    let mut want_sha = String::new();
+    if let Ok(txt) = std::fs::read_to_string(&man) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+            if let Some(p) = v.get("platforms").and_then(|p| p.get("windows-x86_64")) {
+                url = p.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string();
+                want_sha = p.get("sha256").and_then(|s| s.as_str()).unwrap_or("").to_string();
+            }
+        }
+    }
+    if url.is_empty() {
+        return Err("远程协助组件清单不可用（请检查网络后重试）".into());
+    }
+    let dl = Command::new("curl.exe")
+        .args(["-L", "--fail", "-s", "--max-time", "600", "-o"])
+        .arg(&zip)
+        .arg(&url)
+        .status();
+    if !matches!(dl, Ok(s) if s.success()) || !zip.is_file() {
+        return Err("远程协助组件下载失败（请检查网络后重试，或到下载页手动安装组件）".into());
+    }
+    // sha256 校验：下载不完整的 zip 解压会得到残缺组件（更难排查），宁可这里失败重试。
+    if !want_sha.is_empty() {
+        use sha2::{Digest, Sha256};
+        match std::fs::read(&zip) {
+            Ok(bytes) => {
+                let got = format!("{:x}", Sha256::digest(&bytes));
+                if got != want_sha {
+                    let _ = std::fs::remove_file(&zip);
+                    return Err("组件包校验失败（下载不完整），请重试".into());
+                }
+            }
+            Err(e) => return Err(format!("读取组件包失败：{e}")),
+        }
+    }
+
+    // 2) 提权安装（全 ASCII 脚本）。$env:ProgramData 在提权上下文仍是 C:\ProgramData。
+    let ps = r#"$ErrorActionPreference='Stop';
+$zip = Join-Path $env:ProgramData 'BangXin\assist\x8assist.zip';
+$dst = 'C:\Program Files\X8Assist';
+if (Test-Path $dst) { Remove-Item $dst -Recurse -Force -ErrorAction SilentlyContinue };
+Add-Type -AssemblyName System.IO.Compression.FileSystem;
+[IO.Compression.ZipFile]::ExtractToDirectory($zip, 'C:\Program Files');
+$chars = (48..57)+(65..90)+(97..122) | ForEach-Object { [char]$_ };
+$p = -join (1..12 | ForEach-Object { $chars | Get-Random });
+[IO.File]::WriteAllText((Join-Path $dst 'x8pwd.txt'), $p);
+$exe = Join-Path $dst 'X8Assist.exe';
+Start-Process -FilePath $exe -ArgumentList '--server' -WindowStyle Hidden;
+Start-Sleep -Seconds 6;
+& $exe --password $p | Out-Null;
+Start-Sleep -Seconds 2;
+Get-Process X8Assist -ErrorAction SilentlyContinue | Stop-Process -Force;
+if (Test-Path $exe) { exit 0 } else { exit 9 }"#;
+    let utf16: Vec<u8> = ps.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
+    let enc = {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        B64.encode(&utf16)
+    };
+    let elevate = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|p| p.join("elevate.exe")))
+        .unwrap_or_else(|| std::path::PathBuf::from("elevate.exe"));
+    let st = Command::new(&elevate)
+        .args([
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-EncodedCommand",
+            &enc,
+        ])
+        .status()
+        .map_err(|e| format!("提权安装组件失败：{e}"))?;
+    let _ = std::fs::remove_file(&zip);
+    if !st.success() {
+        return Err("组件安装未完成（可能取消了系统授权）。可重试，或到下载页手动安装组件".into());
+    }
+    if installed_assist_path().is_none() {
+        return Err("组件安装后仍未找到 X8Assist.exe，请到下载页手动安装组件".into());
+    }
+    Ok("installed".into())
 }
 
 /// mac：按需下载官方 RustDesk.app 到用户目录缓存（2026-11-11 方案 A）。
@@ -1610,7 +1706,6 @@ fn mac_install_rustdesk() -> Result<String, String> {
     }
     Ok("installed".into())
 }
-
 
 /// Linux：PATH 里是否已有可执行的 rustdesk（与 rustdesk_path() 同判据）。
 /// 注意这是实时扫目录、不是进程启动时的缓存，所以刚装完立刻调用也能发现。
@@ -1994,6 +2089,8 @@ fn linux_self_update_blocking() -> Result<String, String> {
     });
     std::thread::sleep(std::time::Duration::from_millis(500));
     // 前端此时不会收到返回值（进程已退出重启）；成功路径靠「界面重开且版本号变了」验收。
+    // 2026-11-10 P1-3：process::exit 绕过 RunEvent::Exit，必须显式收掉插件。
+    wx_sidecar::stop_all_fast();
     std::process::exit(0);
 }
 
@@ -2049,9 +2146,9 @@ fn assist_exe(_app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
 /// 只有它还不存在（首次、尚未走过 ensure_rustdesk）时才回落资源包。
 #[cfg(not(windows))]
 fn assist_exe(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
-    // mac 2026-11-11 方案 A：优先按需下载的缓存（与 ensure_rustdesk 的 rustdesk_path 同源，
-    // 满足「--password 与启动必须是同一份」），其次才是历史上落位到 /Applications 的那份
-    // （老机器升级上来的），最后回落到安装包内资源（1.6.86 起已无）。
+    // mac 2026-11-11 方案 A：优先按需下载的缓存（与 ensure_rustdesk 的 rustdesk_path
+    // 同源，满足「--password 与启动必须是同一份」），其次才是历史上落位到
+    // /Applications 的那份（老机器升级上来的），最后回落到安装包内资源（1.6.86 起已无）。
     #[cfg(target_os = "macos")]
     if let Some(p) = macos_cached_exe() {
         return Ok(p);
@@ -2333,8 +2430,6 @@ fn hide_assist_windows() {
 /// ⚠️ 仅用于**被控端待控**分支（空 target，拉起后还没会话窗口）。
 /// 控制端（--connect）**不得**调用：局域网打洞快，远程画面会话窗口常在 6s 内弹出即被永久藏死。
 fn hide_assist_windows_retried() {
-    // mac 已于 2026-11-16 停用窗口隐藏（见 hide_assist_windows 注释），不再起该线程。
-    #[cfg(all(unix, not(target_os = "macos")))]
     std::thread::spawn(|| {
         for _ in 0..12 {
             hide_assist_windows();
@@ -2350,7 +2445,6 @@ fn hide_assist_windows_retried() {
 /// 实例被回收（close_rustdesk / assist_idle_reap / 会话结束）后循环自行退出。
 #[cfg(not(windows))]
 fn hide_assist_windows_while_running() {
-    #[cfg(all(unix, not(target_os = "macos")))]
     std::thread::spawn(|| loop {
         if !unix_rustdesk_running() {
             break;
@@ -2392,12 +2486,7 @@ fn assist_has_live_session(pids: &[String]) -> bool {
 /// 改为打开系统浏览器触发真实下载）。
 #[tauri::command]
 async fn open_in_browser(url: String) -> Result<(), String> {
-    // 2026-11-12：除 https 外只放行 macOS 的「系统设置」deeplink（前缀白名单，其余 scheme 一律拒）。
-    // 起因：W消息 读微信向导的「打开系统设置」按钮一直是废的 —— 它传的是
-    // x-apple.systempreferences:...，被这里判成「无效地址」，前端又静默 catch，点了没反应。
-    let allowed = url.starts_with("https://")
-        || url.starts_with("x-apple.systempreferences:");
-    if !allowed {
+    if !url.starts_with("https://") {
         return Err("无效地址".into());
     }
     // 2026-11-07 二次评审 P1-3：open_checked 会等子进程退出码（Linux 三个候选串行最多
@@ -2419,554 +2508,54 @@ const SAFE_OPEN_EXT: &[&str] = &[
 ];
 
 // ==================== 本地落盘 HTTP 服务（2026-11-06） ====================
-// 起因：P2P 收到的 152.9MB 文件在桌面端点「打开/保存」时永远卡在「分块写入中…」。
-// 实测证据：`%USERPROFILE%\Downloads\downfiles` 从未被创建、磁盘上无任何 `.part` 残留，
-// 说明前端 `invoke` 连**几百字节**的 `save_chunk_begin` 都没送达 Rust —— WebView2 的
-// IPC（postMessage 桥）在本机表现就是「发了没回」，Promise 永挂，不是 payload 大小问题。
-//
-// 处置：不再经过 IPC 传二进制。Rust 在 127.0.0.1 起一个极简 HTTP 服务，前端 `XHR` 直接
-// POST Blob（Chromium 把 127.0.0.1 视为可信来源，https 页面请求不触发 mixed-content 拦截），
-// 后端按 Content-Length 流式写盘，内存占用与文件大小无关。
-//
-// 约束：
-//   · 只监听回环，不对外
-//   · 落盘目录仍走 save_target_dir（防穿越），文件名仍走 sanitize_filename
-//   · 只接受 im.x8fde.com / tauri 外壳来源（Origin 校验），空 Origin（本机直连）放行
-const SAVE_HTTP_PORTS: std::ops::Range<u16> = 47615..47625;
+// 2026-11-17 拆分：本地 HTTP 服务实现 → http_local.rs；/x8ipc 命令兜底桥 → bridge.rs。
+// 两者都是 main.rs 的子模块，内部 `use super::*` 拿命令函数，行为与拆分前完全一致。
+mod http_local;
+mod bridge;
+use http_local::*;
 
-/// 启动本地落盘服务（幂等：绑定失败说明端口被占，换下一个；全占则直接放弃，
-/// 前端探测不到会自动退回 IPC / 浏览器下载）。
-fn save_http_start() {
-    std::thread::spawn(|| {
-        let mut bound: Option<std::net::TcpListener> = None;
-        for port in SAVE_HTTP_PORTS {
-            if let Ok(l) = std::net::TcpListener::bind(("127.0.0.1", port)) {
-                bound = Some(l);
-                break;
+// ── 事件补投队列（2026-11-16）──────────────────────────────────────────────
+// Tauri 的 emit 走 WebView 的 IPC 回程 —— 桥一失效，Rust 这边照发不误，前端却永远
+// 收不到（x8mail 新邮件角标不更新、托盘「检查更新」点了没反应都是这个）。
+// HTTP 没有「服务端主动推送」的等价物，所以这里给每条事件编号入环形队列，
+// 前端用 2 秒 HTTP 轮询补取。listen 保留：两条路都在时以轮询为准（seq 去重）。
+mod evq {
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+    use tauri::Emitter;
+
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    static Q: Mutex<VecDeque<(u64, String, serde_json::Value)>> = Mutex::new(VecDeque::new());
+    const KEEP: usize = 128;
+
+    /// 发事件：正常 emit + 入队（补投用）
+    pub fn push(app: &tauri::AppHandle, name: &str, payload: serde_json::Value) {
+        let seq = SEQ.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut q) = Q.lock() {
+            q.push_back((seq, name.to_string(), payload.clone()));
+            while q.len() > KEEP {
+                q.pop_front();
             }
         }
-        let listener = match bound {
-            Some(l) => l,
-            None => return,
-        };
-        for conn in listener.incoming() {
-            if let Ok(stream) = conn {
-                std::thread::spawn(move || {
-                    let _ = save_http_handle(stream);
-                });
-            }
-        }
-    });
-}
-
-/// 查询参数百分号解码（文件名/subdir 用；+ 视为空格）
-fn pct_decode(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(b.len());
-    let mut i = 0usize;
-    while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            let hi = (b[i + 1] as char).to_digit(16);
-            let lo = (b[i + 2] as char).to_digit(16);
-            if let (Some(hi), Some(lo)) = (hi, lo) {
-                out.push((hi * 16 + lo) as u8);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(if b[i] == b'+' { b' ' } else { b[i] });
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).to_string()
-}
-
-fn save_http_cors(origin: &str) -> String {
-    let allow = if origin.contains("im.x8fde.com")
-        || origin.contains("tauri.localhost")
-        || origin.contains("localhost")
-        || origin.is_empty()
-    {
-        if origin.is_empty() { "*".to_string() } else { origin.to_string() }
-    } else {
-        "null".to_string()
-    };
-    format!(
-        "Access-Control-Allow-Origin: {}\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nAccess-Control-Allow-Private-Network: true\r\nAccess-Control-Max-Age: 86400\r\n",
-        allow
-    )
-}
-
-fn save_http_reply(
-    s: &mut std::net::TcpStream,
-    code: u16,
-    cors: &str,
-    body: &str,
-) -> std::io::Result<()> {
-    use std::io::Write;
-    let reason = match code {
-        200 => "OK",
-        204 => "No Content",
-        400 => "Bad Request",
-        403 => "Forbidden",
-        404 => "Not Found",
-        500 => "Internal Server Error",
-        _ => "OK",
-    };
-    let msg = format!(
-        "HTTP/1.1 {} {}\r\n{}Content-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        code,
-        reason,
-        cors,
-        body.as_bytes().len(),
-        body
-    );
-    s.write_all(msg.as_bytes())?;
-    s.flush()
-}
-
-fn save_http_handle(mut s: std::net::TcpStream) -> std::io::Result<()> {
-    use std::io::{Read, Write};
-    s.set_read_timeout(Some(std::time::Duration::from_secs(1800)))?;
-
-    // 1) 读请求头（到 \r\n\r\n 为止），已读到的多余字节属于 body 开头
-    let mut head: Vec<u8> = Vec::with_capacity(4096);
-    let mut tmp = [0u8; 4096];
-    let hdr_end = loop {
-        if let Some(p) = head.windows(4).position(|w| w == b"\r\n\r\n") {
-            break p;
-        }
-        let n = s.read(&mut tmp)?;
-        if n == 0 {
-            return Ok(());
-        }
-        head.extend_from_slice(&tmp[..n]);
-        if head.len() > 256 * 1024 {
-            let cors = save_http_cors("");
-            return save_http_reply(&mut s, 400, &cors, "{\"ok\":false,\"error\":\"head_too_large\"}");
-        }
-    };
-    let head_str = String::from_utf8_lossy(&head[..hdr_end]).to_string();
-    let pre_body = head[hdr_end + 4..].to_vec();
-
-    let mut lines = head_str.split("\r\n");
-    let req_line = lines.next().unwrap_or("").to_string();
-    let rp: Vec<&str> = req_line.split(' ').collect();
-    let method = rp.first().copied().unwrap_or("").to_string();
-    let target = rp.get(1).copied().unwrap_or("/").to_string();
-
-    let mut clen: usize = 0;
-    let mut origin = String::new();
-    for l in lines {
-        let low = l.to_ascii_lowercase();
-        if let Some(v) = low.strip_prefix("content-length:") {
-            clen = v.trim().parse().unwrap_or(0);
-        } else if let Some(v) = low.strip_prefix("origin:") {
-            origin = v.trim().to_string();
-        }
+        let _ = app.emit(name, payload);
     }
 
-    let cors = save_http_cors(&origin);
-    if origin.contains("im.x8fde.com")
-        || origin.contains("tauri.localhost")
-        || origin.contains("localhost")
-        || origin.is_empty()
-    {
-        // 放行
-    } else {
-        return save_http_reply(&mut s, 403, &cors, "{\"ok\":false,\"error\":\"bad_origin\"}");
-    }
-
-    if method == "OPTIONS" {
-        return save_http_reply(&mut s, 204, &cors, "");
-    }
-
-    let (path_only, query) = match target.split_once('?') {
-        Some((p, q)) => (p.to_string(), q.to_string()),
-        None => (target.clone(), String::new()),
-    };
-
-    if path_only == "/ping" {
-        let body = format!("{{\"ok\":true,\"svc\":\"x8save\",\"pid\":{}}}", std::process::id());
-        return save_http_reply(&mut s, 200, &cors, &body);
-    }
-
-    // GET /pick?accept=image/* —— 系统文件选择框（2026-11-06）
-    // 为什么要 Rust 来弹：`<input type="file">` 在 WebView2 下**拿不到绝对路径**，
-    // 发送方就永远没法「定位到源目录」，只能把文件再落一份到 downfiles 里凑合（老8 否掉）。
-    // 这里只回路径，字节由前端再走 /readfile 取；任何失败都返回 ok:false，前端回退旧文件框。
-    if path_only == "/pick" && method == "GET" {
-        #[cfg(windows)]
-        {
-            let mut want_img = false;
-            for kv in query.split('&') {
-                if let Some((k, v)) = kv.split_once('=') {
-                    if k == "accept" && pct_decode(v).starts_with("image") {
-                        want_img = true;
-                    }
-                }
-            }
-            let filter = if want_img {
-                "$d.Filter='图片|*.png;*.jpg;*.jpeg;*.gif;*.webp;*.bmp'"
-            } else {
-                "$d.Filter='所有文件|*.*'"
-            };
-            // 输出一律 base64 单行：PowerShell 5.1 的 stdout 是 OEM 代码页，中文路径直接读会乱码。
-            // 给对话框挂一个不可见的 TopMost 宿主窗口：没有 owner 时对话框可能被邦信主窗口挡住，
-            // 用户就会以为「点了没反应」—— 这也是今天反复踩的同一类坑。
-            let script = format!(
-                "Add-Type -AssemblyName System.Windows.Forms|Out-Null;\
-                 $d=New-Object System.Windows.Forms.OpenFileDialog;\
-                 $d.Multiselect=$true;$d.CheckFileExists=$true;{};\
-                 $d.Title='邦信 - 选择要发送的文件';\
-                 $w=New-Object System.Windows.Forms.Form;\
-                 $w.TopMost=$true;$w.ShowInTaskbar=$false;$w.Opacity=0;$w.Width=1;$w.Height=1;\
-                 $w.StartPosition='CenterScreen';$w.Show()|Out-Null;\
-                 $r=$d.ShowDialog($w);$w.Close();\
-                 if($r -eq 'OK'){{foreach($f in $d.FileNames){{$i=Get-Item $f;\"$([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($f)))|$($i.Length)\"}}}}",
-                filter
-            );
-            let out = Command::new("powershell")
-                .args([
-                    "-NoProfile",
-                    "-STA",
-                    "-NonInteractive",
-                    "-WindowStyle",
-                    "Hidden",
-                    "-Command",
-                    &script,
-                ])
-                .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-                .output();
-            match out {
-                Ok(o) => {
-                    let txt = String::from_utf8_lossy(&o.stdout).to_string();
-                    // 每行：<base64(路径)>|<字节数> —— 带上大小，前端才能对大文件回退旧文件框
-                    //（那条路是磁盘句柄、零拷贝；这条路要把字节读进内存，超大文件会直接吃光内存）
-                    let mut files: Vec<serde_json::Value> = Vec::new();
-                    for line in txt.lines() {
-                        let l = line.trim();
-                        if l.is_empty() {
-                            continue;
-                        }
-                        let (b64, sz) = match l.split_once('|') {
-                            Some((a, b)) => (a, b.trim().parse::<u64>().unwrap_or(0)),
-                            None => (l, 0),
-                        };
-                        if let Ok(bytes) = b64_decode(b64) {
-                            if let Ok(p) = String::from_utf8(bytes) {
-                                files.push(serde_json::json!({ "path": p, "size": sz }));
-                            }
-                        }
-                    }
-                    // rc 一并带回去：PowerShell 被安全策略拦住（Add-Type 被禁）时 rc≠0 且没有输出，
-                    // 前端据此回退旧文件框 —— 否则会被当成「用户点了取消」，表现成「点+没反应」。
-                    let rc = o.status.code().unwrap_or(-1);
-                    let err_txt = String::from_utf8_lossy(&o.stderr).to_string();
-                    let body = serde_json::json!({
-                        "ok": true, "files": files, "rc": rc,
-                        "err": err_txt.chars().take(300).collect::<String>()
-                    })
-                    .to_string();
-                    return save_http_reply(&mut s, 200, &cors, &body);
-                }
-                Err(e) => {
-                    let body = serde_json::json!({ "ok": false, "error": format!("{e}") }).to_string();
-                    return save_http_reply(&mut s, 200, &cors, &body);
+    /// 取 after 之后的事件；调用方拿返回里的 seq 作为下次游标
+    pub fn since(after: u64) -> serde_json::Value {
+        let cur = SEQ.load(Ordering::SeqCst).saturating_sub(1);
+        let mut evs: Vec<serde_json::Value> = Vec::new();
+        if let Ok(q) = Q.lock() {
+            for (s, n, p) in q.iter() {
+                if *s > after {
+                    evs.push(serde_json::json!({ "seq": s, "name": n, "payload": p }));
                 }
             }
         }
-        #[cfg(not(windows))]
-        {
-            return save_http_reply(
-                &mut s,
-                200,
-                &cors,
-                "{\"ok\":false,\"error\":\"pick_unsupported\"}",
-            );
-        }
-    }
-
-    // GET /readfile?path=<绝对路径> —— 原始字节（把原生对话框选中的文件读成 File）
-    // 必须流式转发：2GB 上限的直传件一次性读进内存会直接把客户端打爆。
-    if path_only == "/readfile" && method == "GET" {
-        let mut p = String::new();
-        for kv in query.split('&') {
-            if let Some((k, v)) = kv.split_once('=') {
-                if k == "path" {
-                    p = pct_decode(v);
-                }
-            }
-        }
-        let pb = std::path::PathBuf::from(&p);
-        if !pb.is_file() {
-            return save_http_reply(&mut s, 404, &cors, "{\"ok\":false,\"error\":\"not_found\"}");
-        }
-        let len = std::fs::metadata(&pb).map(|m| m.len()).unwrap_or(0);
-        let mut f = match std::fs::File::open(&pb) {
-            Ok(f) => f,
-            Err(e) => {
-                let body = serde_json::json!({ "ok": false, "error": format!("{e}") }).to_string();
-                return save_http_reply(&mut s, 500, &cors, &body);
-            }
-        };
-        use std::io::Write;
-        let header = format!(
-            "HTTP/1.1 200 OK\r\n{}Content-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            cors, len
-        );
-        if s.write_all(header.as_bytes()).is_err() {
-            return Ok(());
-        }
-        let _ = std::io::copy(&mut f, &mut s);
-        return Ok(());
-    }
-
-    // GET /reveal?name=<文件名>&subdir=<子目录>&open=0|1
-    // 2026-11-06：为什么定位/打开也要走这里 —— 这台机器上 invoke 到 Rust 的 Promise
-    // 会「发了不回」（save_chunk_begin、reveal_file 实测都挂死，前端没有 reject 也没有 resolve），
-    // 而本地 HTTP 通稳定可用。存在则 explorer /select（open=1 则直接用默认程序打开），
-    // 不存在则打开所在目录，绝不让按钮「没反应」。
-    if path_only == "/reveal" && method == "GET" {
-        let mut name = String::new();
-        let mut subdir: Option<String> = None;
-        let mut want_open = false;
-        let mut probe_only = false;
-        let mut abs_path = String::new();
-        for kv in query.split('&') {
-            if let Some((k, v)) = kv.split_once('=') {
-                match k {
-                    "name" => name = pct_decode(v),
-                    // 绝对路径直达（2026-11-06）：发送方定位/打开自己发出的**原始文件**，
-                    // 不经过 downfiles —— 那是接收方的落地目录，发送方没必要存副本。
-                    "path" => abs_path = pct_decode(v),
-                    "subdir" => {
-                        let d = pct_decode(v);
-                        if !d.is_empty() {
-                            subdir = Some(d);
-                        }
-                    }
-                    "open" => want_open = pct_decode(v) == "1",
-                    // probe=1：只查存在性，不做任何 UI 动作（前端据此决定「要不要再存一份」）
-                    "probe" => probe_only = pct_decode(v) == "1",
-                    _ => {}
-                }
-            }
-        }
-        // 绝对路径优先于「downfiles 里按名字找」：发送方传的是他自己的源文件路径
-        if !abs_path.trim().is_empty() {
-            let p = std::path::PathBuf::from(&abs_path);
-            if p.is_file() {
-                let ps = p.to_string_lossy().to_string();
-                if probe_only {
-                    let body = serde_json::json!({
-                        "ok": true, "path": ps, "selected": true, "opened": false
-                    })
-                    .to_string();
-                    return save_http_reply(&mut s, 200, &cors, &body);
-                }
-                let mut opened = false;
-                if want_open {
-                    opened = open_external(&ps).is_ok();
-                }
-                reveal_in_folder(&p);
-                let body = serde_json::json!({
-                    "ok": true, "path": ps, "selected": true, "opened": opened
-                })
-                .to_string();
-                return save_http_reply(&mut s, 200, &cors, &body);
-            }
-            // 源文件已被移动/删除：不假装成功，让前端给人一句话
-            let body = serde_json::json!({
-                "ok": true, "path": "", "selected": false, "opened": false, "gone": true
-            })
-            .to_string();
-            return save_http_reply(&mut s, 200, &cors, &body);
-        }
-
-        let dir = save_target_dir(subdir.as_deref());
-        // 命中同基名（容忍 ` (n)` 递增后缀）即为已有副本，不要求名字逐字节相等
-        let target = if name.trim().is_empty() {
-            None
-        } else {
-            resolve_saved_file(&dir, &sanitize_filename(&name))
-        };
-        let mut selected = false;
-        let mut opened = false;
-        let path_str = match target {
-            Some(p) if p.is_file() => {
-                let ps = p.to_string_lossy().to_string();
-                selected = true;
-                if probe_only {
-                    return save_http_reply(
-                        &mut s,
-                        200,
-                        &cors,
-                        &serde_json::json!({
-                            "ok": true, "path": ps, "selected": true,
-                            "opened": false, "dir": dir.to_string_lossy().to_string()
-                        })
-                        .to_string(),
-                    );
-                }
-                if want_open {
-                    opened = open_external(&ps).is_ok();
-                }
-                #[cfg(windows)]
-                {
-                    // explorer /select, 必须分开传参：合成一个时含空格路径会被整体加引号，
-                    // explorer 解析不到开关（2026-10-22 修过同一处）
-                    let _ = Command::new("explorer")
-                        .arg("/select,")
-                        .arg(ps.replace('/', "\\"))
-                        .spawn();
-                }
-                #[cfg(target_os = "macos")]
-                {
-                    if let Ok(c) = Command::new("open").args(["-R", &ps]).spawn() {
-                        reap_in_background(c);
-                    }
-                }
-                #[cfg(not(any(windows, target_os = "macos")))]
-                {
-                    if let Ok(c) = Command::new("xdg-open")
-                        .arg(p.parent().unwrap_or(std::path::Path::new("/")))
-                        .spawn()
-                    {
-                        reap_in_background(c);
-                    }
-                }
-                ps
-            }
-            _ => {
-                // 只探测：明确告诉前端「不在」，不做任何 UI 动作
-                if probe_only {
-                    return save_http_reply(
-                        &mut s,
-                        200,
-                        &cors,
-                        &serde_json::json!({
-                            "ok": true, "path": "", "selected": false,
-                            "opened": false, "dir": dir.to_string_lossy().to_string()
-                        })
-                        .to_string(),
-                    );
-                }
-                // 文件不在（被移走/删除）：直接把人送到目录，仍然「有反应」
-                if dir.exists() {
-                    let _ = open_external(&dir.to_string_lossy());
-                }
-                String::new()
-            }
-        };
-        let body = serde_json::json!({
-            "ok": true,
-            "path": path_str,
-            "selected": selected,
-            "opened": opened,
-            "dir": dir.to_string_lossy().to_string()
-        })
-        .to_string();
-        return save_http_reply(&mut s, 200, &cors, &body);
-    }
-
-    if path_only != "/save" || method != "POST" {
-        return save_http_reply(&mut s, 404, &cors, "{\"ok\":false,\"error\":\"not_found\"}");
-    }
-
-    // 2) 解析 name / subdir
-    let mut name = String::new();
-    let mut subdir: Option<String> = None;
-    for kv in query.split('&') {
-        if let Some((k, v)) = kv.split_once('=') {
-            match k {
-                "name" => name = pct_decode(v),
-                "subdir" => {
-                    let d = pct_decode(v);
-                    if !d.is_empty() {
-                        subdir = Some(d);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    if name.trim().is_empty() {
-        return save_http_reply(&mut s, 400, &cors, "{\"ok\":false,\"error\":\"no_name\"}");
-    }
-
-    // 3) 流式写 .part → rename（同名自动加序号，绝不覆盖已有文件）
-    let dir = save_target_dir(subdir.as_deref());
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        let body = serde_json::json!({ "ok": false, "error": format!("无法创建目录：{}", e) }).to_string();
-        return save_http_reply(&mut s, 500, &cors, &body);
-    }
-    let safe = sanitize_filename(&name);
-    let tmp = dir.join(format!("{}.{}.x8part", safe, std::process::id()));
-    let mut final_path = dir.join(&safe);
-    if final_path.exists() {
-        let p = std::path::Path::new(&safe);
-        let stem = p.file_stem().map(|x| x.to_string_lossy().to_string()).unwrap_or_else(|| safe.clone());
-        let ext = p.extension().map(|x| format!(".{}", x.to_string_lossy())).unwrap_or_default();
-        let mut n = 1;
-        while n < 999 {
-            let cand = dir.join(format!("{} ({}){}", stem, n, ext));
-            if !cand.exists() {
-                final_path = cand;
-                break;
-            }
-            n += 1;
-        }
-    }
-
-    let write_res = (|| -> std::io::Result<usize> {
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp)?;
-        let mut written = 0usize;
-        // 请求头之后已顺带读到的 body 片段
-        if !pre_body.is_empty() {
-            let take = if clen > 0 { pre_body.len().min(clen) } else { pre_body.len() };
-            f.write_all(&pre_body[..take])?;
-            written += take;
-        }
-        let mut buf = vec![0u8; 256 * 1024];
-        loop {
-            if clen > 0 && written >= clen {
-                break;
-            }
-            let want = if clen > 0 { (clen - written).min(buf.len()) } else { buf.len() };
-            let n = s.read(&mut buf[..want])?;
-            if n == 0 {
-                break;
-            }
-            f.write_all(&buf[..n])?;
-            written += n;
-        }
-        f.flush()?;
-        Ok(written)
-    })();
-
-    match write_res {
-        Ok(written) => {
-            let _ = std::fs::rename(&tmp, &final_path);
-            let body = serde_json::json!({
-                "ok": true,
-                "path": final_path.to_string_lossy().to_string(),
-                "bytes": written
-            })
-            .to_string();
-            save_http_reply(&mut s, 200, &cors, &body)
-        }
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            let body = serde_json::json!({ "ok": false, "error": format!("写入失败：{}", e) }).to_string();
-            save_http_reply(&mut s, 500, &cors, &body)
-        }
+        serde_json::json!({ "seq": cur, "events": evs })
     }
 }
-// ==================== 本地落盘 HTTP 服务 · 结束 ====================
+
 
 /// 下载目录（Windows `%USERPROFILE%\Downloads`；其余 `~/Downloads`）。
 /// 2026-10-23 S2：抽成函数 —— download_file 落盘与 reveal_file 的目录校验必须用同一份定义，
@@ -2985,10 +2574,518 @@ fn downloads_dir() -> std::path::PathBuf {
     }
 }
 
+// ==================== 自动落盘文件保留期（清理 下载/downfiles）· 2026-11-13 ====================
+// 为什么需要：聊天文件「收即落盘」到 `下载/downfiles`，只增不减；图片/视频攒一个月就是几个 GB。
+// 口径（老8 定）：默认保留 10 天、可改、最少 1 天，客户端自动清理（启动 3 分钟后首跑，之后每 6 小时）。
+// 范围硬约束：只清 `下载/downfiles` 的**直接子文件** —— 不递归、不删目录，绝不碰下载目录根
+//（那是用户自己的下载，删了就是事故）。
+const RETENTION_DEFAULT_DAYS: u32 = 10;
+const RETENTION_MIN_DAYS: u32 = 1;
+const RETENTION_MAX_DAYS: u32 = 365;
+
+/// 用户级配置目录：升级/换版都不受影响（Windows %LOCALAPPDATA%\BangXin）。
+fn bangxin_user_dir() -> std::path::PathBuf {
+    if cfg!(windows) {
+        std::path::PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_default()).join("BangXin")
+    } else if cfg!(target_os = "macos") {
+        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+            .join("Library/Application Support/BangXin")
+    } else {
+        let base = std::env::var("XDG_CONFIG_HOME")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| format!("{}/.config", std::env::var("HOME").unwrap_or_default()));
+        std::path::PathBuf::from(base).join("BangXin")
+    }
+}
+
+fn retention_cfg_path() -> std::path::PathBuf {
+    bangxin_user_dir().join("file_retention.json")
+}
+
+fn clamp_days(d: u64) -> u32 {
+    d.clamp(RETENTION_MIN_DAYS as u64, RETENTION_MAX_DAYS as u64) as u32
+}
+
+fn retention_days_load() -> u32 {
+    let raw = std::fs::read_to_string(retention_cfg_path()).unwrap_or_default();
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
+    match v.get("days").and_then(|x| x.as_u64()) {
+        Some(d) => clamp_days(d),
+        None => RETENTION_DEFAULT_DAYS,
+    }
+}
+
+fn retention_days_save(days: u32) -> u32 {
+    let d = clamp_days(days as u64);
+    let dir = bangxin_user_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let body = serde_json::json!({ "days": d }).to_string();
+    let _ = std::fs::write(retention_cfg_path(), body);
+    d
+}
+
+/// 自动落盘目录：`<下载目录>/downfiles`（前端收即落盘传的 subdir，见 save_target_dir）。
+fn auto_saved_dir() -> std::path::PathBuf {
+    downloads_dir().join("downfiles")
+}
+
+/// 扫描 downfiles：`purge_days` 有值时顺带删除超期文件。
+/// 返回 (剩余文件数, 剩余字节, 本次删除数)。任何一步失败都静默跳过，绝不因清理失败影响启动。
+fn scan_auto_saved(purge_days: Option<u32>) -> (usize, u64, usize) {
+    let dir = auto_saved_dir();
+    let cutoff = purge_days.and_then(|d| {
+        std::time::SystemTime::now().checked_sub(std::time::Duration::from_secs(
+            clamp_days(d as u64) as u64 * 86_400,
+        ))
+    });
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return (0, 0, 0);
+    };
+    let (mut count, mut bytes, mut removed) = (0usize, 0u64, 0usize);
+    for e in rd.flatten() {
+        let p = e.path();
+        let Ok(md) = e.metadata() else { continue };
+        if !md.is_file() {
+            continue; // 子目录一律不碰（用户可能自己往里放东西）
+        }
+        count += 1;
+        bytes += md.len();
+        let Some(cut) = cutoff else { continue };
+        if !in_downloads(&p) {
+            continue;
+        }
+        let mt = md.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        if mt < cut && std::fs::remove_file(&p).is_ok() {
+            removed += 1;
+            count -= 1;
+            bytes = bytes.saturating_sub(md.len());
+        }
+    }
+    (count, bytes, removed)
+}
+
+fn retention_state_json(extra: serde_json::Value) -> serde_json::Value {
+    let (count, bytes, _) = scan_auto_saved(None);
+    let mut v = serde_json::json!({
+        "days": retention_days_load(),
+        "min": RETENTION_MIN_DAYS,
+        "max": RETENTION_MAX_DAYS,
+        "count": count,
+        "bytes": bytes,
+        "dir": auto_saved_dir().to_string_lossy(),
+    });
+    if let (Some(o), Some(e)) = (v.as_object_mut(), extra.as_object()) {
+        for (k, val) in e {
+            o.insert(k.clone(), val.clone());
+        }
+    }
+    v
+}
+
+#[tauri::command]
+fn file_retention_get() -> Result<serde_json::Value, String> {
+    Ok(retention_state_json(serde_json::json!({})))
+}
+
+#[tauri::command]
+fn file_retention_set(days: u32) -> Result<serde_json::Value, String> {
+    let d = retention_days_save(days);
+    let (_, _, removed) = scan_auto_saved(Some(d));
+    si_log(&format!("[retention] set {d}d, removed {removed}"));
+    Ok(retention_state_json(serde_json::json!({ "removed": removed })))
+}
+
+#[tauri::command]
+fn file_retention_clean(days: Option<u32>) -> Result<serde_json::Value, String> {
+    let d = match days {
+        Some(x) => retention_days_save(x),
+        None => retention_days_load(),
+    };
+    let (_, _, removed) = scan_auto_saved(Some(d));
+    si_log(&format!("[retention] manual clean keep {d}d, removed {removed}"));
+    Ok(retention_state_json(serde_json::json!({ "removed": removed })))
+}
+
+// ── 开机自启动（2026-11-14 老8）────────────────────────────────────────────
+// 默认开启：首次运行（含从老版本升上来、配置还没有的那一次）自动写系统自启动项；
+// 个人资料 →「启动 → 开机自启动」可关。三端统一，均不需要管理员权限：
+//   Windows  HKCU\Software\Microsoft\Windows\CurrentVersion\Run（值名 BangXin）
+//   macOS    ~/Library/LaunchAgents/com.x8fde.im.autostart.plist（RunAtLoad）
+//   Linux    ~/.config/autostart/bangxin.desktop
+// 配置只记「用户意图」，是否真的开了以系统里的实际项为准（用户可能在任务管理器里禁用）
+// ——故每次启动做一次对齐：意图开但项缺失/指向旧 exe → 补写；意图关但项还在 → 删掉。
+const AUTOSTART_REG_VALUE: &str = "BangXin";
+const AUTOSTART_MAC_LABEL: &str = "com.x8fde.im.autostart";
+
+fn autostart_cfg_path() -> std::path::PathBuf {
+    bangxin_user_dir().join("autostart.json")
+}
+
+/// None = 用户从未表过态（首次安装 / 从没有本功能的老版本升上来）→ 按默认「开」处理。
+fn autostart_intent_load() -> Option<bool> {
+    let raw = std::fs::read_to_string(autostart_cfg_path()).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    v.get("enabled").and_then(|x| x.as_bool())
+}
+
+fn autostart_intent_save(on: bool) {
+    let dir = bangxin_user_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(
+        autostart_cfg_path(),
+        serde_json::json!({ "enabled": on }).to_string(),
+    );
+}
+
+/// 自启动要拉起的可执行文件。
+/// Linux 以 AppImage 运行时 current_exe() 指向临时挂载点（/tmp/.mount_xxx/…，退出即消失），
+/// 必须取 $APPIMAGE 指向的原始文件。
+fn autostart_target_exe() -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(p) = std::env::var("APPIMAGE") {
+            if !p.trim().is_empty() {
+                return Some(std::path::PathBuf::from(p));
+            }
+        }
+    }
+    std::env::current_exe().ok()
+}
+
+#[cfg(windows)]
+mod autostart_sys {
+    // 刻意不引入 winreg / windows-sys 的 Registry feature：实测 winreg 0.56 会拉进
+    // windows-sys 0.61 全量 feature 重编（opt-level=z + codegen-units=1 下一次要 40 分钟以上），
+    // 为一个 Run 键读写付这个编译代价不值。这里直接声明 advapi32 的四个导出，零新增依赖。
+    use super::{autostart_target_exe, AUTOSTART_REG_VALUE};
+    use std::os::windows::ffi::OsStrExt;
+
+    type Hkey = isize;
+    const HKEY_CURRENT_USER: Hkey = 0x8000_0001u32 as i32 as isize;
+    const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+    const KEY_QUERY_VALUE: u32 = 0x0001;
+    const KEY_SET_VALUE: u32 = 0x0002;
+    const REG_SZ: u32 = 1;
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegCreateKeyExW(
+            hkey: Hkey,
+            lpsubkey: *const u16,
+            reserved: u32,
+            lpclass: *const u16,
+            dwoptions: u32,
+            samdesired: u32,
+            lpsecurityattributes: *const core::ffi::c_void,
+            phkresult: *mut Hkey,
+            lpdwdisposition: *mut u32,
+        ) -> i32;
+        fn RegOpenKeyExW(
+            hkey: Hkey,
+            lpsubkey: *const u16,
+            uloptions: u32,
+            samdesired: u32,
+            phkresult: *mut Hkey,
+        ) -> i32;
+        fn RegSetValueExW(
+            hkey: Hkey,
+            lpvaluename: *const u16,
+            reserved: u32,
+            dwtype: u32,
+            lpdata: *const u8,
+            cbdata: u32,
+        ) -> i32;
+        fn RegQueryValueExW(
+            hkey: Hkey,
+            lpvaluename: *const u16,
+            lpreserved: *const u32,
+            lptype: *mut u32,
+            lpdata: *mut u8,
+            lpcbdata: *mut u32,
+        ) -> i32;
+        fn RegDeleteValueW(hkey: Hkey, lpvaluename: *const u16) -> i32;
+        fn RegCloseKey(hkey: Hkey) -> i32;
+    }
+
+    fn wide(s: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    fn read() -> Option<String> {
+        unsafe {
+            let mut hk: Hkey = 0;
+            if RegOpenKeyExW(HKEY_CURRENT_USER, wide(RUN_KEY).as_ptr(), 0, KEY_QUERY_VALUE, &mut hk) != 0 {
+                return None;
+            }
+            let name = wide(AUTOSTART_REG_VALUE);
+            let mut ty: u32 = 0;
+            let mut cb: u32 = 0;
+            let rc = RegQueryValueExW(hk, name.as_ptr(), std::ptr::null(), &mut ty, std::ptr::null_mut(), &mut cb);
+            if rc != 0 || cb == 0 {
+                RegCloseKey(hk);
+                return None;
+            }
+            let mut buf = vec![0u8; cb as usize];
+            let rc = RegQueryValueExW(hk, name.as_ptr(), std::ptr::null(), &mut ty, buf.as_mut_ptr(), &mut cb);
+            RegCloseKey(hk);
+            if rc != 0 {
+                return None;
+            }
+            let units = (cb as usize) / 2;
+            let w = std::slice::from_raw_parts(buf.as_ptr() as *const u16, units);
+            let s = String::from_utf16_lossy(w);
+            Some(s.trim_end_matches('\0').to_string())
+        }
+    }
+
+    pub fn write(exe: &std::path::Path) -> Result<(), String> {
+        unsafe {
+            let mut hk: Hkey = 0;
+            let rc = RegCreateKeyExW(
+                HKEY_CURRENT_USER,
+                wide(RUN_KEY).as_ptr(),
+                0,
+                std::ptr::null(),
+                0,
+                KEY_SET_VALUE,
+                std::ptr::null(),
+                &mut hk,
+                std::ptr::null_mut(),
+            );
+            if rc != 0 {
+                return Err(format!("打开注册表失败（{rc}）"));
+            }
+            // 带空格的路径必须整串加引号，否则登录时会被系统拆成「程序 + 参数」
+            let cmd = wide(&format!("\"{}\"", exe.to_string_lossy()));
+            let rc = RegSetValueExW(
+                hk,
+                wide(AUTOSTART_REG_VALUE).as_ptr(),
+                0,
+                REG_SZ,
+                cmd.as_ptr() as *const u8,
+                (cmd.len() * 2) as u32,
+            );
+            RegCloseKey(hk);
+            if rc != 0 {
+                return Err(format!("写入自启动项失败（{rc}）"));
+            }
+            Ok(())
+        }
+    }
+
+    pub fn remove() -> Result<(), String> {
+        unsafe {
+            let mut hk: Hkey = 0;
+            if RegOpenKeyExW(HKEY_CURRENT_USER, wide(RUN_KEY).as_ptr(), 0, KEY_SET_VALUE, &mut hk) != 0 {
+                return Ok(()); // 根键都没有 = 本来就没项
+            }
+            let rc = RegDeleteValueW(hk, wide(AUTOSTART_REG_VALUE).as_ptr());
+            RegCloseKey(hk);
+            // 2 = ERROR_FILE_NOT_FOUND，本来就没有，视作成功
+            if rc != 0 && rc != 2 {
+                return Err(format!("删除自启动项失败（{rc}）"));
+            }
+            Ok(())
+        }
+    }
+
+    /// 真正启用且指向当前 exe（升级换过安装目录时旧路径要重写）
+    pub fn is_on() -> bool {
+        let want = autostart_target_exe().map(|p| format!("\"{}\"", p.to_string_lossy()));
+        match (read(), want) {
+            (Some(cur), Some(w)) => cur.trim().eq_ignore_ascii_case(w.trim()),
+            _ => false,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod autostart_sys {
+    use super::AUTOSTART_MAC_LABEL;
+
+    fn plist_path() -> std::path::PathBuf {
+        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+            .join("Library/LaunchAgents")
+            .join(format!("{AUTOSTART_MAC_LABEL}.plist"))
+    }
+
+    fn xml_escape(s: &str) -> String {
+        s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    }
+
+    pub fn write(exe: &std::path::Path) -> Result<(), String> {
+        let p = plist_path();
+        if let Some(dir) = p.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        let body = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{label}</string>
+  <key>ProgramArguments</key>
+  <array><string>{exe}</string></array>
+  <key>RunAtLoad</key><true/>
+</dict>
+</plist>
+"#,
+            label = AUTOSTART_MAC_LABEL,
+            exe = xml_escape(&exe.to_string_lossy())
+        );
+        // 登录时系统自己会读 LaunchAgents，这里不需要 launchctl 立即加载
+        std::fs::write(&p, body).map_err(|e| e.to_string())
+    }
+
+    pub fn remove() -> Result<(), String> {
+        match std::fs::remove_file(plist_path()) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    pub fn is_on() -> bool {
+        plist_path().exists()
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod autostart_sys {
+    fn desktop_path() -> std::path::PathBuf {
+        let base = std::env::var("XDG_CONFIG_HOME")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| format!("{}/.config", std::env::var("HOME").unwrap_or_default()));
+        std::path::PathBuf::from(base).join("autostart").join("bangxin.desktop")
+    }
+
+    pub fn write(exe: &std::path::Path) -> Result<(), String> {
+        let p = desktop_path();
+        if let Some(dir) = p.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        let body = format!(
+            "[Desktop Entry]\n\
+             Type=Application\n\
+             Name=邦信\n\
+             Comment=邦信 X8.IM 开机自启动\n\
+             Exec=\"{}\"\n\
+             Terminal=false\n\
+             X-GNOME-Autostart-enabled=true\n\
+             Hidden=false\n",
+            exe.to_string_lossy()
+        );
+        std::fs::write(&p, body).map_err(|e| e.to_string())
+    }
+
+    pub fn remove() -> Result<(), String> {
+        match std::fs::remove_file(desktop_path()) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    pub fn is_on() -> bool {
+        // 以文件内容为准更准，但存在性已足以表达「登录时会被拉起」
+        desktop_path().exists()
+    }
+}
+
+fn autostart_apply(on: bool) -> Result<(), String> {
+    if on {
+        let exe = autostart_target_exe().ok_or_else(|| "取不到程序路径".to_string())?;
+        autostart_sys::write(&exe)
+    } else {
+        autostart_sys::remove()
+    }
+}
+
+/// 启动时对齐一次：默认开 + 自愈（升级换目录后重写指向当前 exe）。
+/// 失败只记日志，绝不阻断启动。
+fn autostart_boot_sync() {
+    let want = match autostart_intent_load() {
+        Some(v) => v,
+        None => {
+            autostart_intent_save(true); // 首次：默认开启
+            true
+        }
+    };
+    if let Err(e) = autostart_apply(want) {
+        si_log(&format!("[autostart] sync failed want={want}: {e}"));
+    }
+}
+
+#[tauri::command]
+fn autostart_get() -> Result<serde_json::Value, String> {
+    Ok(serde_json::json!({
+        "enabled": autostart_sys::is_on(),
+        "intent": autostart_intent_load(),
+        "exe": autostart_target_exe().map(|p| p.to_string_lossy().to_string()),
+        "platform": std::env::consts::OS,
+    }))
+}
+
+#[tauri::command]
+fn autostart_set(on: bool) -> Result<serde_json::Value, String> {
+    autostart_apply(on)?;
+    autostart_intent_save(on);
+    si_log(&format!("[autostart] set {on}"));
+    autostart_get()
+}
+
+/// 后台清理线程：启动 3 分钟后首跑（避开启动高峰），此后每 6 小时一次。
+/// 三端共用（downfiles 位置在 mac/linux 同样成立）。
+fn spawn_retention_cleaner() {
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(180));
+        loop {
+            let d = retention_days_load();
+            let (_, _, removed) = scan_auto_saved(Some(d));
+            if removed > 0 {
+                si_log(&format!("[retention] auto clean keep {d}d, removed {removed}"));
+            }
+            std::thread::sleep(std::time::Duration::from_secs(6 * 3600));
+        }
+    });
+}
+
+/// WX 组件的自主更新（2026-11-16）
+/// 为什么要放在后端：IPC 桥不可靠时，前端「点页签 → 探测 → 准备组件」这条链会整条断掉，
+/// 组件就永远装不上、也永不拉起。更新决策本来也不需要用户参与——版本号比对是纯机械判断。
+/// 所以后端自己来：启动 60s 后查一次（避开启动高峰），之后每 30 分钟一轮；
+/// 有新版就走 wx_updater::prepare 的既有链路（拉清单 → 下载 → 验签 → 落盘 → 拉起），
+/// 断网/验签失败保留旧版，绝不阻断页面。
+fn spawn_wx_autoupdate(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        loop {
+            // 只对本机「装过组件」的机器做后台更新（available = 磁盘上有组件本体）。
+            // 从没用过 W消息 的人没有组件 → 这里什么都不做，不会被凭空拉起一个
+            // 读微信库的进程；用过的人则保持组件常新、点页签即就绪。
+            if crate::wx_sidecar::available() {
+                match crate::wx_updater::prepare(&app, false) {
+                    Ok(v) => {
+                        let ver = v
+                            .get("version")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("?")
+                            .to_string();
+                        crate::ipc_probe::mark(format!("autoupdate ok version={ver}"));
+                    }
+                    Err(e) => crate::ipc_probe::mark(format!("autoupdate err {e}")),
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1800));
+        }
+    });
+}
+
 /// 文件名消毒（2026-10-23 S3）。只收敛「本机不合法 / 会出事」的部分，其余尽量保留原貌
 /// （用户要靠文件名认文件，不做拼音化、不改扩展名大小写）。
-///   · 路径分隔与 Windows 非法字符 → 去掉（否则可跑出下载目录，或建出子路径）
-///   · cmd 元字符（& % ^）→ 去掉：Windows 侧「打开」走 `cmd /C start "" <路径>`，
+///   · 路径分隔与 Windows 非法字符 → 去掉（否则可跑出下载目录，或建出子路径）///   · cmd 元字符（& % ^）→ 去掉：Windows 侧「打开」走 `cmd /C start "" <路径>`，
 ///     文件名含 `&` 会被拆成两条命令（文件名来自服务端，等同一条注入路径），`%VAR%` 会被展开
 ///   · 控制字符 → 去掉（UI/日志/explorer 都会错乱）
 ///   · 结尾的点与空格 → 去掉（Windows 静默吞掉，落盘名与预期不一致，reveal 找不到）
@@ -3593,7 +3690,8 @@ async fn download_file(app: tauri::AppHandle, url: String, token: String, name: 
                 got += n as u64;
                 if last.elapsed().as_millis() >= 200 {
                     last = std::time::Instant::now();
-                    let _ = app2.emit("x8dl", serde_json::json!({ "key": key2, "got": got, "total": total }));
+                    // evq::push = emit + 入队（HTTP 轮询补投用），只发一次
+                    evq::push(&app2, "x8dl", serde_json::json!({ "key": key2, "got": got, "total": total, "done": false }));
                 }
             }
             Ok(())
@@ -3620,7 +3718,7 @@ async fn download_file(app: tauri::AppHandle, url: String, token: String, name: 
         return Err("文件下载失败（未生成文件）".into());
     }
     // 落盘完成：补一条终态事件，前端据此把卡片切成「已保存」并记住路径
-    let _ = app2.emit("x8dl", serde_json::json!({
+    evq::push(&app2, "x8dl", serde_json::json!({
         "key": key2, "got": got, "total": total, "done": true,
         "path": dest.to_string_lossy()
     }));
@@ -3880,6 +3978,140 @@ fn tray_icon_handle() -> Option<(*mut std::ffi::c_void, u32)> {
     Some((ctx.hwnd, 1))
 }
 
+// 🔴🔴 2026-11-17 二改（v1.7.13）：**绝对不要**把托盘图标钉到 NOTIFYICON_VERSION_4。
+//
+// 上午「B1 根治」用 `NIM_SETVERSION` 把图标钉成 v4（想修同事机器「看得见点不动」），方向反了：
+// 钉上 v4 之后，Shell 把 **icon id 塞进回调消息 lParam 的高字**（v3 下 lParam 就是纯鼠标消息），
+// 而 tray-icon 0.25.1 的消息分发是**整字比较**：
+//     `WM_USER_TRAYICON if matches!(lparam as u32, WM_LBUTTONDOWN | ... | WM_LBUTTONUP ...)`
+//     （tray-icon-0.25.1/src/platform_impl/windows/mod.rs:389-402）
+// id=1 时 lParam = 0x0001_0202，永不等于 WM_LBUTTONUP(0x0202) → 落到 `_ => {}` → DefWindowProc。
+// 结果：左键不出事件、右键不弹菜单、Enter/Leave/Move 一并消失，而且**一行日志都不会有**
+// （分发在进 `TrayIconEvent::send` 之前就返回了）。这正是 1.7.11/1.7.12 真机上
+// 「托盘图标点不动、nav.log 全空」的直接原因 —— v4 是这版自己引入的回归。
+//
+// 上游 tray-icon 从不上 SETVERSION，v3 下点击 / 菜单 / GetRect 都是正常路径（全球 tauri 应用默认如此）。
+// 因此：v4 钉死逻辑整体删除；`GetRect` 真失效时由下面的 wndproc 钩子兜底（不依赖矩形）。
+
+/// 托盘窗口收到的回调消息（tray-icon `WM_USER_TRAYICON`，值固定 6002）。
+#[cfg(target_os = "windows")]
+const WM_USER_TRAYICON: u32 = 6002;
+
+/// 被钩子换下来的原始 wndproc（0 = 未挂载）。
+#[cfg(target_os = "windows")]
+static TRAY_HOOK_OLD: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+/// 钩子里回调主窗要用的 AppHandle。
+#[cfg(target_os = "windows")]
+static TRAY_HOOK_APP: std::sync::Mutex<Option<tauri::AppHandle>> = std::sync::Mutex::new(None);
+/// 唤起去重：钩子与 tray-icon 原生事件可能同时触发，600ms 内只认一次。
+#[cfg(target_os = "windows")]
+static TRAY_LAST_OPEN: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// 托盘唤起的唯一入口（去重后调 show_main）。
+fn tray_open_main(app: &tauri::AppHandle) {
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(mut g) = TRAY_LAST_OPEN.lock() {
+            if let Some(t) = *g {
+                if t.elapsed() < std::time::Duration::from_millis(600) {
+                    return;
+                }
+            }
+            *g = Some(std::time::Instant::now());
+        }
+    }
+    show_main(app);
+}
+
+/// 托盘窗口 wndproc 钩子：**不依赖 `Shell_NotifyIconGetRect`** 的点击通道。
+///
+/// 为什么需要：tray-icon 分发的第一步是 `get_tray_rect()`，拿不到矩形就 `return 0`
+/// （windows/mod.rs:412-415）—— 图标在溢出面板 / 句柄刚重注册 / explorer 刚重启时都可能拿不到，
+/// 于是「点了完全静默」。这里在 tray-icon 之前先看一眼原始 lParam，能认就直接唤起主窗，
+/// 再把消息原样交给它（原生路径可用时照样弹右键菜单，靠 600ms 去重不会重复唤起）。
+///
+/// lParam 解析：v4 下低字=鼠标消息、高字=icon id；v3 下 lParam 就是鼠标消息（高字 0）。
+/// 统一按低字判定，两种版本都能用。
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn tray_hook_proc(
+    hwnd: *mut std::ffi::c_void,
+    msg: u32,
+    wparam: usize,
+    lparam: isize,
+) -> isize {
+    use std::sync::atomic::Ordering;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CallWindowProcW, DefWindowProcW, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE,
+        WM_RBUTTONUP,
+    };
+
+    // NIN_SELECT / NIN_KEYSELECT（v4 的键盘/辅助激活），值 = WM_USER + 0 / + 1
+    const NIN_SELECT: u32 = 0x0400;
+    const NIN_KEYSELECT: u32 = 0x0401;
+
+    if msg == WM_USER_TRAYICON {
+        let raw = lparam as u32;
+        let lo = raw & 0xFFFF;
+        let hi = raw >> 16;
+        // Move 在图标上滑一下就发，一次几十条会把 nav.log 冲爆 → 不记
+        if lo != WM_MOUSEMOVE {
+            nav_write(&format!("tray raw: lo={lo:#06x} hi={hi} wp={wparam:#x}"));
+        }
+        let open = lo == WM_LBUTTONUP || lo == WM_LBUTTONDBLCLK || lo == NIN_SELECT || lo == NIN_KEYSELECT;
+        if open {
+            let app = TRAY_HOOK_APP.lock().ok().and_then(|g| g.clone());
+            if let Some(app) = app {
+                tray_open_main(&app);
+                nav_write("tray raw: 左键 → 唤起主窗（钩子通道生效）");
+            }
+        } else if lo == WM_RBUTTONUP {
+            // 菜单仍由 tray-icon 原生路径弹（它依赖 GetRect）；这里只留证据，
+            // 下次再报「右键没菜单」能一眼分清是没收到还是弹不出来。
+            nav_write("tray raw: 右键到达（菜单走 tray-icon 原生路径）");
+        }
+    }
+
+    let old = TRAY_HOOK_OLD.load(Ordering::SeqCst);
+    if old != 0 {
+        let f: unsafe extern "system" fn(*mut std::ffi::c_void, u32, usize, isize) -> isize =
+            std::mem::transmute(old);
+        CallWindowProcW(Some(f), hwnd, msg, wparam, lparam)
+    } else {
+        DefWindowProcW(hwnd, msg, wparam, lparam)
+    }
+}
+
+/// 把上面的钩子挂到 `tray_icon_app` 窗口（幂等；窗口还没建好时后台重试约 3s）。
+#[cfg(target_os = "windows")]
+fn tray_hook_install(app: tauri::AppHandle) {
+    use std::sync::atomic::Ordering;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowLongPtrW, GWLP_WNDPROC};
+
+    if let Ok(mut g) = TRAY_HOOK_APP.lock() {
+        *g = Some(app);
+    }
+    std::thread::spawn(move || {
+        for _ in 0..30 {
+            if TRAY_HOOK_OLD.load(Ordering::SeqCst) != 0 {
+                return;
+            }
+            if let Some((hwnd, _uid)) = tray_icon_handle() {
+                let hook: unsafe extern "system" fn(*mut std::ffi::c_void, u32, usize, isize) -> isize =
+                    tray_hook_proc;
+                let old =
+                    unsafe { SetWindowLongPtrW(hwnd, GWLP_WNDPROC, hook as usize as isize) };
+                if old != 0 {
+                    TRAY_HOOK_OLD.store(old, Ordering::SeqCst);
+                    nav_write("tray hook: 已挂到 tray_icon_app（点击不再依赖 GetRect）");
+                    return;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        nav_write("tray hook: 挂载失败（始终没拿到 tray_icon_app 窗口）");
+    });
+}
+
 /// Windows 托盘气泡提示（2026-10-19 老8 诉求：托盘图标要有气泡，才有提醒作用）。
 ///
 /// 不走 tauri-plugin-notification 的原因：那条路是 WinRT toast，依赖开始菜单快捷方式注册的
@@ -3891,8 +4123,7 @@ fn tray_icon_handle() -> Option<(*mut std::ffi::c_void, u32)> {
 #[cfg(target_os = "windows")]
 fn win_tray_balloon(title: &str, body: &str) {
     use windows_sys::Win32::UI::Shell::{
-        Shell_NotifyIconW, NIF_INFO, NIIF_INFO, NIM_MODIFY, NIM_SETVERSION, NOTIFYICONDATAW,
-        NOTIFYICON_VERSION_4,
+        Shell_NotifyIconW, NIF_INFO, NIIF_INFO, NIM_MODIFY, NOTIFYICONDATAW,
     };
 
     let Some((hwnd, uid)) = tray_icon_handle() else {
@@ -3906,19 +4137,7 @@ fn win_tray_balloon(title: &str, body: &str) {
     }
 
     unsafe {
-        // 关键修复（2026-10-22 排查「托盘闪烁正常、气泡永不弹出」）：
-        // tray-icon 0.25.1 注册图标时从不调用 NIM_SETVERSION，通知图标停留在默认版本（v3）。
-        // Windows 要求图标处于 NOTIFYICON_VERSION_4 才会渲染 NIF_INFO 气球——否则
-        // Shell_NotifyIconW(NIM_MODIFY, NIF_INFO) 返回 SUCCESS 却静默丢弃，无报错、图标照常。
-        // 每次发气泡前把版本钉到 4（幂等）：既修当前问题，也顺带覆盖「资源管理器重启→图标被
-        // 重建→版本被打回默认」后气泡再次失效的场景（无需监听 TaskbarCreated）。
-        let mut v: NOTIFYICONDATAW = std::mem::zeroed();
-        v.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-        v.hWnd = hwnd;
-        v.uID = uid;
-        v.Anonymous.uVersion = NOTIFYICON_VERSION_4;
-        let _ = Shell_NotifyIconW(NIM_SETVERSION, &v);
-
+        // ⚠️ 不要在这里 SETVERSION v4（见 tray_hook 上方长注释：v4 会让 tray-icon 分发整字比较失败）
         let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
         nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
         nid.hWnd = hwnd;
@@ -3948,8 +4167,16 @@ fn win_tray_balloon(title: &str, body: &str) {
 static TRAY_FLASH_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static TRAY_FLASH_UNREAD: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
-/// 闪烁半周期（毫秒）。500ms = 每秒切两次，QQ/微信同级速率：明显但不躁。
-const TRAY_FLASH_INTERVAL_MS: u64 = 500;
+/// 闪烁半周期（毫秒）。
+/// 2026-11-17 由 500 改 900：每次「换图标」= 新建一个 HICON + Shell_NotifyIcon(NIM_MODIFY)
+/// + 立刻 DestroyIcon 旧的，500ms 一次对通知区太密（见 start_tray_heal 头的失效说明）。
+/// 900ms 仍是每秒一次以上的明暗变化，肉眼照样抓得住，写入次数少四成。
+const TRAY_FLASH_INTERVAL_MS: u64 = 900;
+
+/// 闪烁总时长上限（tick 数，≈ 900ms × 24 ≈ 21 秒）。
+/// 闪够就停在亮态：老8 要的是「进来消息时抓一下眼」，不是永久躁动；
+/// 长时间高频写托盘还是把图标句柄写坏的主嫌疑，限次从源头收窄。
+const TRAY_FLASH_MAX_TICKS: u32 = 24;
 
 /// 暗态亮度系数（微信式「一暗一亮」的暗侧）。0.35 实测足够看出呼吸感，
 /// 又不会暗到像「图标被禁用/掉线」——托盘区白天在浅色任务栏上也看得清。
@@ -3963,6 +4190,14 @@ const TRAY_FLASH_DIM: f32 = 0.4;
 /// 与微信一致；数字交给右下角浮窗和 tooltip，不在托盘这张小图上挤。
 fn start_tray_flash(app: tauri::AppHandle, count: i64) {
     use std::sync::atomic::Ordering;
+    // 2026-11-17 诊断：留一行「开闪那一刻图标句柄是否还活着」。配合 start_tray_heal 的
+    // "tray heal: 图标句柄失效" 行，下次真机再哑掉能直接判定是闪烁写坏还是别的原因。
+    if count > 0 {
+        nav_write(&format!(
+            "tray flash start n={count} alive={}",
+            tray_rect_alive(&app)
+        ));
+    }
     TRAY_FLASH_UNREAD.store(count.max(0), Ordering::SeqCst);
     let my_gen = TRAY_FLASH_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     std::thread::spawn(move || {
@@ -4016,6 +4251,14 @@ fn start_tray_flash(app: tauri::AppHandle, count: i64) {
                 }
                 return;
             }
+            // ④ 闪够时长（≈21s）：落回默认 logo 收工，不再高频写托盘。
+            // 未读数不会丢——tooltip / 右下角浮窗照旧，用户点开窗口即清。
+            if tick > TRAY_FLASH_MAX_TICKS {
+                if let Some(tray) = app.tray_by_id("x8im-tray") {
+                    let _ = tray.set_icon(def_icon.clone());
+                }
+                return;
+            }
             // 未读数变了才重建图标：32x32 逐像素压暗很便宜，但没必要每 500ms 重算
             if n != cached_n {
                 // 亮态固定用默认 logo（老8：不用红点角标，原图标一暗一亮即好）
@@ -4047,6 +4290,178 @@ fn stop_tray_flash() {
     TRAY_FLASH_GEN.fetch_add(1, Ordering::SeqCst); // 在跑的循环下一 tick 发现世代过期即退出
 }
 
+// ─────────────────────── 托盘图标自愈（2026-11-17） ───────────────────────
+//
+// 现象（老8 真机报）：图标明明在闪，左键点不开、右键菜单也不弹。
+// 根因链：tray-icon 0.25.1 的消息分发第一步是 `Shell_NotifyIconGetRect(hwnd, uID)`，
+//   拿不到矩形就 `return 0`（mod.rs:412）——**连菜单都不会弹**。所以「看得见、点不动」
+//   说明通知区里那个图标句柄已经失效，屏幕上的只是残影。重启程序即恢复 → 是运行期被写坏的。
+// 头号嫌疑：闪烁每次换图都是「新建 HICON → NIM_MODIFY → 立刻 DestroyIcon 旧的」，
+//   高频下和 explorer 的通知区更新抢跑（已把闪烁降到 900ms/最长 21s 收窄概率）。
+// 兜底：常驻自愈线程——连续 3 次（每 20s 一次）拿不到图标矩形，就 NIM_DELETE + NIM_ADD
+//   重新注册一遍再还原图标/提示。修不了概率，但保证「哑掉最多 1 分钟、自己活回来」。
+fn tray_rect_alive(app: &tauri::AppHandle) -> bool {
+    match app.tray_by_id("x8im-tray") {
+        Some(t) => matches!(t.rect(), Ok(Some(_))),
+        None => false,
+    }
+}
+
+/// 把托盘图标钉到 `NOTIFYICON_VERSION_3`（**消息格式与默认一致**：wParam=uID、lParam=纯鼠标消息）。
+///
+/// 为什么必须显式钉这一下：1.7.11/1.7.12 曾把记录钉成 v4（图标记录里的 version 是**持久属性**，
+/// NIM_MODIFY 改不动，只有 NIM_SETVERSION 能改）。老机器上那条 v4 记录会跨版本残留在 explorer 里，
+/// 于是即便新版本不再钉 v4，Shell 仍按 v4 发包（lParam 高字=icon id）→ tray-icon 整字比较继续失败。
+/// 显式改回 3，等于把「记录属性」修回来，比删建图标副作用小（不会让图标在通知区里跳位置）。
+#[cfg(target_os = "windows")]
+fn tray_set_version_3() {
+    use windows_sys::Win32::UI::Shell::{Shell_NotifyIconW, NIM_SETVERSION, NOTIFYICONDATAW};
+
+    let Some((hwnd, uid)) = tray_icon_handle() else {
+        return;
+    };
+    unsafe {
+        let mut v: NOTIFYICONDATAW = std::mem::zeroed();
+        v.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        v.hWnd = hwnd;
+        v.uID = uid;
+        v.Anonymous.uVersion = 3; // NOTIFYICON_VERSION_3
+        let _ = Shell_NotifyIconW(NIM_SETVERSION, &v);
+    }
+}
+
+/// 直接给图标写提示文字（`NIF_TIP`）。
+///
+/// 🔴 2026-11-17 现场实测（1.7.12）：图标注册时 `szTip` 是空的 —— 鼠标移上去 explorer 根本
+/// 不生成 tooltip 窗口（对照组别的程序一悬停就出）。tray-icon 的 `attrs.tooltip` 这条链在
+/// 真机上不可靠，所以这里绕过它，用 Shell_NotifyIcon 硬写一遍，幂等。
+#[cfg(target_os = "windows")]
+fn tray_write_tip(text: &str) {
+    use windows_sys::Win32::UI::Shell::{
+        Shell_NotifyIconW, NIF_TIP, NIM_MODIFY, NOTIFYICONDATAW,
+    };
+
+    let Some((hwnd, uid)) = tray_icon_handle() else {
+        return;
+    };
+    let mut nid: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
+    nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+    nid.hWnd = hwnd;
+    nid.uID = uid;
+    nid.uFlags = NIF_TIP;
+    let v: Vec<u16> = text.encode_utf16().take(127).collect();
+    nid.szTip[..v.len()].copy_from_slice(&v);
+    unsafe {
+        let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+    }
+}
+
+/// 启动收口：把图标记录的版本修回 v3、补写提示文字，并自检「到底注册上没有」。
+///
+/// 自检判据：`NIM_MODIFY + NIF_STATE + dwStateMask=0` 是空操作，返回 TRUE 只可能因为该
+/// (hWnd, uID) 的图标真实存在。返回 FALSE 的典型原因是 `NIM_ADD` 当年就失败了
+/// （explorer 未就绪 / 同 id 被旧实例占着）——屏幕上那个图标其实是**残留幽灵**。
+#[cfg(target_os = "windows")]
+fn tray_fixup(app: &tauri::AppHandle) {
+    use windows_sys::Win32::UI::Shell::{Shell_NotifyIconW, NIF_STATE, NIM_MODIFY, NOTIFYICONDATAW};
+
+    let Some((hwnd, uid)) = tray_icon_handle() else {
+        nav_write("tray check: 找不到 tray_icon_app 窗口（托盘根本没建出来？）");
+        return;
+    };
+    // ① 版本修回 v3（v4 记录会跨版本残留，不修则点击永远静默）
+    tray_set_version_3();
+    // ② 提示文字硬写（真机上 tray-icon 的 tooltip 没写进 szTip）
+    tray_write_tip("邦信即时通讯");
+
+    let mut nid: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
+    nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+    nid.hWnd = hwnd;
+    nid.uID = uid;
+    nid.uFlags = NIF_STATE;
+    nid.dwState = 0;
+    nid.dwStateMask = 0;
+    let registered = unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid) } != 0;
+    let rect_ok = tray_rect_alive(app);
+    nav_write(&format!(
+        "tray check: uid={uid} registered={registered} rect_ok={rect_ok} ver=3+tip"
+    ));
+    if !registered {
+        nav_write("tray check: 通知区里没有我们的图标（屏幕上的多半是残留幽灵）→ 重注册一次");
+        let _ = tray_revive(app);
+        nav_write(&format!(
+            "tray check: 重注册后 rect_ok={}",
+            tray_rect_alive(app)
+        ));
+    }
+}
+
+/// 就地重注册托盘图标（NIM_DELETE + NIM_ADD + 还原图标/提示），返回重注册后是否可点。
+/// 自愈线程与「点 X 时托盘不可用」两条路径共用，动作完全一致。
+///
+/// ⚠️ `Shell_NotifyIconGetRect` 拿不到矩形有两种原因，**API 不区分**（tray-icon 只看 S_OK，
+///    其余一律当 None，见 get_tray_rect）：①句柄真失效（残影）②图标被折进「隐藏的图标」
+///    溢出面板。所以调用方必须能容忍「重注册后仍拿不到」——那多半是②，不是坏了。
+fn tray_revive(app: &tauri::AppHandle) -> bool {
+    if let Some(tray) = app.tray_by_id("x8im-tray") {
+        let _ = tray.set_visible(false);
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        let _ = tray.set_visible(true);
+        let _ = tray.set_icon(Some(tray_icon_image()));
+        let _ = tray.set_tooltip(Some("邦信即时通讯"));
+    }
+    // 重注册后记录回到默认版本，但**v4 残留**要显式改回 3（见 tray_set_version_3）；
+    // 同时硬写一遍提示文字（tray-icon 的 tooltip 在真机上没落进 szTip）。
+    #[cfg(target_os = "windows")]
+    {
+        tray_set_version_3();
+        tray_write_tip("邦信即时通讯");
+    }
+    // 通知区落位要一点时间：隔 50ms 问一次，最多 6 次（≈300ms）
+    for _ in 0..6 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        if tray_rect_alive(app) {
+            return true;
+        }
+    }
+    false
+}
+
+/// 托盘自愈线程（2026-11-17 B：提速到约 10s 一轮）。
+///
+/// 旧版 20s × 3 次才动手（最长 1 分钟不响）；现在 5s × 2 次，真失效 ≈10s 内复活。
+/// 因为上面那条「API 不区分溢出区」的限制，重注册后仍拿不到的，按 10s→20s→40s→60s
+/// 退避（封顶 60s 一次），避免把「图标在溢出面板」误判成坏掉而每 10s 折腾一次通知区。
+fn start_tray_heal(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        let mut bad: u32 = 0;
+        let mut wait: u64 = 5;
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(wait));
+            if tray_rect_alive(&app) {
+                bad = 0;
+                wait = 5;
+                continue;
+            }
+            bad += 1;
+            if bad < 2 {
+                continue;
+            }
+            bad = 0;
+            if app.tray_by_id("x8im-tray").is_none() {
+                continue;
+            }
+            if tray_revive(&app) {
+                wait = 5;
+                nav_write("tray heal: 图标句柄失效，已重新注册");
+            } else {
+                wait = (wait * 2).min(60);
+                nav_write(&format!("tray heal: 重注册后仍拿不到矩形，退避到 {wait}s"));
+            }
+        }
+    });
+}
+
 // ─────────────────────── 右下角卡通 FDE 浮动提醒（2026-10-22） ───────────────────────
 //
 // 老8 诉求：像微信收到消息时那样，屏幕右下角浮出一个卡通头像小窗提示，不用非得盯着托盘。
@@ -4058,13 +4473,126 @@ fn stop_tray_flash() {
 // 内容走线上页 https://im.x8fde.com/app/fde-float.html —— 跟主窗同一套架构：
 // 改浮窗样式只发 web，不用重新发客户端。
 
-/// 浮窗尺寸（逻辑像素）：正好装下 84px 圆形头像 + 8px 间距 + 21px 文案胶囊。
-const FDE_FLOAT_W: f64 = 132.0;
-const FDE_FLOAT_H: f64 = 148.0;
-/// 自动收起延时：页面内 8s 开始淡出，这里再多留 1.2s 兜住淡出动画。
+/// 浮窗尺寸（逻辑像素）：2026-11-16 升级为「AI邦」精灵 —— 96px 精灵 + 气泡两行。
+const FDE_FLOAT_W: f64 = 148.0;
+const FDE_FLOAT_H: f64 = 196.0;
+/// 🔴 必须与 tauri.conf.json 主窗 `additionalBrowserArgs` **逐字一致**。
+/// WebView2 同一进程只接受一套 Environment 参数：第二次 `CreateCoreWebView2EnvironmentWithOptions`
+/// 若 args 不同，直接返回 ERROR_INVALID_STATE(0x8007139F)「组或资源的状态不是执行请求操作的正确状态」。
+/// 2026-11-17 真机定位：AI邦 浮窗在**任何**机器上都建不出来（历史版本同样，只是当时失败被静默吞掉），
+/// 主窗能建、第二窗必挂，就是因为代码创建时漏了这个参数。改主窗参数时这里要一起改。
+const X8_WEBVIEW_ARGS: &str = "--disable-background-networking --disable-component-update --no-first-run --disable-safebrowsing --disable-features=msEdgeComponentUpdates,msEdgeShoppingAssistant,EdgeReadingList";
+/// 自动收起延时：**只对「无未读的临时提示」生效**（升级提示等）。
+/// 有未读（count>0）时改为常驻屏上，直到未读清零 / 用户手动收起 ——
+/// 2026-11-16 专家评审 P0：9.2s 自动消失是「提示不明显」的根因之一，人离开两分钟就完全错过。
 const FDE_FLOAT_AUTO_HIDE_MS: u64 = 9_200;
 /// 浮窗世代号：每次显示 +1，上一轮的自动隐藏计时发现自己过期就放弃（同 TRAY_FLASH_GEN 套路）。
 static FDE_FLOAT_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 精灵「钉住」：托盘「召唤 AI邦」置 true —— 出来后**永不自动收**，
+/// 只有用户手工关（点精灵唤起主窗 / 页面 ✕ / 右键收起）才失效。
+/// 老8 2026-11-17 明确：召唤出来的 AI邦 不要自己消失，一直挂着，想关我再关。
+static PET_PIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+// ─────────────────────── AI邦 精灵配置（2026-11-16）───────────────────────
+//
+// 落盘 %LOCALAPPDATA%\BangXin\pet.json（与 file_retention.json 同目录，升级不受影响）：
+//   { "x": 1720, "y": 700,      // 用户拖过的落点（逻辑像素），换屏/拔屏后自动作废
+//     "muted": false,           // 免打扰：只停提示音，视觉提醒照旧
+//     "enabled": true }         // 总开关：false = 完全回到 2026-10-22 的旧浮窗行为
+//
+// 老8 2026-11-16 的诉求是「提示更明显」，所以这里的原则是：
+// 精灵只叠加在既有 6 层提醒之上，**不改 notify_unread 语义**；出问题关 enabled 即回滚。
+
+fn pet_cfg_path() -> std::path::PathBuf {
+    bangxin_user_dir().join("pet.json")
+}
+
+fn pet_cfg_load() -> serde_json::Value {
+    let raw = std::fs::read_to_string(pet_cfg_path()).unwrap_or_default();
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
+    if v.is_object() {
+        v
+    } else {
+        serde_json::json!({})
+    }
+}
+
+fn pet_cfg_save(v: &serde_json::Value) {
+    let dir = bangxin_user_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(pet_cfg_path(), v.to_string());
+}
+
+fn pet_flag(key: &str, def: bool) -> bool {
+    pet_cfg_load()
+        .get(key)
+        .and_then(|x| x.as_bool())
+        .unwrap_or(def)
+}
+
+fn pet_enabled() -> bool {
+    pet_flag("enabled", true)
+}
+
+fn pet_muted() -> bool {
+    pet_flag("muted", false)
+}
+
+fn pet_saved_pos() -> Option<(f64, f64)> {
+    let v = pet_cfg_load();
+    let x = v.get("x").and_then(|x| x.as_f64())?;
+    let y = v.get("y").and_then(|x| x.as_f64())?;
+    Some((x, y))
+}
+
+fn pet_save_pos(x: f64, y: f64) {
+    let mut v = pet_cfg_load();
+    v["x"] = serde_json::json!(x.round() as i64);
+    v["y"] = serde_json::json!(y.round() as i64);
+    pet_cfg_save(&v);
+}
+
+/// 新消息提示音（Windows：PlaySoundW 播系统通知音，零资源文件、零新增依赖）。
+/// 免打扰（pet.json: muted）时静默；mac/linux 暂不播（后续接 afplay / paplay）。
+#[cfg(target_os = "windows")]
+fn pet_sound() {
+    use windows_sys::Win32::Media::Audio::{PlaySoundW, SND_ALIAS, SND_ASYNC, SND_NODEFAULT};
+    let alias: Vec<u16> = "SystemNotification\0".encode_utf16().collect();
+    unsafe {
+        let _ = PlaySoundW(
+            alias.as_ptr(),
+            std::mem::zeroed(),
+            SND_ALIAS | SND_ASYNC | SND_NODEFAULT,
+        );
+    }
+}
+#[cfg(not(target_os = "windows"))]
+fn pet_sound() {}
+
+/// 指定屏幕坐标所在的**工作区**（已扣掉任务栏）。多显示器全靠它：
+/// MONITOR_DEFAULTTONEAREST 保证坐标落到最近那块屏，永不返回空。
+#[cfg(target_os = "windows")]
+fn work_area_at(px: i32, py: i32) -> Option<(i32, i32, i32, i32)> {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+    unsafe {
+        let pt = POINT { x: px, y: py };
+        let h = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+        let mut mi: MONITORINFO = std::mem::zeroed();
+        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(h, &mut mi) == 0 {
+            return None;
+        }
+        Some((
+            mi.rcWork.left,
+            mi.rcWork.top,
+            mi.rcWork.right,
+            mi.rcWork.bottom,
+        ))
+    }
+}
 
 /// 主屏工作区（物理像素 left/top/right/bottom）。
 /// 不用 monitor.size()：那块含任务栏，浮窗会被任务栏压掉半个。
@@ -4081,33 +4609,62 @@ fn primary_work_area() -> Option<(i32, i32, i32, i32)> {
     }
 }
 
-/// 浮窗落点：主屏工作区右下角，距右 16、距底 8 逻辑像素。
+/// 精灵落点（2026-11-16 重写）：
+///   ① 用户拖过的位置优先（pet.json），但落点必须仍在某块屏的工作区内，否则作废回落
+///   ② 回落位置 = **主窗所在那块屏**的工作区右下角（距右 16 / 距底 8 逻辑像素）
+/// 旧实现死钉 primary_monitor，双屏用户主窗在副屏时精灵会跑到另一块屏上。
 fn fde_float_pos(app: &tauri::AppHandle) -> (f64, f64) {
-    let sf = app
-        .primary_monitor()
-        .ok()
-        .flatten()
-        .map(|m| m.scale_factor())
-        .unwrap_or(1.0);
+    // 主窗所在屏优先；拿不到再退回主屏
+    let mon = app
+        .get_webview_window("main")
+        .and_then(|w| w.current_monitor().ok().flatten())
+        .or_else(|| app.primary_monitor().ok().flatten());
+    let mut sf = 1.0_f64;
+    let mut mpx = 0_i32;
+    let mut mpy = 0_i32;
+    let mut mw = 1920_u32;
+    let mut mh = 1080_u32;
+    if let Some(m) = mon {
+        sf = m.scale_factor();
+        let p = m.position();
+        let s = m.size();
+        mpx = p.x;
+        mpy = p.y;
+        mw = s.width;
+        mh = s.height;
+    }
+
+    if let Some((sx, sy)) = pet_saved_pos() {
+        #[cfg(target_os = "windows")]
+        {
+            // 换算成物理像素问一句「这个点还在某块屏的工作区里吗」
+            let cx = ((sx + FDE_FLOAT_W / 2.0) * sf) as i32;
+            let cy = ((sy + FDE_FLOAT_H / 2.0) * sf) as i32;
+            if work_area_at(cx, cy).is_some() && sx > -FDE_FLOAT_W && sy > -FDE_FLOAT_H {
+                return (sx, sy);
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            return (sx, sy);
+        }
+    }
+
     #[cfg(target_os = "windows")]
     {
-        if let Some((l, t, r, b)) = primary_work_area() {
+        let cx = mpx + mw as i32 / 2;
+        let cy = mpy + mh as i32 / 2;
+        if let Some((l, t, r, b)) = work_area_at(cx, cy) {
             let w = (r - l) as f64 / sf;
             let h = (b - t) as f64 / sf;
             return (w - FDE_FLOAT_W - 16.0, h - FDE_FLOAT_H - 8.0);
         }
     }
     // 非 Windows / 取不到工作区：退回显示器整块，额外让出 56px 当任务栏
-    if let Ok(Some(m)) = app.primary_monitor() {
-        let sf = m.scale_factor();
-        let s = m.size();
-        let p = m.position();
-        return (
-            (p.x as f64 + s.width as f64) / sf - FDE_FLOAT_W - 16.0,
-            (p.y as f64 + s.height as f64) / sf - FDE_FLOAT_H - 8.0 - 56.0,
-        );
-    }
-    (0.0, 0.0)
+    (
+        (mpx as f64 + mw as f64) / sf - FDE_FLOAT_W - 16.0,
+        (mpy as f64 + mh as f64) / sf - FDE_FLOAT_H - 8.0 - 56.0,
+    )
 }
 
 /// 百分号编码（只用于把中文提示塞进 URL query）
@@ -4140,83 +4697,194 @@ fn js_str(s: &str) -> String {
 }
 
 /// 关闭浮窗（若在显示）并作废自动隐藏计时。
+///
+/// 🔴 2026-11-17 老8：召唤出来的 AI邦 不要自动消失，一直挂着、要关再手工关。
+/// 所以「钉住」期间（托盘召唤后）这里直接不干活 —— 未读清零、主窗回前台、
+/// 自动收起计时全都不生效；只有点精灵 / 页面 ✕ 这两条手工路径会先清钉再收。
 fn fde_float_close(app: &tauri::AppHandle) {
     use std::sync::atomic::Ordering;
+    if PET_PIN.load(Ordering::SeqCst) {
+        return;
+    }
     FDE_FLOAT_GEN.fetch_add(1, Ordering::SeqCst);
     if let Some(w) = app.get_webview_window("fde-float") {
         let _ = w.hide();
     }
 }
 
-/// 显示/刷新浮窗。count=0 时只显示头像不显示角标（消息落在已打开会话里，未读数没涨）。
-fn fde_float_show_impl(app: &tauri::AppHandle, count: i64, tip: &str) {
+/// 显示/刷新精灵窗。count=0 时只显示精灵不显示角标（消息落在已打开会话里，未读数没涨）。
+///
+/// 2026-11-16 AI邦：
+///   · pet.json 里 enabled=false → 整层不出现（回滚旧行为的唯一开关）
+///   · count>0 → **常驻**，不再挂自动收起计时；由 notify_unread(0) / pet_close 收
+///   · count=0 → 临时提示（升级通知等），保留 9.2s 自动收起
+///   · 有新未读且未静音时播一声系统通知音（silent=true 时不响：登录自动问候用）
+fn fde_float_show_impl(app: &tauri::AppHandle, count: i64, tip: &str, silent: bool) {
+    fde_float_show_ex(app, count, tip, silent, false);
+}
+
+/// force = true 时忽略 pet.json 的 enabled 总开关。
+/// 只给托盘「召唤 AI邦」用：用户关掉精灵是「别拿新消息打扰我」，不代表不许手动叫出来。
+/// 建 AI邦 浮窗：三级降级 + 失败留痕（2026-11-17）。
+///
+/// 起因：老8 新电脑点「AI邦形象 → 卡通精灵」毫无反应。实测 EnumWindows 枚举该进程
+/// 顶层窗口只有 main + tray_icon_app，**fde-float 根本没被建出来**；而原代码收尾是
+/// `Err(_) => {}` —— 建窗失败连一行日志都没有，等于黑盒（旧机器上也可能是同样静默失败）。
+/// 三级尝试：① 原样（透明 + 无边框 + 置顶）→ ② 不透明（透明窗在部分显卡/远程桌面/
+/// WebView2 版本上建不出来）→ ③ 最低配（不置顶、带阴影）。每级失败都写 nav.log，
+/// 成功走降级也记一行，便于事后确认到底哪一级不行。
+fn fde_build_window(
+    app: &tauri::AppHandle,
+    path: &str,
+    x: f64,
+    y: f64,
+    show_after: bool,
+) -> Option<tauri::WebviewWindow> {
+    // 2026-11-17 二改：改用**本地打包页**（dist/fde-float.html）而不是远程 External URL。
+    // 真机实测：External(https://…) 建第二个 webview 一律 0x8007139F（L1~L4 全败），
+    // 而主窗（App 协议 + 本地资源）正常 —— 差距就在 URL 形态上，故先按本地页验证。
+    let mk_url = || tauri::WebviewUrl::App(path.into());
+    // (transparent, shadow, always_on_top)
+    let attempts: [(bool, bool, bool); 3] = [
+        (true, false, true),
+        (false, false, true),
+        (false, true, false),
+    ];
+    for (i, (transparent, shadow, on_top)) in attempts.into_iter().enumerate() {
+        let r = tauri::WebviewWindowBuilder::new(app, "fde-float", mk_url())
+        .title("AI邦")
+        .additional_browser_args(X8_WEBVIEW_ARGS)
+        // 🔴 2026-11-17 真机根因（第三轮）：WebView2 规定「同一个 user data folder 里，
+        // 只要 Environment options 有任何差异，第二次建 controller 就报 0x8007139F」。
+        // 主窗的 args 来自 tauri.conf.json，浮窗走代码 builder —— 即使字符串写得一样，
+        // 也不是同一个 Environment 实例，实测照样 0x8007139F（L1~L4 全败、args 已对齐仍败）。
+        // 唯一可靠解法：给浮窗一个**独立 data_directory**（独立 Environment），互不干涉。
+        // 代价：多一个 msedgewebview2 进程组，只在浮窗存活期间；浮窗是静态页，不需要共享登录态。
+        .data_directory(bangxin_user_dir().join("pet-webview"))
+        .inner_size(FDE_FLOAT_W, FDE_FLOAT_H)
+        .position(x, y)
+        .decorations(false)
+        .transparent(transparent)
+        .always_on_top(on_top)
+        .skip_taskbar(true)
+        .focused(false)
+        .resizable(false)
+        .shadow(shadow)
+        // 🔴 2026-11-17 诊断：之前一律 `visible(false)` 建窗、随后 show() —— 真机上
+        // 窗口 vis=1、rect 正确、非 cloaked，但 WebView2 **一点内容都不画**（连不透明档
+        // 该有的白底都没有）。改为「要显示就以 visible(true) 建窗」，让 WebView2 在
+        // 可见窗口上初始化合成层；预建（show_after=false）仍然隐藏建。
+        .visible(show_after)
+        .build();
+        match r {
+            Ok(w) => {
+                nav_write(&format!(
+                    "[pet] fde-float 建成 L{}（transparent={transparent} on_top={on_top} visible={show_after}）",
+                    i + 1
+                ));
+                if show_after {
+                    // 保险：1px 抖一下，强制 WebView2 重算视口（隐藏期建窗偶发 0x0 视口）
+                    let _ = w.set_size(tauri::LogicalSize::new(FDE_FLOAT_W + 1.0, FDE_FLOAT_H));
+                    let _ = w.set_size(tauri::LogicalSize::new(FDE_FLOAT_W, FDE_FLOAT_H));
+                    let _ = w.set_position(tauri::LogicalPosition::new(x, y));
+                }
+                return Some(w);
+            }
+            Err(e) => nav_write(&format!("[pet] fde-float 建窗失败 L{}: {e}", i + 1)),
+        }
+    }
+    // L4 纯诊断：与主窗同构（有边框、可见、占任务栏、不置顶不透明）。
+    // 2026-11-17：L1~L3 在同进程里全部 0x8007139F，且 tauri 的 create_webview 本身
+    // 已投递主线程（tauri-runtime-wry 2.12 `send_user_message` + rx.recv），
+    // 所以要么是某个窗口属性触发，要么同进程第二个 webview 根本建不出来。
+    // L4 建成 → 是属性问题，逐个加回即可；L4 也失败 → 必须换实现（不要第二个 webview）。
+    let r = tauri::WebviewWindowBuilder::new(app, "fde-float", mk_url())
+    .title("AI邦")
+    .additional_browser_args(X8_WEBVIEW_ARGS)
+    .data_directory(bangxin_user_dir().join("pet-webview"))
+    .inner_size(320.0, 420.0)
+    .position(x, y)
+    .build();
+    match r {
+        Ok(w) => {
+            nav_write("[pet] fde-float L4 最小属性建成 ✓（说明是窗口属性触发，不是 webview 本身）");
+            if show_after {
+                let _ = w.show();
+            }
+            Some(w)
+        }
+        Err(e) => {
+            nav_write(&format!("[pet] fde-float L4 也失败，第二个 webview 建不出来: {e}"));
+            None
+        }
+    }
+}
+
+fn fde_float_show_ex(app: &tauri::AppHandle, count: i64, tip: &str, silent: bool, force: bool) {
     use std::sync::atomic::Ordering;
+    if !force && !pet_enabled() {
+        return;
+    }
     let n = count.max(0);
     let (x, y) = fde_float_pos(app);
 
     if let Some(w) = app.get_webview_window("fde-float") {
         // 已存在：原地更新数字/文案 + 重播入场动画。不整窗 reload——reload 会白闪一下
+        // keep 恒 1：页面不要挂 8 秒淡出，精灵出来就一直在（老8 2026-11-17）
+        let keep = 1;
         let js = format!(
-            "window.__fdeUpdate && window.__fdeUpdate({}, {})",
-            n,
+            "window.__fdeUpdate && window.__fdeUpdate({n}, {}, {keep})",
             js_str(tip)
         );
         let _ = w.eval(&js);
         let _ = w.set_position(tauri::LogicalPosition::new(x, y));
         let _ = w.show();
     } else {
-        let url = format!(
-            "https://im.x8fde.com/app/fde-float.html?n={}&t={}",
-            n,
-            url_encode(tip)
-        );
-        let parsed = match url.parse() {
-            Ok(u) => u,
-            Err(_e) => {
+        // 建窗才记一行：区分「命令根本没到」与「到了但建窗失败」（见 fde_build_window 头注）
+        nav_write(&format!("[pet] 建 fde-float n={n} pos=({x:.0},{y:.0})"));
+        // 本地打包页（dist/fde-float.html），带首次渲染所需的参数；后续更新走 __fdeUpdate
+        let keep = 1;
+        let path = format!("fde-float.html?n={}&t={}&k={keep}", n, url_encode(tip));
+        let tip_owned = tip.to_string();
+        let h_main = app.clone();
+        if let Err(e) = app.run_on_main_thread(move || {
+            // 排队期间可能已被另一次调用建好：改成原地更新，别再建一遍
+            if let Some(w) = h_main.get_webview_window("fde-float") {
+                let _ = w.eval(&format!(
+                    "window.__fdeUpdate && window.__fdeUpdate({n}, {}, {keep})",
+                    js_str(&tip_owned)
+                ));
+                let _ = w.set_position(tauri::LogicalPosition::new(x, y));
+                let _ = w.show();
                 return;
             }
-        };
-        match tauri::WebviewWindowBuilder::new(app, "fde-float", tauri::WebviewUrl::External(parsed))
-            .title("邦信")
-            .inner_size(FDE_FLOAT_W, FDE_FLOAT_H)
-            .position(x, y)
-            .decorations(false)
-            .transparent(true)
-            .always_on_top(true)
-            .skip_taskbar(true)
-            .focused(false)
-            .resizable(false)
-            .shadow(false)
-            .visible(false)
-            .build()
-        {
-            Ok(w) => {
-                let _ = w.show();
-            }
-            Err(_) => {}
+            fde_build_window(&h_main, &path, x, y, true);
+        }) {
+            nav_write(&format!("[pet] 投主线程失败: {e}"));
         }
     }
 
-    // 到点自动收起（被再次显示 / 被已读 / 被点击 → 世代号变了，本轮自行放弃）
-    let my_gen = FDE_FLOAT_GEN.fetch_add(1, Ordering::SeqCst) + 1;
-    let app2 = app.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(FDE_FLOAT_AUTO_HIDE_MS));
-        use std::sync::atomic::Ordering;
-        if FDE_FLOAT_GEN.load(Ordering::SeqCst) == my_gen {
-            if let Some(w) = app2.get_webview_window("fde-float") {
-                let _ = w.hide();
-            }
-        }
-    });
+    // 提示音：只在新未读时响，且尊重免打扰
+    if n > 0 && !silent && !pet_muted() {
+        pet_sound();
+    }
+
+    // 🔴 2026-11-17 老8：精灵出来就不要自己消失，一直在，等手工关（点它 / ✕ / 右键收起）。
+    // 所以这里**不再挂任何自动收起计时** —— 未读常驻、召唤常驻、登录问候也常驻。
+    FDE_FLOAT_GEN.fetch_add(1, Ordering::SeqCst);
 }
 
 /// 前端接口：显示右下角 FDE 浮动提醒（由 notify_unread / away_notice 内部调用，
 /// 也允许页面直接触发，便于以后扩展「任务提醒」等场景）。
 #[tauri::command]
-fn fde_float_show(app: tauri::AppHandle, count: Option<i64>, tip: Option<String>) -> Result<(), String> {
+fn fde_float_show(
+    app: tauri::AppHandle,
+    count: Option<i64>,
+    tip: Option<String>,
+    silent: Option<bool>,
+) -> Result<(), String> {
     let t = tip.unwrap_or_default();
-    fde_float_show_impl(&app, count.unwrap_or(0), &t);
+    fde_float_show_impl(&app, count.unwrap_or(0), &t, silent.unwrap_or(false));
     Ok(())
 }
 
@@ -4229,8 +4897,186 @@ fn fde_float_hide(app: tauri::AppHandle) {
 /// 浮窗被点击：唤起主窗（浮窗自身由 show_main → fde_float_close 收掉）。
 #[tauri::command]
 fn fde_float_click(app: tauri::AppHandle) {
+    use std::sync::atomic::Ordering;
+    // 点精灵 = 用户要干活了：解除钉住，允许随之收起
+    PET_PIN.store(false, Ordering::SeqCst);
     fde_float_close(&app);
     show_main(&app);
+}
+
+/// 托盘「召唤 AI邦」：无条件把精灵叫到屏上并**常驻**。
+///
+/// 为什么需要这个入口：精灵原来只有一条出镜路径 —— 前端 notify_unread 判定「人在别处/
+/// 不在当前会话」才弹。老8 2026-11-17 反馈「还是没看到 AI邦」时，能做的只有等一条
+/// 不属于当前会话的新消息；主窗开着、正看着那个会话时它永远不出现，等于不可验证。
+/// 召唤路径不看 enabled、不等消息、也不挂 9.2s 自动收起 —— 要看到就必须看得到。
+fn pet_summon(app: &tauri::AppHandle) {
+    use std::sync::atomic::Ordering;
+    // 🔴 2026-11-17 真机第二次踩坑（老8 点托盘「召唤 AI邦」没反应）：
+    //   早先这里「先 destroy 再重建」，想清掉可能的透明空窗。但 destroy 是**投递主线程异步执行**的，
+    //   轮询 1.5s 后 tauri 侧句柄往往还在 → fde_float_show_ex 走「已存在」分支 →
+    //   对**已排队待销毁的死窗** eval/show 全静默失败 → 窗口没了、屏上再也没有。
+    //   真机日志对得上：第二次点只有 `summon from tray`（在本函数尾），没有任何建窗记录。
+    //   结论：召唤**绝不 destroy**。已有窗口就原地 eval + show（幂等，重复点只是刷新文案），
+    //   没有才建。页面已本地打包（dist/fde-float.html），不存在远程白屏那类空窗。
+    // 钉住：召唤出来的精灵不自动消失（未读清零 / 主窗回前台都不收），等用户手工关。
+    // 与 pet_autoshow 同理，pin 必须在显示**之前**置位。
+    PET_PIN.store(true, Ordering::SeqCst);
+    fde_float_show_ex(app, 0, "我在，点我打开邦信", true, true);
+    // 作废上面为「纯提示」排的自动收起计时：召唤出来的精灵要留着，
+    // 直到点它 / 主窗回前台 / 未读清零（与未读常驻同一套收起条件）。
+    FDE_FLOAT_GEN.fetch_add(1, Ordering::SeqCst);
+    // 诊断：show 是异步投递的，这里只做「事后回看」——真看不到时日志能说清是没建窗还是没显示。
+    let h = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        match h.get_webview_window("fde-float") {
+            Some(w) => {
+                let vis = w.is_visible().unwrap_or(false);
+                nav_write(&format!("[pet] summon 后 700ms: 窗口存在 visible={vis}"));
+            }
+            None => nav_write("[pet] summon 后 700ms: 窗口不存在（建窗失败）"),
+        }
+    });
+    si_log("[pet] summon from tray");
+}
+
+/// 启动即把 AI邦 挂到屏上并常驻（2026-11-17 老8：**默认打开着**，加个小 ✕ 手工关，
+/// 平时不再自动收）。
+///
+/// 与 pet_summon 的区别只有一处：召唤是用户主动点托盘（不看 enabled、也不改任何配置），
+/// 这里是开机自启行为 —— 要尊重 pet.json 的 enabled 总开关（关掉精灵的人不该每次启动
+/// 又被弹一脸）。钉住逻辑相同：未读清零 / 主窗回前台都不收，只有 ✕、右键收起、点精灵才收。
+fn pet_autoshow(app: &tauri::AppHandle) {
+    use std::sync::atomic::Ordering;
+    if !pet_enabled() {
+        si_log("[pet] autoshow skipped: enabled=false");
+        return;
+    }
+    // 🔴 先置 pin 再显示：show_ex 的建窗是**投递主线程异步执行**的，若先显示后 pin，
+    // 中间那几十毫秒里任何一次 close（前端收起升级提示、未读清零）都可能把刚建好的窗收掉。
+    // 真机 13:35 那轮就是这么丢的：日志里建成 visible=true，几秒后 WS_VISIBLE 没了。
+    PET_PIN.store(true, Ordering::SeqCst);
+    fde_float_show_ex(app, 0, "AI邦 · 点我打开邦信", true, false);
+    FDE_FLOAT_GEN.fetch_add(1, Ordering::SeqCst);
+    si_log("[pet] autoshow on boot");
+    // 诊断：2s 后回看窗口是否真在屏上（曾出现「建窗 visible=true、几秒后变 hidden」）
+    let h = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        match h.get_webview_window("fde-float") {
+            Some(w) => nav_write(&format!(
+                "[pet] autoshow 后 2s: visible={}",
+                w.is_visible().unwrap_or(false)
+            )),
+            None => nav_write("[pet] autoshow 后 2s: 窗口不存在"),
+        }
+    });
+}
+
+// ── AI邦 精灵的前端接口（2026-11-16，四处同步：本体 / generate_handler! /
+//    build.rs 名单 / capabilities/remote.json）──────────────────────────────
+
+/// 手动收起精灵（不改变未读）：用户右键「收起」或点 ✕ 时调用。
+#[tauri::command]
+fn pet_close(app: tauri::AppHandle) {
+    use std::sync::atomic::Ordering;
+    // 手工关 = 解除钉住，再真正收起
+    PET_PIN.store(false, Ordering::SeqCst);
+    fde_float_close(&app);
+}
+
+/// 拖动精灵：由前端 mousedown 触发（不走 window.startDragging 的 JS 命名空间，
+/// 与 drag_begin 同因——远端页面下 .window 命名空间不可靠）。
+/// 松手后落点自动记忆（start_dragging 在 Windows 上立即返回，故轮询到位置稳定再存盘）。
+#[tauri::command]
+fn pet_drag_begin(app: tauri::AppHandle) {
+    let Some(w) = app.get_webview_window("fde-float") else {
+        return;
+    };
+    let _ = w.start_dragging();
+    std::thread::spawn(move || {
+        let mut last: Option<(i32, i32)> = None;
+        let mut stable = 0;
+        for _ in 0..40 {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            let Ok(p) = w.outer_position() else { break };
+            let cur = (p.x, p.y);
+            if last == Some(cur) {
+                stable += 1;
+                if stable >= 3 {
+                    break;
+                }
+            } else {
+                stable = 0;
+                last = Some(cur);
+            }
+        }
+        if let (Some((x, y)), Ok(sf)) = (last, w.scale_factor()) {
+            let sf = if sf > 0.1 { sf } else { 1.0 };
+            pet_save_pos(x as f64 / sf, y as f64 / sf);
+        }
+    });
+}
+
+/// 显式保存当前位置（拖动结束前端兜底调一次）。
+#[tauri::command]
+fn pet_pos_save(app: tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("fde-float") {
+        if let Ok(p) = w.outer_position() {
+            let sf = w.scale_factor().unwrap_or(1.0);
+            let sf = if sf > 0.1 { sf } else { 1.0 };
+            pet_save_pos(p.x as f64 / sf, p.y as f64 / sf);
+        }
+    }
+}
+
+/// 免打扰开关（只静音提示音，视觉提醒照旧）；返回落盘后的值。
+#[tauri::command]
+fn pet_set_muted(on: bool) -> bool {
+    let mut v = pet_cfg_load();
+    v["muted"] = serde_json::json!(on);
+    pet_cfg_save(&v);
+    on
+}
+
+/// 精灵状态（前端首次渲染取静音态用）。
+#[tauri::command]
+fn pet_status() -> serde_json::Value {
+    serde_json::json!({
+        "enabled": pet_enabled(),
+        "muted": pet_muted(),
+        "avatar": pet_avatar(),
+        "pos": pet_saved_pos().map(|(x, y)| serde_json::json!({ "x": x, "y": y })).unwrap_or(serde_json::Value::Null)
+    })
+}
+
+/// AI邦 用哪个形象（pet.json: avatar）：空串 = 内置卡通精灵；data:/http(s) = 用户自己的头像。
+///
+/// 为什么存 data URL 而不是头像链接：精灵窗是**独立 webview**，没有主窗的登录 token，
+/// MM 头像接口要 Bearer 才给图（主窗拿到的是 blob:，跨窗不可用）。所以由主窗把头像
+/// 压成 160px 的 jpeg data URL 传进来，落盘后精灵窗直接用，不依赖登录态也不怕链接过期。
+fn pet_avatar() -> String {
+    pet_cfg_load()
+        .get("avatar")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// 设置 AI邦 形象；传空串 = 换回卡通精灵。返回落盘后的值。
+#[tauri::command]
+fn pet_set_avatar(app: tauri::AppHandle, url: String) -> String {
+    let v = url.trim().to_string();
+    let mut cfg = pet_cfg_load();
+    cfg["avatar"] = serde_json::json!(v);
+    pet_cfg_save(&cfg);
+    // 精灵窗开着就地换脸，不用等下次弹出
+    if let Some(w) = app.get_webview_window("fde-float") {
+        let js = format!("window.__fdeAvatar && window.__fdeAvatar({})", js_str(&v));
+        let _ = w.eval(&js);
+    }
+    v
 }
 
 // ───────────────── 右下角「升级中」进度小窗（2026-10-23 老8 定） ─────────────────
@@ -4689,33 +5535,40 @@ fn notify_unread(
     flash: Option<bool>,
     title: Option<String>,
     body: Option<String>,
+    in_current: Option<bool>,
 ) -> Result<(), String> {
+    // 2026-11-16：count = -1 表示「只提醒、不改未读数字」。
+    // 场景：消息落在用户正开着的会话里，真实未读不涨；旧前端用 count=1 冒充，
+    // 会把托盘 tooltip 写成「1 条未读」且一直挂着（假未读）。传 -1 则完全不动 tooltip。
+    let alert_only = count < 0;
     let n = count.max(0);
     let def_icon = Some(tray_icon_image());
-    if let Some(tray) = app.tray_by_id("x8im-tray") {
-        let tip = if n > 0 {
-            format!("邦信 · {n} 条未读")
-        } else {
-            "邦信即时通讯".to_string()
-        };
-        let _ = tray.set_tooltip(Some(tip));
-        if n > 0 {
-            // 新消息：托盘图标**不换**红点角标（老8 2026-10-23：用原图标一暗一亮即好），
-            // 保持默认 logo；真正抢眼交给下面的闪烁循环 + 右下角浮窗 + tooltip。
-            if let Some(ic) = def_icon.clone() {
-                let _ = tray.set_icon(Some(ic));
-            }
-        } else {
-            // 未读清零：停掉可能在闪的托盘图标循环，再把图标还原默认 logo；
-            // 右下角 FDE 浮窗也一并收起（人已经处理完了，浮窗再挂着就是噪音）
-            stop_tray_flash();
-            fde_float_close(&app);
-            if let Some(ic) = def_icon {
-                let _ = tray.set_icon(Some(ic));
+    if !alert_only {
+        if let Some(tray) = app.tray_by_id("x8im-tray") {
+            let tip = if n > 0 {
+                format!("邦信 · {n} 条未读")
+            } else {
+                "邦信即时通讯".to_string()
+            };
+            let _ = tray.set_tooltip(Some(tip));
+            if n > 0 {
+                // 新消息：托盘图标**不换**红点角标（老8 2026-10-23：用原图标一暗一亮即好），
+                // 保持默认 logo；真正抢眼交给下面的闪烁循环 + 右下角浮窗 + tooltip。
+                if let Some(ic) = def_icon.clone() {
+                    let _ = tray.set_icon(Some(ic));
+                }
+            } else {
+                // 未读清零：停掉可能在闪的托盘图标循环，再把图标还原默认 logo；
+                // 右下角 AI邦 精灵也一并收起（人已经处理完了，精灵再挂着就是噪音）
+                stop_tray_flash();
+                fde_float_close(&app);
+                if let Some(ic) = def_icon {
+                    let _ = tray.set_icon(Some(ic));
+                }
             }
         }
     }
-    let want_flash = flash.unwrap_or(n > 0);
+    let want_flash = flash.unwrap_or(alert_only || n > 0);
     if want_flash {
         if let Some(w) = app.get_webview_window("main") {
             // 真实 OS 窗口状态（Rust 侧权威）：失焦 / 最小化 / 隐藏 任一都算「人没在看」。
@@ -4725,21 +5578,36 @@ fn notify_unread(
             let away = !w.is_focused().unwrap_or(true)
                 || !w.is_visible().unwrap_or(true)
                 || w.is_minimized().unwrap_or(false);
-            if away {
-                if n > 0 {
+            // 2026-11-16 老8「看不到 AI邦」：旧判据只认窗口状态 —— 只要主窗在前台，
+            // 任何会话的新消息都被当成「人正在看」，精灵/气泡/闪烁一律不弹，只剩左侧小红点。
+            // 改为：消息不属于当前正在看的会话（in_current=false）同样要提醒；
+            // 当前会话的消息仍然完全静默（自己正聊的那条不该反复骚扰）。
+            let alert = away || !in_current.unwrap_or(true);
+            if alert {
+                // 提醒用的计数：alert_only 时不碰真实未读，用占位 1 驱动闪烁与精灵
+                let cn = if alert_only { 1 } else { n };
+                if cn > 0 {
                     // 2026-10-22：托盘图标「一暗一亮」闪烁，闪到窗口回前台 / 已读清零为止。
-                    start_tray_flash(app.clone(), n);
-                    // 2026-10-22：屏幕右下角卡通 FDE 浮窗（微信式），窗在托盘上方浮现，
-                    // 8s 后自动淡出，点一下直接唤起主窗。
+                    start_tray_flash(app.clone(), cn);
+                    // 2026-11-16：AI邦 精灵（原 FDE 浮窗）—— 有未读就停在屏上，不再 9.2s 自动消失
                     let ftip = title
                         .clone()
                         .filter(|s| !s.trim().is_empty())
-                        .unwrap_or_else(|| format!("{n} 条新消息"));
-                    fde_float_show_impl(&app, n, &ftip);
+                        .unwrap_or_else(|| {
+                            if alert_only {
+                                "新消息".to_string()
+                            } else {
+                                format!("{cn} 条新消息")
+                            }
+                        });
+                    fde_float_show_impl(&app, cn, &ftip, false);
                 }
                 // 新消息：弹气泡 + 闪任务栏/托盘，但**绝不** bring_to_front 抢前台——
                 // 消息到达就抢焦点会让任务栏闪烁（需失焦才闪）失去意义，也违背微信式体验。
-                if n > 0 {
+                // 2026-11-16：气泡只在人真的离开时弹。主窗在前台（只是不在那个会话）时
+                // 精灵已经在右下角占位并响了提示音，再叠一张系统通知卡片会压在一起、
+                // 既看不清也吵；声音与文案由精灵承担即可。
+                if cn > 0 && away {
                     #[cfg(target_os = "windows")]
                     {
                         let t = title
@@ -4749,7 +5617,13 @@ fn notify_unread(
                         let b = body
                             .clone()
                             .filter(|s| !s.trim().is_empty())
-                            .unwrap_or_else(|| format!("{n} 条未读消息"));
+                            .unwrap_or_else(|| {
+                                if alert_only {
+                                    "收到一条新消息".to_string()
+                                } else {
+                                    format!("{cn} 条未读消息")
+                                }
+                            });
                         win_tray_balloon(&t, &b);
                     }
                     // mac/linux 无托盘气泡 API，靠 Dock 弹跳 / 任务栏闪烁；这里不重复处理
@@ -4762,9 +5636,13 @@ fn notify_unread(
                 // （见 flash_taskbar 注释）；两者都指向同一个 FlashWindowEx，重复调用幂等。
                 // ⚠️ 这里不能用 `?` 把失败冒泡出去：托盘闪烁与右下角气泡都已生效，
                 //    任务栏闪不了不该让整个命令返回失败，前端会误判成「提醒全没做成」。
-                let _ = w.request_user_attention(Some(UserAttentionType::Critical));
-                #[cfg(target_os = "windows")]
-                flash_taskbar(&w);
+                // 2026-11-16：只在人真的离开时才抢注意力；主窗在前台时只弹精灵与气泡，
+                // 否则窗口明明开着却闪任务栏 / 抢置顶，反而是干扰。
+                if away {
+                    let _ = w.request_user_attention(Some(UserAttentionType::Critical));
+                    #[cfg(target_os = "windows")]
+                    flash_taskbar(&w);
+                }
             }
         }
     }
@@ -4816,7 +5694,11 @@ fn away_notice(app: tauri::AppHandle, title: Option<String>, body: Option<String
         .or_else(|| title.clone())
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "收到一条新消息".to_string());
-    fde_float_show_impl(&app, 0, &ftip);
+    fde_float_show_impl(&app, 0, &ftip, true);
+    // 2026-11-16：当前会话来消息时未读数是 0，fde_float_show_impl 不会自己响，这里补一声
+    if !pet_muted() {
+        pet_sound();
+    }
     #[cfg(target_os = "windows")]
     {
         let t = title
@@ -5040,6 +5922,145 @@ fn task_ctx() -> Result<TaskCtx, String> {
     Ok(fresh)
 }
 
+// ─────────────── 升级状态标记 / 半卸自愈（2026-11-17 C）───────────────
+//
+// 事故原型（老8 新电脑）：自动升级断在「卸掉旧版之后、装上新版之前」，
+// `C:\Program Files\BangXin\x8im.exe` 没了、updates 里躺着刚下载的安装包 →
+// 桌面快捷方式成死链接、托盘只剩残影、没有任何恢复入口，用户判定「程序死了」。
+//
+// 三层兜底，缺一不可：
+//   ① installer.nsh PREINSTALL 不再整目录 RMDir（中断时旧 exe 还在，程序照样起得来）
+//   ② installer.nsh 生成的 updater-task.cmd：装完**校验 x8im.exe 是否回来**，
+//      没回来重试一次，仍没有就写 task-failed.txt + 弹提示并打开下载页
+//   ③ 这里：触发前落「升级中」标记；启动后自检——成功则收尾清包，
+//      连续 3 次升不上去就落 giveup 停止自动重试（防「下载→安装→失败」死循环）
+
+fn upgrade_dir() -> Option<std::path::PathBuf> {
+    programdata_dir().ok().map(|p| p.join("BangXin"))
+}
+fn upgrade_marker_path() -> Option<std::path::PathBuf> {
+    upgrade_dir().map(|d| d.join("updating.json"))
+}
+fn upgrade_giveup_path() -> Option<std::path::PathBuf> {
+    upgrade_dir().map(|d| d.join("upgrade-giveup.txt"))
+}
+fn upgrade_task_failed_path() -> Option<std::path::PathBuf> {
+    upgrade_dir().map(|d| d.join("updates").join("task-failed.txt"))
+}
+
+/// 从 updates 里最新的包名解析目标版本（`BangXin_1.7.10_x64-setup.exe` / `-portable.zip`）。
+fn newest_update_target(updates: &std::path::Path) -> Option<String> {
+    let mut best: Option<(std::time::SystemTime, String)> = None;
+    for e in std::fs::read_dir(updates).ok()?.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if !name.starts_with("BangXin_")
+            || !(name.ends_with("_x64-setup.exe") || name.ends_with("_x64-portable.zip"))
+        {
+            continue;
+        }
+        let ver = name.trim_start_matches("BangXin_").split('_').next()?.to_string();
+        let t = e
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        if best.as_ref().map(|(bt, _)| t > *bt).unwrap_or(true) {
+            best = Some((t, ver));
+        }
+    }
+    best.map(|(_, v)| v)
+}
+
+fn parse_ver(s: &str) -> (u32, u32, u32) {
+    let mut it = s.trim().split('.');
+    let a = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+    let b = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+    let c = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+    (a, b, c)
+}
+
+/// 触发静默安装**之前**落标记：目标版本 + 第几次尝试。只增不减，成功才清。
+fn upgrade_mark_start(updates: &std::path::Path) {
+    let Some(target) = newest_update_target(updates) else {
+        return;
+    };
+    let Some(p) = upgrade_marker_path() else { return };
+    let prev = std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+    let prev_target = prev
+        .as_ref()
+        .and_then(|v| v.get("target"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    // 换了目标版本就重新计数（升到 1.7.11 不该继承 1.7.10 的失败次数）
+    let attempts = if prev_target == target {
+        prev.as_ref()
+            .and_then(|v| v.get("attempts"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            + 1
+    } else {
+        1
+    };
+    let body = serde_json::json!({
+        "target": target,
+        "attempts": attempts,
+        "ts": chrono::Local::now().to_rfc3339(),
+    });
+    let _ = std::fs::write(&p, body.to_string());
+    nav_write(&format!("upgrade mark: target={target} attempts={attempts}"));
+}
+
+/// 启动后自检上次升级结果（代价是几行文件操作，直接放在后台线程里跑）。
+fn upgrade_selfcheck(app: &tauri::AppHandle) {
+    let cur = app.package_info().version.to_string();
+    let Some(marker) = upgrade_marker_path() else { return };
+    let Ok(txt) = std::fs::read_to_string(&marker) else {
+        return; // 没有标记 = 上次根本没触发过升级，正常
+    };
+    let v: serde_json::Value = serde_json::from_str(&txt).unwrap_or_default();
+    let target = v.get("target").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let attempts = v.get("attempts").and_then(|x| x.as_u64()).unwrap_or(0);
+    let (c, t) = (parse_ver(&cur), parse_ver(&target));
+    if t.0 == 0 {
+        let _ = std::fs::remove_file(&marker);
+        return;
+    }
+    if c >= t {
+        // 升级成功：清标记 + 清失败记录 + 清残留安装包（否则下个版本还会拿同一个包重装）
+        let _ = std::fs::remove_file(&marker);
+        if let Some(g) = upgrade_giveup_path() {
+            let _ = std::fs::remove_file(g);
+        }
+        if let Some(f) = upgrade_task_failed_path() {
+            let _ = std::fs::remove_file(f);
+        }
+        if let Some(u) = upgrade_dir().map(|d| d.join("updates")) {
+            if let Ok(rd) = std::fs::read_dir(&u) {
+                for e in rd.flatten() {
+                    let n = e.file_name().to_string_lossy().to_string();
+                    if n.starts_with("BangXin_") && (n.ends_with(".exe") || n.ends_with(".zip")) {
+                        let _ = std::fs::remove_file(e.path());
+                    }
+                }
+            }
+        }
+        nav_write(&format!("upgrade ok: {cur} >= {target}，已清残留安装包"));
+    } else {
+        nav_write(&format!(
+            "upgrade 未完成: 当前 {cur} < 目标 {target}（第 {attempts} 次）"
+        ));
+        if attempts >= 3 {
+            if let Some(g) = upgrade_giveup_path() {
+                let _ = std::fs::write(&g, format!("{target}\n"));
+            }
+            nav_write("upgrade: 连续 3 次未成功 → 落 upgrade-giveup.txt，停止自动重试");
+        }
+        // 标记**保留**：失败次数要跨重启累计，成功时才清
+    }
+}
+
 /// 触发「应用补丁」：优先 `schtasks /Run`（普通权限、零 UAC）；
 /// 失败则**降级为提权直跑** `updater-task.cmd`（弹一次 UAC，用户点「是」即可）。
 ///
@@ -5049,7 +6070,10 @@ fn task_ctx() -> Result<TaskCtx, String> {
 /// 现在预检失败**只降级、不放弃**：包照样下载、验签、落盘；最后一公里改用提权直跑，
 /// 最差情况也只是弹一次 UAC，而不是白下几十 MB 后报「请手动更新」。
 #[cfg(windows)]
-fn apply_patch_task(ctx: &TaskCtx) -> Result<(), String> {
+pub(crate) fn apply_patch_task(ctx: &TaskCtx) -> Result<(), String> {
+    // 2026-11-17 C：动手之前先落「升级中」标记。之后本进程多半会被 taskkill 带走，
+    // 标记是唯一能把「上次升级到哪个版本、试了几次」带到下一次启动的载体。
+    upgrade_mark_start(&ctx.updates);
     let (code, out) = win_run_capture("schtasks", &["/Run", "/TN", ctx.name]);
     upd_log(&format!("触发补丁应用: schtasks /Run code={code} out={out}"));
     if code == 0 {
@@ -5068,15 +6092,33 @@ fn apply_patch_task(ctx: &TaskCtx) -> Result<(), String> {
     }
     // 优先用随包自带的 elevate.exe 提权无窗启动 updater-task.cmd（SW_HIDE，不弹黑窗）；
     // 仅当该工具缺失（极老版本没带上）时，才回退到 PowerShell Start-Process -WindowStyle Hidden。
+    //
+    // 🔴 2026-11-13 老8：升级时弹出 DOS 窗口（看着不舒服）。根因在计划任务的动作本身
+    // （`cmd /c updater-task.cmd` + /IT → 任务计划器给它一个可见控制台），已在
+    // installer.nsh / post-update.cmd 改为 wscript 隐藏启动。降级通道同步改：
+    // elevate 起 wscript 跑 updater-silent.vbs（wscript 是 GUI 子系统，零控制台），
+    // 只有 vbs 缺失（极老版本没带上）才退回旧的 cmd.exe /c updater-task.cmd。
     let elevate = std::env::current_exe()
         .ok()
         .and_then(|e| e.parent().map(|p| p.join("elevate.exe")))
         .unwrap_or_else(|| std::path::PathBuf::from("elevate.exe"));
+    let silent = ctx.updates.parent().map(|p| p.join("updater-silent.vbs"));
     let (c2, o2) = if elevate.exists() {
-        win_run_capture(
-            &elevate.to_string_lossy(),
-            &["cmd.exe", "/c", &script.display().to_string()],
-        )
+        match silent.as_ref().filter(|p| p.exists()) {
+            Some(vbs) => win_run_capture(
+                &elevate.to_string_lossy(),
+                &[
+                    "wscript.exe",
+                    "//B",
+                    "//Nologo",
+                    &vbs.display().to_string(),
+                ],
+            ),
+            None => win_run_capture(
+                &elevate.to_string_lossy(),
+                &["cmd.exe", "/c", &script.display().to_string()],
+            ),
+        }
     } else {
         let ps = format!(
             "Start-Process -FilePath 'cmd.exe' -ArgumentList '/c','\"{}\"' -Verb RunAs -WindowStyle Hidden",
@@ -5323,6 +6365,19 @@ async fn win_auto_update(
     // （分不清是前端没调、IPC 没派发，还是命令内部卡在第一个阻塞点），先钉死这一点。
     #[cfg(windows)]
     upd_log("[入口] win_auto_update 收到调用");
+    // 2026-11-17 C：连续 3 次自动升级未成功就停手，别让用户陷入
+    // 「下载 10MB → taskkill → 装不上 → 再下载」的死循环。手动装好新版后
+    // upgrade_selfcheck() 会自动删掉这个闸门文件。
+    #[cfg(windows)]
+    if let Some(g) = upgrade_giveup_path() {
+        if g.exists() {
+            upd_log("[入口] 已存在 upgrade-giveup.txt，拒绝自动升级");
+            return Err(
+                "自动升级已连续失败 3 次（多半被安全软件拦了）。请手动下载安装最新版：https://im.x8fde.com/app/"
+                    .into(),
+            );
+        }
+    }
     let prog = std::sync::Arc::new(Some(on_event));
     #[cfg(windows)]
     {
@@ -5737,6 +6792,63 @@ static RESUME_RELOAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 /// 主窗隐藏超过此时长（秒）再次唤起即 reload（兜底非睡眠类长挂机白屏）
 const MAIN_IDLE_RELOAD_SECS: u64 = 3600;
 
+// ───────────── 主窗显隐兜底（2026-11-17 A：tao 内部幂等位失同步）─────────────
+//
+// 🩸 真因（老8 2026-11-17 现场报告 + tao 0.37.1 源码实读）：
+//   tao 的 `set_visible()` 只改内部 `WindowFlags::VISIBLE` 位（window.rs:128-136），
+//   真正的 ShowWindow 由 `WindowState::apply_diff()` 下发，而它第一句就是
+//   `if diff == WindowFlags::empty() { return; }`（window_state.rs:318-320）。
+//   于是窗口一旦被 **tao 之外**的力量显示回来 —— 任务栏点击 / Alt-Tab / 双击桌面图标
+//   （走 wake_existing_instance_window 的 ShowWindow）/ 安装器外部 ShowWindow ——
+//   tao 仍认为它「已隐藏」，此后所有 `hide()` 全部空转：不调系统 API、不报错、
+//   不留日志、0.001s 返回 Ok(())。
+//   现场表现：点 X 第 1 次有效，从第 2 次起永久失效，重启才恢复。
+// 对策：每次 hide/show 之后用 Win32 复核真实窗口状态，不一致就用 Win32 强制纠偏。
+//   ⚠️ 判据必须用 IsWindowVisible / IsIconic：tauri 的 `is_visible()` 读的就是那个
+//   会失同步的标志位，拿它自查等于拿错题本对答案。
+
+/// 真实可见性（Win32 直查，不信 tao 标志位）。实参统一传裸指针 `hwnd.0`：
+/// windows-sys 0.59 的 HWND 是 newtype，link! 展开后 API 实参为 *mut c_void。
+#[cfg(target_os = "windows")]
+fn w32_visible(h: *mut std::ffi::c_void) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+    unsafe { IsWindowVisible(h) != 0 }
+}
+
+/// 真实最小化状态。
+#[cfg(target_os = "windows")]
+fn w32_iconic(h: *mut std::ffi::c_void) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::IsIconic;
+    unsafe { IsIconic(h) != 0 }
+}
+
+/// 强制隐藏（绕开 tao 幂等短路）。
+#[cfg(target_os = "windows")]
+fn w32_hide(h: *mut std::ffi::c_void) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+    unsafe {
+        let _ = ShowWindow(h, SW_HIDE);
+    }
+}
+
+/// 强制显示到前台（SW_RESTORE 同时解决「隐藏」和「最小化」；SW_SHOW 不还原最小化）。
+#[cfg(target_os = "windows")]
+fn w32_show_restore(h: *mut std::ffi::c_void) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_RESTORE};
+    unsafe {
+        let _ = ShowWindow(h, SW_RESTORE);
+    }
+}
+
+/// 强制最小化。
+#[cfg(target_os = "windows")]
+fn w32_minimize(h: *mut std::ffi::c_void) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_MINIMIZE};
+    unsafe {
+        let _ = ShowWindow(h, SW_MINIMIZE);
+    }
+}
+
 fn show_main(app: &tauri::AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         // 是否需要 reload：隐藏过久 或 系统唤醒后置位
@@ -5751,6 +6863,16 @@ fn show_main(app: &tauri::AppHandle) {
         };
         let _ = w.show();
         let _ = w.unminimize();
+        // 2026-11-17 A：show()/unminimize() 同样走 tao 的幂等位 —— 若窗口真实隐藏
+        // 而 tao 认为「可见」，这里会静默空转、窗口从此叫不出来（现场「点托盘唤不出」）。
+        // 复核真实状态，不一致就用 Win32 兜底。
+        #[cfg(target_os = "windows")]
+        if let Ok(h) = w.hwnd() {
+            if !w32_visible(h.0) || w32_iconic(h.0) {
+                w32_show_restore(h.0);
+                nav_write("show_main: tao show/unminimize 空转 → Win32 SW_RESTORE 强制显示");
+            }
+        }
         if need_reload {
             let _ = w.eval("location.reload()");
         }
@@ -5852,6 +6974,53 @@ fn wake_existing_instance_window() -> bool {
     FOUND.store(false, std::sync::atomic::Ordering::SeqCst);
     unsafe { EnumWindows(Some(cb), 0) };
     FOUND.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// 是否还有「另一个」同程序进程活着（2026-11-13）。
+///
+/// 用途：区分「对方正在冷启动、窗口还没建出来」和「对方是真僵尸残留」。
+/// 单靠窗口判据会把前者误判成后者（升级刚结束时尤其明显），于是两个实例都放行。
+#[cfg(target_os = "windows")]
+fn other_instance_alive() -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let me = std::process::id();
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            // 拿不到快照时保守判定「有对方」→ 走带超时的等待分支，不会因此双开。
+            return true;
+        }
+        let mut e: PROCESSENTRY32W = std::mem::zeroed();
+        e.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut found = false;
+        if Process32FirstW(snap, &mut e) != 0 {
+            loop {
+                let pid = e.th32ProcessID;
+                if pid != me && pid != 0 {
+                    let len = e
+                        .szExeFile
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(e.szExeFile.len());
+                    let name = String::from_utf16_lossy(&e.szExeFile[..len]);
+                    if name.eq_ignore_ascii_case("x8im.exe") {
+                        found = true;
+                        break;
+                    }
+                }
+                if Process32NextW(snap, &mut e) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snap);
+        found
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -5965,6 +7134,7 @@ fn enforce_single_instance() {
             // 连得上=活实例→聚焦后自杀；连不上=僵尸残留→抢占
             if std::os::unix::net::UnixStream::connect(&path).is_ok() {
                 si_log("already-exists woken -> exit(0)");
+                wx_sidecar::stop_all_fast();
                 std::process::exit(0);
             }
             let _ = std::fs::remove_file(&path);
@@ -6067,15 +7237,36 @@ fn enforce_single_instance() {
         return; // 建锁失败（权限异常）不阻断启动，宁可多开也别打不开
     }
     if err == ERROR_ALREADY_EXISTS {
-        // 已有实例：先把它唤到前台，唤得到才退出本进程。
-        // 唤不到主窗 = 对方是僵尸（无界面）→ 放行，否则用户双击图标永远「没反应」。
-        let woken = wake_existing_instance_window();
-        si_log(&format!("already-exists woken={woken}"));
-        if woken {
-            si_log("exit(0): 已有主窗，已聚焦");
-            std::process::exit(0);
+        // 已有实例：优先唤起它的主窗。
+        //
+        // 2026-11-13 修（老8 报「升级后出现两个窗口」）：原逻辑是「唤不到主窗就直接放行」，
+        // 理由是「对方是僵尸，不能让你打不开」。但冷启动 WebView2 要 3~10 秒、升级刚结束
+        // 又叠加 UAC 与文件替换，这期间对方**进程活着但窗口还没建出来**，于是第二个启动源
+        // （安装器拉起的 + 用户点的）被误判成僵尸，两个都放行 → 双开抢同一个 EBWebView
+        // 用户数据目录，越抢越慢、越容易白屏。
+        //
+        // 现在改成「先看有没有同类进程存活」：
+        //   · 唤到主窗          → 聚焦并退出本进程（原行为）
+        //   · 对方进程已退出    → 立刻放行（不用白等，避免双击没反应）
+        //   · 对方存活但没窗口  → 每 250ms 重试唤醒，最多 8 秒；仍无窗才判僵尸放行
+        // 这样既堵住双开，也保留老8 的硬要求：僵尸/半死状态绝不影响正常打开。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            if wake_existing_instance_window() {
+                si_log("already-exists woken=true -> exit(0): 已聚焦");
+                wx_sidecar::stop_all_fast();
+                std::process::exit(0);
+            }
+            if !other_instance_alive() {
+                si_log("already-exists peer-gone -> continue（对方已退出，放行本次）");
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                si_log("already-exists peer-alive no-window 8s -> continue（僵尸放行）");
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
         }
-        si_log("no main window -> continue");
     }
     // 首个实例（或对方是僵尸）：句柄故意不关闭，进程存活期间由系统持锁。
     // （HANDLE 是 Copy 类型，无需 forget；只要不调 CloseHandle 就不会提前释放锁。）
@@ -6097,29 +7288,8 @@ fn enforce_single_instance() {
 /// 返回值只是给前端确认「命令进到函数体了」，真正成功与否看进程有没有退出。
 #[tauri::command]
 async fn x8_restart(app: tauri::AppHandle) -> Result<String, String> {
-    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-    let mut cmd = std::process::Command::new(&exe);
-    for a in std::env::args_os().skip(1) {
-        // 之前就是被 --x8-restart 拉起来的，别把旧标记复制过去（否则越滚越多）；
-        // --x8-parent 同理（只给一次，指向上一代老进程），避免 PID 链越滚越长。
-        let s = a.to_string_lossy();
-        if s == "--x8-restart" || s.starts_with("--x8-parent=") {
-            continue;
-        }
-        cmd.arg(a);
-    }
-    cmd.arg("--x8-restart");
-    // 把当前（老）进程 PID 传给子进程，让它精确等到本进程退出再建窗，根治 WebView2 抢锁。
-    cmd.arg(format!("--x8-parent={}", std::process::id()));
-    // 脱离父进程的控制台/进程组，避免老进程退出时把新进程一起带走
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
-    }
-    cmd.spawn().map_err(|e| format!("spawn: {e}"))?;
+    // 派生新进程（与自愈链 ③ 共用同一套 spawn 逻辑，见 spawn_self_restart）
+    spawn_self_restart()?;
 
     // 两个进程短暂并存：给新进程时间把 WebView2 用户数据目录接管好
     let _ = tauri::async_runtime::spawn_blocking(|| {
@@ -6131,6 +7301,8 @@ async fn x8_restart(app: tauri::AppHandle) -> Result<String, String> {
     // 兜底：今天这个毛病就是「退出请求发出去了但事件循环没退」，1.2 秒还没走掉就硬退
     std::thread::spawn(|| {
         std::thread::sleep(std::time::Duration::from_millis(1200));
+        // P1-3：硬退兜底也要收插件，不能只靠 stdin EOF。
+        wx_sidecar::stop_all_fast();
         std::process::exit(0);
     });
     Ok("restarting".into())
@@ -6188,8 +7360,16 @@ fn x8_auth_clear(app: tauri::AppHandle) -> Result<(), String> {
 /// 宿主发起的 navigate 是**浏览器级**动作：不经过页面 JS 的作用域、不受缓存策略与
 /// 页面生命周期影响，是这套链路上唯一可靠的重载手段。
 /// 只放行应用自己的 https 地址，避免远端页面（或注入脚本）把窗口导航到任意站点。
+/// 2026-11-12 老8「点版本更新刷新不动，只能关掉邦信重开」：把命令从 async 改回同步。
+///
+/// x8_nav_log 实证：同一次运行里成功那次留下了 `host-nav`，失败的两次
+/// （01:13:56 / 01:42:58）只有 `before-replace`，15 秒后直接 `dog-alive` —— 前端
+/// `await invoke('x8_nav')` 的 Promise 一直没 resolve，后面的 location.replace 永远
+/// 执行不到。与 2026-10-26 updater 那次同源：**远程域下 async 命令的 IPC response
+/// 偶发永久 pending**（不执行完、不 reject）。navigate 本身是同步动作，不需要 async，
+/// 走同步返回路径即可绕开这条通道。
 #[tauri::command]
-async fn x8_nav(app: tauri::AppHandle, target: String) -> Result<String, String> {
+fn x8_nav(app: tauri::AppHandle, target: String) -> Result<String, String> {
     let u = tauri::Url::parse(&target).map_err(|e| format!("url: {e}"))?;
     let host_ok = u.host_str().map(|h| h == "im.x8fde.com").unwrap_or(false);
     if u.scheme() != "https" || !host_ok || !u.path().starts_with("/app/") {
@@ -6201,6 +7381,407 @@ async fn x8_nav(app: tauri::AppHandle, target: String) -> Result<String, String>
     w.navigate(u).map_err(|e| format!("navigate: {e}"))?;
     Ok("nav".into())
 }
+
+// ================= 2026-11-13 前端刷新链重做（老8 定性：必须用户点，且由 Rust 执行）=================
+// 现场证据（x8_nav_log + leveldb 反推，本地时区）：
+//   09:43:36 fire → 09:43:38 bunload（导航真的开始了）→ 09:43:51 dog-alive（无 pagehide、无 boot）
+// 同一秒服务端按 WebView2 UA 实测 /app/index.html?_b=… 返回 200，说明既不是网络也不是缓存，
+// 而是**导航发起后没有 commit**。而旧链路里 hostNav 超时（1.2s）之后前端还会再 replace 一次，
+// 等于两条导航互抢 —— 后发的会把先发的取消，这是 11-13 复盘出来的竞态。
+//
+// 现在的分工：
+//   ① x8_reload_ui  —— 前端只发「信号」，URL 由 Rust 自己拼并 navigate；前端不再 replace。
+//   ② nav_probe     —— navigate 后 1/3/8 秒回读主窗真实 URL，落 %ProgramData%\BangXin\nav.log
+//                      并上报 /x8/errlog.php。以后不用再 dump WebView2 的 leveldb 猜。
+//   ③ x8_rebuild_ui —— 兜底：eval 注入导航，2.2 秒仍未跳就销毁主窗并按同 label 重建
+//                      （文档环境坏掉只有重建能治，比让用户「退出重开」体面）。
+// 全程只有用户点击才触发，不带任何自动刷新。
+
+fn nav_log_path() -> std::path::PathBuf {
+    let base = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into());
+    let dir = std::path::Path::new(&base).join("BangXin");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("nav.log")
+}
+
+fn nav_write(msg: &str) {
+    use std::io::Write;
+    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+    let line = format!("[{ts}] {msg}\n");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(nav_log_path())
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// 上报 /x8/errlog.php（与前端 sendBeacon 同格式，服务端落 /var/lib/x8im/client_err.log）
+fn nav_report(msg: &str) {
+    let body = format!(
+        "{{\"kind\":\"nav\",\"step\":\"host\",\"msg\":\"{}\",\"t\":{},\"href\":\"desktop\"}}",
+        msg.replace('\\', "\\\\").replace('"', "\\\""),
+        chrono::Utc::now().timestamp_millis()
+    );
+    if let Ok(c) = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(6))
+        .build()
+    {
+        let _ = c
+            .post("https://im.x8fde.com/x8/errlog.php")
+            .header("Content-Type", "text/plain")
+            .body(body)
+            .send();
+    }
+}
+
+/// 轮询主窗真实 URL 是否已含 marker（= 导航真的 commit 了）。每 120ms 一次，超时返 false。
+/// 🔴 2026-11-13 二次现场：`navigate()` 返回 Ok 但 URL 根本没变（10:01 两次 probe 全 false，
+/// 而 09:59 那次成功）。所以「调用成功」绝不能当成「已刷新」，必须回读 URL 才算数。
+async fn wait_url_contains(app: &tauri::AppHandle, marker: &str, ms: u64) -> bool {
+    let mut waited = 0u64;
+    while waited < ms {
+        if let Some(w) = app.get_webview_window("main") {
+            if let Ok(u) = w.url() {
+                if u.as_str().contains(marker) {
+                    return true;
+                }
+            }
+        } else {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        waited += 120;
+    }
+    false
+}
+
+/// 🔴 2026-11-13 三改：自愈链互斥（当天 11:07 主窗消失事故的根治）。
+/// 现场：nav.log 11:07:20.902 与 11:07:21.025 两条命令在同一秒先后进入「③ 销毁重建主窗」，
+/// 之后既无 `rebuild done ok` 也无报错 —— 两个任务各自 destroy() 后并发 build 同名窗口 main，
+/// 主线程互等死锁。窗口销毁了没重建起来，托盘点击 / 桌面快捷方式全都唤不起
+/// （Windows 单实例判据是「能否唤起主窗」，唤不起 = 观感上程序已死）。
+/// 做法：整条自愈链（导航 + 重建）只允许一路在跑，后到者立刻返回 "busy"，
+/// 既不重复导航互抢，也绝不并发建窗。RAII guard 保证任何 return / panic 都能复位。
+static NAV_GUARD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+struct NavGuard;
+
+impl NavGuard {
+    fn acquire() -> Option<NavGuard> {
+        use std::sync::atomic::Ordering;
+        NAV_GUARD
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| NavGuard)
+    }
+}
+
+impl Drop for NavGuard {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        NAV_GUARD.store(false, Ordering::SeqCst);
+    }
+}
+
+/// 🔴 2026-11-15 晚 P0 重构：同进程「销毁重建主窗」整段废弃 → 进程级重启。
+///
+/// 本机 18:12 事故现场：`nav.log` 走到「③ 销毁重建主窗」后 6s 看门狗触发，此后既无
+/// `rebuild done ok` 也无 build err；进程 MainWindowTitle 为空、Responding=False，
+/// 而且托盘 `show_main` 兜底完全无效 —— 卡死的是 Tauri 主事件循环。
+///
+/// 机制（上一版误判）：Tauri 2 的 `WebviewWindow::destroy()` 是向主事件循环投递
+/// WindowMessage::Destroy，再在调用线程上阻塞等回执，真正执行 WebView2 `Close()` 的
+/// 仍是**主线程**。所以把 destroy 塞进 `spawn_blocking` 只是把「等待」挪走，阻塞点没变，
+/// 那一招零收益（旧注释声称「不再阻塞主 async 运行时」与实际不符）。
+///
+/// 更致命的是逻辑自相矛盾：能走到 ③ 的前提是「navigate 不 commit」= 渲染进程已不健康，
+/// 而 `ICoreWebView2Controller::Close()` 恰恰要等渲染进程收尾 —— 渲染进程越坏 destroy 越卡。
+/// 实测 16:48 那次 destroy 花 4.5s 才返回、18:12 这次永不返回。
+///
+/// 结论：换文档在同进程内没有可靠实现，唯一确定的手段是**换进程**，复用已跑通的
+/// `x8_restart` 链路（spawn 自身 + `--x8-restart` + `--x8-parent` + DETACHED_PROCESS）。
+/// 本次运行只允许重启一次：重启解决不了的问题再重启只会变成反复闪屏，比停在原地更糟。
+static RUN_RESTART_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 窗口几何快照文件（重启后新进程据此还原位置/尺寸，避免每次自愈都把窗口弹回默认尺寸）。
+/// 仅 Windows 落盘；非 Windows 返回 None，调用方直接跳过（零行为变化）。
+#[cfg(target_os = "windows")]
+fn win_geom_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var("ProgramData").ok()?;
+    Some(std::path::Path::new(&base).join("BangXin").join("win.json"))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn win_geom_path() -> Option<std::path::PathBuf> {
+    None
+}
+
+/// 重启前把主窗几何写盘。任何一步读不到就走默认值 —— 坏几何宁可还原失败，也绝不能影
+/// 响启动。
+fn save_win_geom(app: &tauri::AppHandle) {
+    let Some(path) = win_geom_path() else { return };
+    let mut w = 1180i64;
+    let mut h = 800i64;
+    let mut x: Option<i64> = None;
+    let mut y: Option<i64> = None;
+    let mut maxed = false;
+    let mut vis = true;
+    if let Some(win) = app.get_webview_window("main") {
+        let sf = win.scale_factor().unwrap_or(1.0);
+        if let Ok(s) = win.inner_size() {
+            w = (s.width as f64 / sf).round() as i64;
+            h = (s.height as f64 / sf).round() as i64;
+        }
+        if let Ok(p) = win.outer_position() {
+            x = Some((p.x as f64 / sf).round() as i64);
+            y = Some((p.y as f64 / sf).round() as i64);
+        }
+        maxed = win.is_maximized().unwrap_or(false);
+        vis = win.is_visible().unwrap_or(true);
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let v = serde_json::json!({"w": w, "h": h, "x": x, "y": y, "max": maxed, "vis": vis});
+    let _ = std::fs::write(&path, v.to_string());
+    nav_write(&format!("win_geom saved: {v}"));
+}
+
+/// setup 阶段调用：把上次快照的几何套回主窗，并立刻消费掉快照（只还原一次）。
+/// 快照不存在（正常启动）时完全不动 —— 这是重启路径专用开关，不能污染正常启动。
+fn restore_win_geom(app: &tauri::AppHandle) -> bool {
+    let Some(path) = win_geom_path() else { return true };
+    let Ok(txt) = std::fs::read_to_string(&path) else { return true };
+    let _ = std::fs::remove_file(&path);
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else { return true };
+    let Some(win) = app.get_webview_window("main") else { return true };
+    let sf = win.scale_factor().unwrap_or(1.0);
+    let w = v.get("w").and_then(|x| x.as_f64()).unwrap_or(1180.0);
+    let h = v.get("h").and_then(|x| x.as_f64()).unwrap_or(800.0);
+    let _ = win.set_size(tauri::PhysicalSize::new(
+        (w * sf) as u32,
+        (h * sf) as u32,
+    ));
+    let px = v.get("x").and_then(|x| x.as_f64());
+    let py = v.get("y").and_then(|x| x.as_f64());
+    if let (Some(x), Some(y)) = (px, py) {
+        let _ = win.set_position(tauri::PhysicalPosition::new((x * sf) as i32, (y * sf) as i32));
+    }
+    if v.get("max").and_then(|x| x.as_bool()).unwrap_or(false) {
+        let _ = win.maximize();
+    }
+    // 回读落日志：这是几何还原唯一的客观证据（窗口 API 在无 UIA 环境下取不到尺寸）
+    if let Ok(s) = win.inner_size() {
+        nav_write(&format!(
+            "win_geom restored: 实际 {}x{}（文件 {}x{} pos={:?},{:?}）",
+            s.width, s.height, w, h, px, py
+        ));
+    }
+    // 快照里的可见性：false = 用户当时把窗口藏在托盘（托盘点「刷新界面」），
+    // 那么重启后也不该硬弹到前台。
+    v.get("vis").and_then(|x| x.as_bool()).unwrap_or(true)
+}
+
+/// 派生一个新进程接管界面（进程级重启的唯一实现，`x8_restart` 与自愈链 ③ 共用）。
+///
+/// 关键点（每一条都是踩过的坑，别删）：
+///   · `--x8-restart` 让新进程跳过单实例互斥（此刻老进程还没退完）；
+///   · `--x8-parent=<pid>` 让它精确等老进程退出再建窗，根治两个进程抢 EBWebView 用户数据目录；
+///   · DETACHED_PROCESS 脱离老进程的进程组，避免老进程退出把新进程一起带走。
+fn spawn_self_restart() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let mut cmd = std::process::Command::new(&exe);
+    for a in std::env::args_os().skip(1) {
+        // 之前就是被 --x8-restart 拉起来的，别把旧标记复制过去（否则越滚越多）；
+        // --x8-parent 同理（只给一次，指向上一代老进程），避免 PID 链越滚越长。
+        let s = a.to_string_lossy();
+        if s == "--x8-restart" || s.starts_with("--x8-parent=") {
+            continue;
+        }
+        cmd.arg(a);
+    }
+    cmd.arg("--x8-restart");
+    // 把当前（老）进程 PID 传给子进程，让它精确等到本进程退出再建窗，根治 WebView2 抢锁。
+    cmd.arg(format!("--x8-parent={}", std::process::id()));
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+    cmd.spawn().map_err(|e| format!("spawn: {e}"))?;
+    Ok(())
+}
+
+/// 分诊探针：`im.x8fde.com:443` 至少能建 TCP 连接。
+///
+/// 目的不是测服务健康，而是把两类故障分开 —— 这两类的正确处置完全相反：
+///   · 探针通、navigate 不 commit  → 渲染进程坏了 → 重启进程有意义；
+///   · 探针不通（DNS/出口/断网）   → 重启只会从「窗口不见了」变成「白屏反复重启」，更糟，
+///     必须原地放弃，让页面自己显示离线态 / 重试按钮。
+fn origin_reachable() -> bool {
+    use std::net::{TcpStream, ToSocketAddrs};
+    use std::time::Duration;
+    let Ok(addrs) = "im.x8fde.com:443".to_socket_addrs() else {
+        return false;
+    };
+    for a in addrs.take(3) {
+        if TcpStream::connect_timeout(&a, Duration::from_millis(1500)).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+/// ③ 兜底（替代原「销毁重建主窗」）：进程级重启。
+///
+/// 为什么不再同进程重建：见 `RUN_RESTART_DONE` 上方的机制说明 —— destroy 是主线程的
+/// 阻塞调用，而能走到 ③ 的场景恰恰是渲染进程已不健康、最可能卡死的时候。
+///
+/// 顺序（每一步都不能省）：
+///   ① 节流：本次运行只重启一次，第二次放弃并要求手动重启；
+///   ② 分诊：网络不可达就别重启（会变成白屏反复重启）；
+///   ③ 快照窗口几何 → 派生新进程 → 600ms 后**硬退**（卡死场景下事件循环不可信，
+///      绝不能用 `app.exit(0)` 等握手）。
+async fn restart_in_place(app: &tauri::AppHandle) -> Result<String, String> {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    // ① 节流
+    if RUN_RESTART_DONE.swap(true, Ordering::SeqCst) {
+        nav_write("restart aborted: 本次运行已重启过，请用户手动重启邦信");
+        nav_report("nav-restart-giveup");
+        return Ok("giveup".into());
+    }
+
+    // ② 分诊：探针放阻塞线程池（建连最长 4.5s，不能占 async 运行时）
+    let reachable = tauri::async_runtime::spawn_blocking(origin_reachable)
+        .await
+        .unwrap_or(false);
+    if !reachable {
+        // 没真正重启 → 把配额还回去，等网络恢复后还能再自愈一次（否则一次误判就永久放弃）
+        RUN_RESTART_DONE.store(false, Ordering::SeqCst);
+        nav_write("restart aborted: im.x8fde.com:443 不可达（网络/出口问题，重启无益）");
+        nav_report("nav-restart-offline");
+        return Ok("offline".into());
+    }
+
+    // ③ 快照 → 派生 → 硬退
+    save_win_geom(app);
+    nav_write("③ 同进程重建已废弃 → 进程级重启（spawn --x8-restart）");
+    nav_report("nav-restart-start");
+    if let Err(e) = spawn_self_restart() {
+        // 派生失败同样不算「用掉配额」，否则用户点刷新会一直 giveup
+        RUN_RESTART_DONE.store(false, Ordering::SeqCst);
+        nav_write(&format!("restart spawn err {e}"));
+        return Err(format!("spawn: {e}"));
+    }
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_millis(600));
+        // 插件宿主是独立进程，先收干净再走，避免新进程起来时抢同一批端口/socket。
+        wx_sidecar::stop_all_fast();
+        nav_write("restart: 硬退 process::exit(0)（不等事件循环）");
+        std::process::exit(0);
+    });
+    Ok("restarting".into())
+}
+
+/// ①主通道 + 自愈链（2026-11-13 二改 / 2026-11-15 晚三改）：
+///   ① navigate → ② eval 注入导航 → ③ 进程级重启（原「销毁重建主窗」已废弃，
+///     原因见 `RUN_RESTART_DONE` 上方机制说明）。
+/// 每一步都用「真实 URL 是否变化」判定，而不是信 API 的返回值。
+/// 前端只发一次信号、不传 URL，因此不存在双导航竞态，也不需要它再补任何兜底。
+#[tauri::command]
+async fn x8_reload_ui(app: tauri::AppHandle) -> Result<String, String> {
+    // 已有一路自愈在跑（最长约 5.3s）时直接让位：再开一路只会重复导航、甚至并发建窗。
+    let _guard = match NavGuard::acquire() {
+        Some(g) => g,
+        None => {
+            nav_write("reload_ui busy（上一次自愈未结束，忽略本次）");
+            return Ok("busy".into());
+        }
+    };
+    let ts = chrono::Utc::now().timestamp_millis();
+    let target = format!("https://im.x8fde.com/app/?_b=rust{ts}");
+    let marker = format!("_b=rust{ts}");
+    nav_write(&format!("reload_ui start target={target}"));
+
+    // ① 宿主 navigate
+    if let Some(w) = app.get_webview_window("main") {
+        match tauri::Url::parse(&target) {
+            Ok(u) => {
+                if let Err(e) = w.navigate(u) {
+                    nav_write(&format!("① navigate err {e}"));
+                }
+            }
+            Err(e) => nav_write(&format!("① url err {e}")),
+        }
+    }
+    if wait_url_contains(&app, &marker, 2600).await {
+        nav_write("① navigate commit ✓");
+        nav_report("nav-ok step=navigate");
+        return Ok("navigate".into());
+    }
+    nav_write("① navigate 未 commit（URL 没变）→ ② eval 导航");
+
+    // ② 页面内 eval 导航（绕开宿主 navigate 通道）
+    if let Some(w) = app.get_webview_window("main") {
+        let js = format!(
+            "(function(){{try{{location.replace('{t}')}}catch(e){{try{{location.href='{t}'}}catch(e2){{}}}}}})()",
+            t = target
+        );
+        if w.eval(&js).is_ok() {
+            nav_write("② eval-nav fired");
+        }
+    }
+    if wait_url_contains(&app, &marker, 2200).await {
+        nav_write("② eval commit ✓");
+        nav_report("nav-ok step=eval");
+        return Ok("eval".into());
+    }
+    nav_write("② eval 未 commit → ③ 进程级重启（同进程重建已废弃）");
+
+    // ③ 进程级重启
+    restart_in_place(&app).await
+}
+
+/// ③兜底（前端 15 秒看门狗调用）：eval 注入导航 → 仍未跳则销毁主窗重建。
+#[tauri::command]
+async fn x8_rebuild_ui(app: tauri::AppHandle) -> Result<String, String> {
+    // 与 x8_reload_ui 共用一把锁：看门狗兜底与用户点击撞车时，后到者让位。
+    let _guard = match NavGuard::acquire() {
+        Some(g) => g,
+        None => {
+            nav_write("rebuild_ui busy（上一次自愈未结束，忽略本次）");
+            return Ok("busy".into());
+        }
+    };
+    let ts = chrono::Utc::now().timestamp_millis();
+    let target = format!("https://im.x8fde.com/app/?_b=rb{ts}");
+    let marker = format!("_b=rb{ts}");
+    nav_write(&format!("rebuild_ui start target={target}"));
+
+    if let Some(w) = app.get_webview_window("main") {
+        let js = format!(
+            "(function(){{try{{location.replace('{t}')}}catch(e){{try{{location.href='{t}'}}catch(e2){{}}}}}})()",
+            t = target
+        );
+        if w.eval(&js).is_ok() {
+            nav_write("rebuild_ui eval-nav fired");
+        }
+    }
+    if wait_url_contains(&app, &marker, 2200).await {
+        nav_write("rebuild_ui after-eval commit ✓");
+        return Ok("eval-nav".into());
+    }
+    nav_write("rebuild_ui eval 未 commit → 进程级重启");
+    restart_in_place(&app).await
+}
+
+
 
 fn main() {
     // 2026-10-23 老8：先上硬单实例锁，再初始化任何 GUI/WebView（顺序不能反，
@@ -6277,6 +7858,13 @@ fn main() {
             fde_float_show,
             fde_float_hide,
             fde_float_click,
+            // 2026-11-16 AI邦 卡通精灵：手动收起 / 拖动 + 位置记忆 / 免打扰 / 状态查询
+            pet_close,
+            pet_drag_begin,
+            pet_pos_save,
+            pet_set_muted,
+            pet_set_avatar,
+            pet_status,
             // 2026-10-23 升级中进度小窗（老8：要看到正在下载 / 已用 / 剩余时间）
             upd_float_show,
             upd_float_hide,
@@ -6307,6 +7895,9 @@ fn main() {
             x8_restart,
             // 2026-11-05 换版导航收归宿主（页面自己 location.replace 会被 WebView2 吞掉）
             x8_nav,
+            // 2026-11-13 刷新链重做：主通道（Rust 自拼 URL 导航）+ 兜底（eval 导航→重建主窗）
+            x8_reload_ui,
+            x8_rebuild_ui,
             // 2026-11-05 登录凭据宿主侧留底：升级 / 清缓存后仍能自动登录，不必再扫码
             x8_auth_save,
             x8_auth_load,
@@ -6328,11 +7919,11 @@ fn main() {
             //   AppManifest / capabilities/remote.json / 命令定义处）
             wx_cache::plugins_list,
             wx_cache::wx_plugin_info,
+            // 2026-11-17 本机 W 服务探活（127.0.0.1:60999；mac 端 W消息 用它判服务在不在）
             wx_cache::wx_svc_ping,
             wx_cache::wx_plugin_start,
             wx_cache::wx_plugin_prepare,
             wx_cache::wx_plugin_update_now,
-            wx_cache::wx_plugin_rollback,
             wx_cache::wx_plugin_stop,
             wx_cache::wx_conversations,
             wx_cache::wx_messages,
@@ -6342,23 +7933,87 @@ fn main() {
             wx_cache::wx_customer_list,
             wx_cache::wx_customer_set,
             wx_cache::wx_status,
+            mac_wx_setup::wx_setup_state,
+            mac_wx_setup::wx_setup_run,
+            mac_wx_setup::wx_restore_wechat,
+            mac_wx_setup::wx_wechat_relogin,
             wx_cache::wx_sync_now,
             wx_cache::wx_set_active,
             wx_cache::wx_pick_messages,
             wx_cache::wx_media_data,
-            // 2026-11-16 整改：本地微信读取链已从签名分发版摘除，四个命令恒返回 unsupported
-            // （命令表保留是为了三端一致，前端调用不报 unknown command）
-            mac_wx_setup::wx_setup_state,
-            mac_wx_setup::wx_setup_run,
-            mac_wx_setup::wx_restore_wechat,
-            mac_wx_setup::wx_wechat_relogin
+            // 2026-11-13 自动落盘文件保留期（个人资料 → 本地文件自动清理）
+            // 四处同步：本表 / build.rs 名单 / capabilities/remote.json / 命令定义处
+            file_retention_get,
+            file_retention_set,
+            file_retention_clean,
+            // 2026-11-14 开机自启动（默认开、可关）
+            // 四处同步：本表 / build.rs 名单 / capabilities/remote.json / 命令定义处
+            autostart_get,
+            autostart_set,
+            // 2026-11-16 IPC 卡死定性探针：同步/异步双 ping，只回不卡（四处同步）
+            ipc_probe::x8_ping,
+            ipc_probe::x8_ping_async
         ])
         .setup(|app| {
+            // 2026-11-16 IPC 定性探针：日志落 app_data_dir/ipc_probe.log
+            if let Ok(dir) = app.path().app_data_dir() {
+                crate::ipc_probe::init(dir);
+                crate::ipc_probe::mark("SETUP probe ready".to_string());
+            }
+            // 2026-11-10 插件宿主：挂看门狗（插件被风控杀掉 / 自己 panic 后自愈）。
+            // 注意不在这里拉起插件 —— 用户点开「Wx消息」页签时才启动，不占常驻内存。
+            plugin_host::init(app.handle());
+            // 2026-11-15 晚：自愈链 ③ 改成进程级重启后，新进程据此还原窗口几何。
+            // 只有重启前写过快照才生效（一次性消费），正常启动完全不受影响。
+            let want_vis = restore_win_geom(app.handle());
+            // mac/linux 不走上面那段（那边没有「建窗不置可见」的问题），避免 unused 警告
+            #[cfg(not(target_os = "windows"))]
+            let _ = want_vis;
+            // 🔴 2026-11-15 晚（老8「界面刷新不了」现场）：自愈链 ③ 改成进程级重启后，
+            // 20:03 那次重启出现「进程活着、主窗存在、位置尺寸都还原了，但 IsWindowVisible=0」
+            // —— 用户眼前什么都没有，只能判程序挂了。EnumWindows 实测证据：
+            //   class='Tauri Window'  title='邦信 v1.6.99 … [B10089-庞小刚]'
+            //   visible=False  rect=(334,77) 1196x839   ← 几何还原成功，唯独没显示
+            // tao 在 Windows 上有极小概率建窗后不置 WS_VISIBLE（与旧进程退出的时序有关），
+            // 且没有任何日志能看出它发生过。这里只对重启路径补两道 show：
+            //   ① setup 内立刻 show（窗口此刻一定已建好，restore_win_geom 已成功操作过它）
+            //   ② 1.5s 后再复查一次（防 Tauri/WebView2 初始化末段又把可见性改回去）
+            // 正常启动不走这段，行为零变化。
+            #[cfg(target_os = "windows")]
+            if want_vis && std::env::args().any(|a| a == "--x8-restart") {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.show();
+                    let _ = w.unminimize();
+                    if !w.is_visible().unwrap_or(false) {
+                        nav_write("restart-child: setup 内 show 未生效（窗口仍不可见）");
+                    } else {
+                        nav_write("restart-child: setup 内强制 show ok");
+                    }
+                }
+                let h2 = app.handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    if let Some(w) = h2.get_webview_window("main") {
+                        if !w.is_visible().unwrap_or(false) {
+                            let _ = w.show();
+                            let _ = w.unminimize();
+                            let _ = w.set_focus();
+                            nav_write("restart-child: 1.5s 复查发现主窗不可见 → 已补 show");
+                        }
+                    }
+                });
+            }
             // 2026-11-07 方案 B PoC：本地静态资源拦截（未配置时直接 return，零行为变化）
             #[cfg(windows)]
             local_assets::install(app.handle());
             // 2026-11-06：本地落盘 HTTP 服务（绕开 WebView2 IPC 大包「发了不回」）
-            save_http_start();
+            save_http_start(app.handle().clone());
+            // 2026-11-16：组件自主更新（不依赖前端点页签触发，见函数注释）
+            spawn_wx_autoupdate(app.handle().clone());
+            // 2026-11-13：自动落盘文件保留期清理（下载/downfiles，默认 10 天，最少 1 天）
+            spawn_retention_cleaner();
+            // 2026-11-14 开机自启动：默认开启 + 每次启动对齐系统自启动项（失败只记日志）
+            autostart_boot_sync();
             // 2026-11-07 新邮件轮询（30 分钟 / 9-18 点 / 固定相位抖动 / 启动补查）
             mail::spawn_poller(app.handle().clone());
             // 2026-11-07 P2-8 探针：Linux WebKitGTK 默认 enable-webrtc=FALSE，wry 没开。
@@ -6425,6 +8080,22 @@ fn main() {
             }
 
             let open = MenuItem::with_id(app, "open", "打开邦信", true, None::<&str>)?;
+            // 2026-11-17 老8：托盘加「召唤 AI邦」+「开机自启动」勾选开关。
+            // 召唤 = 精灵唯一的手动出镜入口（原来只能等一条不属于当前会话的新消息，
+            // 主窗开着正看那个会话时永远不出现，用户无从验证它到底在不在）。
+            let summon = MenuItem::with_id(app, "summon", "召唤 AI邦", true, None::<&str>)?;
+            // 勾选态取系统实际值（用户可能在任务管理器里禁用过），不是配置文件里的意图
+            let autostart = CheckMenuItem::with_id(
+                app,
+                "autostart",
+                "开机自启动",
+                true,
+                autostart_sys::is_on(),
+                None::<&str>,
+            )?;
+            // 2026-11-13：页面里的刷新链在 WebView2 上不可靠（导航发起却不 commit），
+            // 托盘这一项由 Rust 直接导航，完全不经过页面 JS/IPC，是最后一道可靠入口。
+            let refresh_ui = MenuItem::with_id(app, "refresh_ui", "刷新界面", true, None::<&str>)?;
             // 2026-10-23 托盘菜单完善（A）：加「检查更新」+ 版本只读标签 + 分隔线，与微信式托盘一致
             let check_updates = MenuItem::with_id(app, "check_updates", "检查更新", true, None::<&str>)?;
             let ver_label = MenuItem::with_id(
@@ -6432,16 +8103,62 @@ fn main() {
             )?;
             let sep = PredefinedMenuItem::separator(app)?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&open, &check_updates, &ver_label, &sep, &quit])?;
+            let menu = Menu::with_items(
+                app,
+                &[
+                    &open,
+                    &summon,
+                    &refresh_ui,
+                    &check_updates,
+                    &autostart,
+                    &ver_label,
+                    &sep,
+                    &quit,
+                ],
+            )?;
+            // TrayIcon 没有 menu() getter（tauri 2.12 只有 set_menu），勾选态只能靠
+            // 自己留着这个 item 的句柄来回填 —— clone 一份 move 进菜单事件闭包。
+            let autostart_item = autostart.clone();
             TrayIconBuilder::with_id("x8im-tray")
                 .icon(tray_icon_image())
                 .tooltip("邦信即时通讯")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
-                .on_menu_event(|app, event| match event.id.as_ref() {
+                .on_menu_event(move |app, event| match event.id.as_ref() {
                     "open" => show_main(app),
+                    // 召唤 AI邦：不看消息、不看 enabled，点了就必须在屏上出现
+                    "summon" => pet_summon(app),
+                    // 开机自启动：点一下翻转，落盘 + 写系统项；勾选态一律按**写后的系统实际值**回填，
+                    // 写失败（注册表被策略锁死等）时不会出现「勾上了其实没生效」的假象
+                    "autostart" => {
+                        let want = !autostart_sys::is_on();
+                        match autostart_set(want) {
+                            Ok(_) => nav_write("tray autostart ok"),
+                            Err(e) => nav_write(&format!("tray autostart err {e}")),
+                        }
+                        let now = autostart_sys::is_on();
+                        let _ = autostart_item.set_checked(now);
+                        // 让页面的「个人资料 → 开机自启动」跟着变（它监听同一个事件）
+                        evq::push(
+                            &app,
+                            "x8-tray-autostart",
+                            serde_json::json!({ "enabled": now }),
+                        );
+                    }
+                    // 刷新界面：Rust 直接导航，不经页面 JS/IPC —— 页面刷新链失灵时的可靠入口
+                    "refresh_ui" => {
+                        let h = app.clone();
+                        // 2026-11-13 二改：x8_reload_ui 现在是 async 自愈链（navigate→eval→重建），
+                        // 托盘这条必须走 async 运行时，不能再用裸线程同步调。
+                        tauri::async_runtime::spawn(async move {
+                            match x8_reload_ui(h).await {
+                                Ok(m) => nav_write(&format!("tray refresh_ui ok mode={m}")),
+                                Err(e) => nav_write(&format!("tray refresh_ui err {e}")),
+                            }
+                        });
+                    }
                     // 检查更新：发事件给前端，复用 checkUpdBoth 的进度条/静默升级 UI（manual=true）
-                    "check_updates" => { let _ = app.emit("x8-tray-check-updates", ()); }
+                    "check_updates" => { evq::push(&app, "x8-tray-check-updates", serde_json::json!(null)); }
                     // 2026-11-07 老8 二报「托盘退出仍无反应」：上面的 600ms 硬退兜底
                     // 和 kill_rustdesk_procs() 写在**同一线程**，一旦 kill 卡在管道 EOF
                     // （见 win_run_capture_to 注释），app.exit(0) 与 process::exit(0)
@@ -6451,6 +8168,8 @@ fn main() {
                     "quit" => {
                         std::thread::spawn(|| {
                             std::thread::sleep(std::time::Duration::from_millis(800));
+                            // P1-3：800ms 硬退兜底同样要收插件。
+                            wx_sidecar::stop_all_fast();
                             std::process::exit(0);
                         });
                         let h = app.clone();
@@ -6462,12 +8181,104 @@ fn main() {
                     }
                     _ => {}
                 })
+                // 2026-11-17 老8 报「托盘有消息一闪一闪的，就是点不开」：
+                // 根因是这里原先只绑了 DoubleClick，而上面 show_menu_on_left_click(false)
+                // 又让左键不弹菜单 —— 左键单击既不开窗、也无人接管，等于点在空气上
+                // （用户看到图标在闪却怎么点都没反应，必被判成「死了」）。
+                // 改为左键单击即唤起（与微信/QQ 一致），双击也保留，show_main 幂等不会互相干扰。
                 .on_tray_icon_event(|tray, event| {
-                    if let TrayIconEvent::DoubleClick { .. } = event {
-                        show_main(tray.app_handle());
+                    // 2026-11-17 C：托盘点击此前在日志里完全无痕，现场无法区分
+                    // 「事件根本没到进程」和「到了但处理无声」。入口无条件落一笔。
+                    // ⚠️ Move 必须排除：鼠标划过图标区就发，一次几十条，会把 nav.log 冲爆。
+                    match &event {
+                        TrayIconEvent::Move { .. } => return,
+                        TrayIconEvent::Click {
+                            button,
+                            button_state,
+                            ..
+                        } => nav_write(&format!("tray ev: click {button:?}/{button_state:?}")),
+                        TrayIconEvent::DoubleClick { button, .. } => {
+                            nav_write(&format!("tray ev: dblclick {button:?}"))
+                        }
+                        // Enter / Leave 是鼠标进出图标区，与「点了没反应」无关，不记
+                        _ => {}
+                    }
+                    match event {
+                        TrayIconEvent::Click {
+                            button: tauri::tray::MouseButton::Left,
+                            button_state: tauri::tray::MouseButtonState::Up,
+                            ..
+                        } => tray_open_main(tray.app_handle()),
+                        TrayIconEvent::DoubleClick { .. } => tray_open_main(tray.app_handle()),
+                        _ => {}
                     }
                 })
                 .build(app)?;
+            // 2026-11-17 二改：**不再钉 v4**（那是 1.7.11/1.7.12「点不动」的根因，见 tray_hook 注释）。
+            // 改为给 tray_icon_app 挂 wndproc 钩子：点击不再依赖 Shell_NotifyIconGetRect，
+            // 且回调消息原样进 nav.log（`tray raw:`），下次再哑掉能一眼分清「没收到」和「收到了没处理」。
+            #[cfg(target_os = "windows")]
+            tray_hook_install(app.handle().clone());
+            // 启动收口（1.7.13）：图标记录版本修回 v3 + 硬写 tooltip + 注册自检。
+            // 真机实测（1.7.12）：图标在、szTip 空、点击消息到了窗口却没人接（v4 记录残留）。
+            #[cfg(target_os = "windows")]
+            {
+                let h = app.handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    tray_fixup(&h);
+                });
+            }
+            // 2026-11-17：托盘点击「看得见、点不动」的兜底——常驻自愈线程（见 start_tray_heal）。
+            start_tray_heal(app.handle().clone());
+            // 2026-11-17 C：上次自动升级到底成没成？5 秒后自检一次（成功清残留包 / 失败计数）。
+            {
+                let h = app.handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    upgrade_selfcheck(&h);
+                });
+            }
+            // 2026-11-17：AI邦 浮窗**取消启动期预建**。
+            // 预建走的是 `visible(false)` 建窗 → 真机上窗口 vis=1、rect 正确、非 cloaked，
+            // 但 WebView2 一点内容都不画（连不透明档该有的白底都没有）＝隐藏期初始化合成层失败。
+            // 现在运行期建窗已能成功（靠独立 data_directory，见 fde_build_window），
+            // 所以改为「要显示时就地建一个可见窗口」，最直观也最不容易出这种歪状态。
+            // 2026-11-17 晚：AI邦 **默认打开着**（老8：平时不需要自动关，想关有 ✕）。
+            // 延迟 3s 等主窗首屏先出来，别跟登录页抢焦点；建的是可见窗口（见 fde_build_window
+            // 里「隐藏期建窗不画内容」的坑），出来就钉住，只有 ✕ / 右键收起 / 点精灵才收。
+            {
+                let h = app.handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    pet_autoshow(&h);
+                });
+            }
+            // 诊断口子：`set X8_PET_DEMO=1` → 4 秒后自动召唤一次；`=2` → 4s 与 16s 各一次
+            // （第二次专测「重复召唤」：早先 destroy 竞态就是第二下把窗口搞没的）。
+            // 只为「不点托盘也能验证浮窗」用（售后排查、真机验收），不设就完全不触发。
+            match std::env::var("X8_PET_DEMO").as_deref() {
+                Ok("1") => {
+                    let h = app.handle().clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_secs(4));
+                        pet_summon(&h);
+                        nav_write("[pet] X8_PET_DEMO 自动召唤 #1");
+                    });
+                }
+                Ok("2") => {
+                    let h = app.handle().clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_secs(4));
+                        pet_summon(&h);
+                        nav_write("[pet] X8_PET_DEMO 自动召唤 #1");
+                        std::thread::sleep(std::time::Duration::from_secs(12));
+                        pet_summon(&h);
+                        nav_write("[pet] X8_PET_DEMO 自动召唤 #2（重复召唤）");
+                    });
+                }
+                _ => {}
+            }
             // 2026-10-18 问题2 排查结论：boot 路径无启动期 hide（仅 CloseRequested 才 hide 到托盘），
             // 甘真机确认主窗是手动最小化，非代码缺陷。此处加一道保险——启动即把主窗唤到前台：
             // mac 上 Dock/菜单栏若自动隐藏、托盘图标易被忽略，会观感「窗口没出来」。Windows/Linux
@@ -6555,10 +8366,60 @@ fn main() {
             //   workbench → 真关闭，并把主窗邦信唤到前台（关闭 = 返回 IM）
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
-                    let _ = window.hide();
-                    // 2026-11-02 白屏自愈：记下藏入托盘的时刻，show_main 据此判断是否需要 reload
-                    *MAIN_HIDDEN_AT.lock().unwrap() = Some(std::time::Instant::now());
                     api.prevent_close();
+                    // 2026-11-17 A：藏到托盘的前提是「托盘那个图标真能点」。
+                    // 老8 新机实测：升级断在半路 → 托盘只剩僵尸残影 → 点 X 窗口藏起来，
+                    // 然后既叫不回来、托盘也没菜单，整个人以为程序死了。
+                    // 先就地重注册一次；仍拿不到矩形（含图标被折进溢出面板）就**降级最小化**：
+                    // 窗口留在任务栏，人还能点回来，绝不制造「窗口和托盘同时消失」的死局。
+                    let app = window.app_handle();
+                    // 2026-11-17 C：这条链此前**一行日志都没有** —— 现场「点 X 没反应」时
+                    // 既看不出 CloseRequested 到没到、也看不出 hide 成没成。入口先落一笔：
+                    // vis_before 用 Win32 查（tauri 的 is_visible 读的是会失同步的标志位）。
+                    #[cfg(target_os = "windows")]
+                    let hw: Option<*mut std::ffi::c_void> = window.hwnd().ok().map(|h| h.0);
+                    #[cfg(target_os = "windows")]
+                    let vis_before = hw.map(w32_visible).unwrap_or(false);
+                    #[cfg(not(target_os = "windows"))]
+                    let vis_before = window.is_visible().unwrap_or(false);
+                    let rect_ok = tray_rect_alive(app);
+                    let tray_ok = rect_ok || tray_revive(app);
+                    if tray_ok {
+                        let _ = window.hide();
+                        // 2026-11-17 A：hide() 可能因 tao 幂等位陈旧而**空转**（返回 Ok 但
+                        // 窗口纹丝不动，正是「第 1 次有效、第 2 次起永久失效」的现场）。
+                        // 复核真实可见性，没藏掉就 Win32 强压一次。
+                        #[cfg(target_os = "windows")]
+                        if hw.map(w32_visible).unwrap_or(false) {
+                            if let Some(h) = hw {
+                                w32_hide(h);
+                            }
+                            nav_write("close: tao hide 空转（标志位陈旧）→ Win32 SW_HIDE 强制隐藏");
+                        }
+                        // 2026-11-02 白屏自愈：记下藏入托盘的时刻，show_main 据此判断是否需要 reload
+                        *MAIN_HIDDEN_AT.lock().unwrap() = Some(std::time::Instant::now());
+                        #[cfg(target_os = "windows")]
+                        let still = hw.map(w32_visible).unwrap_or(false);
+                        #[cfg(not(target_os = "windows"))]
+                        let still = window.is_visible().unwrap_or(false);
+                        nav_write(&format!(
+                            "close: 藏入托盘 vis_before={vis_before} rect_alive={rect_ok} revived={} still_visible={}",
+                            !rect_ok, still
+                        ));
+                    } else {
+                        nav_write(&format!(
+                            "close: 托盘图标取不到矩形（残影或折进溢出面板）→ 降级为最小化 vis_before={vis_before}"
+                        ));
+                        let _ = window.minimize();
+                        // 最小化的复核判据是 IsIconic —— 最小化窗口 IsWindowVisible 仍为真。
+                        #[cfg(target_os = "windows")]
+                        if let Some(h) = hw {
+                            if !w32_iconic(h) {
+                                w32_minimize(h);
+                                nav_write("close: tao minimize 空转 → Win32 SW_MINIMIZE 强制最小化");
+                            }
+                        }
+                    }
                 } else {
                     show_main(window.app_handle());
                 }
@@ -6574,6 +8435,8 @@ fn main() {
                 tauri::RunEvent::Exit => {
                     // sidecar 是子进程，主程序退出必须显式收掉，否则残留
                     p2p_sidecar::stop_all();
+                    // 2026-11-10 老8 定：邦信关 → WX 消息插件必关
+                    wx_sidecar::stop_all();
                     kill_rustdesk_procs();
                 }
                 // 2026-10-19 修「窗口最小化后无法恢复」：macOS 点 Dock 图标 / LaunchServices

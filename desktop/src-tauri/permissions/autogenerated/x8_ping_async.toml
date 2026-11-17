@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-x8-ping-async"
+description = "Enables the x8_ping_async command without any pre-configured scope."
+commands.allow = ["x8_ping_async"]
+
+[[permission]]
+identifier = "deny-x8-ping-async"
+description = "Denies the x8_ping_async command without any pre-configured scope."
+commands.deny = ["x8_ping_async"]

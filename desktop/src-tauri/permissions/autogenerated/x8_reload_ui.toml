@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-x8-reload-ui"
+description = "Enables the x8_reload_ui command without any pre-configured scope."
+commands.allow = ["x8_reload_ui"]
+
+[[permission]]
+identifier = "deny-x8-reload-ui"
+description = "Denies the x8_reload_ui command without any pre-configured scope."
+commands.deny = ["x8_reload_ui"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-pet-pos-save"
+description = "Enables the pet_pos_save command without any pre-configured scope."
+commands.allow = ["pet_pos_save"]
+
+[[permission]]
+identifier = "deny-pet-pos-save"
+description = "Denies the pet_pos_save command without any pre-configured scope."
+commands.deny = ["pet_pos_save"]

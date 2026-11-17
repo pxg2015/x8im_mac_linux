@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-pet-status"
+description = "Enables the pet_status command without any pre-configured scope."
+commands.allow = ["pet_status"]
+
+[[permission]]
+identifier = "deny-pet-status"
+description = "Denies the pet_status command without any pre-configured scope."
+commands.deny = ["pet_status"]

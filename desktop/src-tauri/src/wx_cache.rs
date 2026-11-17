@@ -96,14 +96,6 @@ pub struct WxStatusView {
     /// 本机微信是否在跑。None = 不知道（插件没起，问不到），false = 明确没开。
     /// 前端只在明确 false 时提示「微信未打开」，避免插件没起时误报。
     pub wechat_running: Option<bool>,
-    /// 最近一轮采集的密钥结果（插件 /api/status 的 key_status）：
-    /// "ok" = 密钥可用；"error" = 本轮失败（含密钥获取失败/解密失败）；
-    /// 空串 = 插件刚起、还没跑过一轮，前端按「未知」处理。
-    /// 2026-11-12：UI 靠它把「系统权限都齐、只是密钥没取到」单独识别出来，
-    /// 才能把 mac 三步向导按「密钥失效」重新顶出来（见 WxMsgPanel.vue）。
-    pub key_status: String,
-    /// 密钥来源/熔断说明（复用缓存 / 已重新获取 / 熔断中），只用于展示。
-    pub key_note: String,
 }
 
 // ── 会话列表（按最新消息时间倒序）────────────────────────────────────────────
@@ -475,18 +467,6 @@ pub fn status(app: &AppHandle) -> Result<WxStatusView, String> {
         if let Ok(raw) = crate::wx_sidecar::http_get("/api/status", 1500) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
                 st.wechat_running = v.get("wechat_running").and_then(|x| x.as_bool());
-                // 2026-11-12：密钥结果透传给界面。wx_status 表里没有这两列（插件不改表结构），
-                // 只能问插件内存里的最近一轮状态；插件重启后为空 = 未知，不据此弹向导。
-                st.key_status = v
-                    .get("key_status")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                st.key_note = v
-                    .get("key_note")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("")
-                    .to_string();
             }
         }
     }
@@ -589,6 +569,7 @@ where
 /// WxMsgPanel 仍是硬编码页签，这里先把入口留着。
 #[tauri::command]
 pub fn plugins_list() -> serde_json::Value {
+    let _probe = crate::ipc_probe::Guard::enter("plugins_list");
     serde_json::json!({ "items": crate::plugin_host::list() })
 }
 
@@ -597,6 +578,7 @@ pub fn plugins_list() -> serde_json::Value {
 /// 也要显示 W消息页签，否则「打开页面自动下载」永远没机会触发。
 #[tauri::command]
 pub fn wx_plugin_info(app: tauri::AppHandle) -> serde_json::Value {
+    let _probe = crate::ipc_probe::Guard::enter("wx_plugin_info");
     let mut v = serde_json::json!({
         "available": crate::wx_sidecar::available(),
         "running": crate::wx_sidecar::running(),
@@ -612,9 +594,9 @@ pub fn wx_plugin_info(app: tauri::AppHandle) -> serde_json::Value {
 }
 
 /// 本机 W 服务探活（2026-11-17 老8 定）。
-/// 为什么放在宿主里：页面跑在 WKWebView 中，https 页面去 fetch http://127.0.0.1:60999
-/// 会被混合内容 / WKWebView 策略拦掉（wxgo 也不发 CORS 头），探活必须由 Rust 做 ——
-/// 回环 HTTP 是宿主的地盘，与 WebView 策略无关。
+/// 为什么放在宿主里：页面跑在 WebView 中，https 页面去 fetch http://127.0.0.1:60999
+/// 会被混合内容 / WebView 策略拦掉（wxgo 也不发 CORS 头），探活必须由 Rust 做 ——
+/// 回环 HTTP 是宿主的地盘，与 WebView 策略无关。mac 端 W消息 正是用这条命令判「W 服务在不在」。
 ///
 /// 判定：**任何 HTTP 响应（哪怕 401）都算「服务在听」**。wxgo 独立版的 /api/* 要令牌，
 /// 页面拿不到，401 恰好证明进程活着、端口在听；只有连接被拒 / 超时才判没起来。
@@ -674,6 +656,7 @@ fn svc_ping(port: u16, path: &str, timeout_ms: u64) -> serde_json::Value {
 /// 断网 / CDN 故障时保留旧版并照常启动，绝不阻断页面。
 #[tauri::command]
 pub async fn wx_plugin_prepare(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    let _probe = crate::ipc_probe::Guard::enter("wx_plugin_prepare");
     blocking(move || crate::wx_updater::prepare(&app, false)).await
 }
 
@@ -681,14 +664,6 @@ pub async fn wx_plugin_prepare(app: tauri::AppHandle) -> Result<serde_json::Valu
 #[tauri::command]
 pub async fn wx_plugin_update_now(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
     blocking(move || crate::wx_updater::prepare(&app, true)).await
-}
-
-/// 组件逃生口（2026-11-12）：新版起不来 / 新版本身有问题时，手动退回上一版。
-/// 宿主不再自动回退（自动回退会掩盖问题、让用户以为「一直没更新成功」），
-/// 由用户显式点「回退到上一版」；这里顺带解除该版本的封禁记录。
-#[tauri::command]
-pub async fn wx_plugin_rollback(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
-    blocking(move || crate::wx_updater::rollback_to_prev(&app)).await
 }
 
 /// 确保插件已启动（点「Wx消息」页签时调一次；已启动则秒回）。
@@ -804,14 +779,9 @@ pub async fn wx_status(app: tauri::AppHandle) -> Result<WxStatusView, String> {
 /// 插件用 `{ok:false,error:"..."}` 表达「微信未打开」这类业务失败 —— 一律转成
 /// Err，让界面原样弹出来，不要显示「已同步」骗人。
 #[tauri::command]
-pub async fn wx_sync_now(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+pub async fn wx_sync_now(_app: tauri::AppHandle) -> Result<serde_json::Value, String> {
     blocking(move || {
-        // 先确保插件在跑（mac 上插件由 LaunchAgent 拉起，可能因崩溃/被停而死掉；
-        // 直接 POST 会得到「插件无响应」这种毫无信息的错误）。
-        crate::wx_sidecar::ensure_started(&app)?;
-        // 超时对齐 keyext：mac 密钥捕获要在微信「退出登录 → 重新登录」时挂断点，
-        // 窗口 180s；这里留 240s，否则用户慢一步就被宿主判超时、白抓一轮。
-        let raw = crate::wx_sidecar::http_post("/api/capture", "{}", 240_000)?;
+        let raw = crate::wx_sidecar::http_post("/api/capture", "{}", 120_000)?;
         let v = serde_json::from_str::<serde_json::Value>(&raw)
             .unwrap_or_else(|_| serde_json::json!({ "ok": true }));
         if v.get("ok").and_then(|x| x.as_bool()) == Some(false) {
@@ -983,5 +953,111 @@ pub async fn wx_media_data(app: tauri::AppHandle, id: i64) -> Result<String, Str
         Err("该图片暂无法显示（微信私有格式或原文件已清理）".to_string())
     })
     .await
+}
+
+// ─────────────────────────────────────────────────────────────
+// 本地 HTTP 的 IPC 代理（2026-11-16）
+// ─────────────────────────────────────────────────────────────
+// 为什么要有这一层：WebView2 的 invoke 桥在部分机器上会「整条失效」——
+// 首条命令到了 Rust 并 0ms 返回，回包却没回到 JS，此后连最简单的命令都发不出去
+//（实证见 ipc_probe.log，以及 App.vue 里 reveal_file / x8_nav「永远 pending」的历史注释）。
+// 但主业务（登录、消息、收发）全部走 HTTP，从来没出过这个问题；本地落盘服务
+// （save_http：选文件/读文件/定位/落盘）也用同一套路稳定跑了半个月。
+//
+// 所以把 wx_* 命令在本地 HTTP 上再暴露一份：前端 inv() 优先走它，不可用才回退 IPC。
+// 老客户端没有 /x8ipc 路由 → 前端拿到 404 → 自动回退，行为完全不变。
+//
+// 这个函数只在独立 HTTP 线程里被调用（不是 tokio worker），
+// 因此对 async 命令用 block_on 同步等待是安全的。
+
+/// 单命令分发。返回 Err("UNKNOWN_CMD") 表示本层不接管，让路由层回 404、前端回退 IPC。
+pub fn http_dispatch(
+    app: &AppHandle,
+    cmd: &str,
+    a: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    use serde_json::json;
+    let sv = |k: &str| a.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let iv = |k: &str, d: i64| a.get(k).and_then(|x| x.as_i64()).unwrap_or(d);
+    let bv = |k: &str, d: bool| a.get(k).and_then(|x| x.as_bool()).unwrap_or(d);
+
+    match cmd {
+        // —— 只读：状态 / 列表（WX 页签的绝大多数调用都在这里）
+        "plugins_list" => Ok(plugins_list()),
+        "wx_plugin_stop" => {
+            wx_plugin_stop();
+            Ok(serde_json::json!(null))
+        }
+        "wx_plugin_info" => Ok(wx_plugin_info(app.clone())),
+        // 本机 W 服务探活（2026-11-17）：HTTP 通道也接一条，别让前端每次多绕一次 404 回退
+        "wx_svc_ping" => Ok(tauri::async_runtime::block_on(wx_svc_ping())),
+        "wx_status" => to_json(status(app)),
+        "wx_conversations" => to_json(conversations(app, iv("limit", 200))),
+        "wx_messages" => to_json(messages(
+            app,
+            &sv("talker"),
+            &sv("q"),
+            iv("before", 0),
+            iv("limit", 100),
+            iv("since", 0),
+        )),
+        "wx_contacts" => to_json(contacts(
+            app,
+            &sv("q"),
+            bv("only_followed", false),
+            &sv("kind"),
+            iv("limit", 120),
+            iv("offset", 0),
+        )),
+        "wx_follow_get" => to_json(follow_list(app)),
+        "wx_customer_list" => to_json(customer_list(app)),
+
+        // —— 写：关注名单 / 客户名
+        "wx_follow_set" => {
+            let list: Vec<String> = a
+                .get("list")
+                .and_then(|x| x.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            follow_set(app, &list).map(|n| json!(n))
+        }
+        "wx_customer_set" => {
+            customer_set(app, &sv("wxid"), &sv("name")).map(|_| json!({ "ok": true }))
+        }
+
+        // —— 需要插件参与 / 原本是 async 包装的：用全局 runtime 同步等
+        "wx_media_data" => {
+            tauri::async_runtime::block_on(wx_media_data(app.clone(), iv("id", 0))).map(|s| json!(s))
+        }
+        "wx_sync_now" => tauri::async_runtime::block_on(wx_sync_now(app.clone())),
+        "wx_set_active" => tauri::async_runtime::block_on(wx_set_active(bv("active", false))),
+        "wx_plugin_start" => tauri::async_runtime::block_on(wx_plugin_start(app.clone())),
+        "wx_plugin_prepare" => tauri::async_runtime::block_on(wx_plugin_prepare(app.clone())),
+        "wx_plugin_update_now" => {
+            tauri::async_runtime::block_on(wx_plugin_update_now(app.clone()))
+        }
+        "wx_pick_messages" => {
+            let ids: Vec<i64> = a
+                .get("ids")
+                .and_then(|x| x.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
+                .unwrap_or_default();
+            to_json(tauri::async_runtime::block_on(wx_pick_messages(
+                app.clone(),
+                ids,
+            )))
+        }
+
+        _ => Err("UNKNOWN_CMD".to_string()),
+    }
+}
+
+fn to_json<T: Serialize>(r: Result<T, String>) -> Result<serde_json::Value, String> {
+    let v = r?;
+    serde_json::to_value(v).map_err(|e| format!("序列化失败：{e}"))
 }
 

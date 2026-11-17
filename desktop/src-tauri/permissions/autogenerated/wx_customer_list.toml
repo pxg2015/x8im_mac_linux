@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-wx-customer-list"
+description = "Enables the wx_customer_list command without any pre-configured scope."
+commands.allow = ["wx_customer_list"]
+
+[[permission]]
+identifier = "deny-wx-customer-list"
+description = "Denies the wx_customer_list command without any pre-configured scope."
+commands.deny = ["wx_customer_list"]

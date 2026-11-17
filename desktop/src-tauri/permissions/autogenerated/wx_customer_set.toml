@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-wx-customer-set"
+description = "Enables the wx_customer_set command without any pre-configured scope."
+commands.allow = ["wx_customer_set"]
+
+[[permission]]
+identifier = "deny-wx-customer-set"
+description = "Denies the wx_customer_set command without any pre-configured scope."
+commands.deny = ["wx_customer_set"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-wx-media-data"
+description = "Enables the wx_media_data command without any pre-configured scope."
+commands.allow = ["wx_media_data"]
+
+[[permission]]
+identifier = "deny-wx-media-data"
+description = "Denies the wx_media_data command without any pre-configured scope."
+commands.deny = ["wx_media_data"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-wx-contacts"
+description = "Enables the wx_contacts command without any pre-configured scope."
+commands.allow = ["wx_contacts"]
+
+[[permission]]
+identifier = "deny-wx-contacts"
+description = "Denies the wx_contacts command without any pre-configured scope."
+commands.deny = ["wx_contacts"]

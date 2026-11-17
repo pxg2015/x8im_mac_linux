@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-wx-pick-messages"
+description = "Enables the wx_pick_messages command without any pre-configured scope."
+commands.allow = ["wx_pick_messages"]
+
+[[permission]]
+identifier = "deny-wx-pick-messages"
+description = "Denies the wx_pick_messages command without any pre-configured scope."
+commands.deny = ["wx_pick_messages"]

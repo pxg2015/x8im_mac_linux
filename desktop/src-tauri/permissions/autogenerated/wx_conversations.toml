@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-wx-conversations"
+description = "Enables the wx_conversations command without any pre-configured scope."
+commands.allow = ["wx_conversations"]
+
+[[permission]]
+identifier = "deny-wx-conversations"
+description = "Denies the wx_conversations command without any pre-configured scope."
+commands.deny = ["wx_conversations"]

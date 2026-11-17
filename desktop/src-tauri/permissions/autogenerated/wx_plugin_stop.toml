@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-wx-plugin-stop"
+description = "Enables the wx_plugin_stop command without any pre-configured scope."
+commands.allow = ["wx_plugin_stop"]
+
+[[permission]]
+identifier = "deny-wx-plugin-stop"
+description = "Denies the wx_plugin_stop command without any pre-configured scope."
+commands.deny = ["wx_plugin_stop"]

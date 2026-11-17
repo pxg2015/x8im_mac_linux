@@ -50,8 +50,8 @@ mod imp {
     pub fn confirm_new_version(ver: &str, cur: &str) -> bool {
         let text = format!(
             "发现新版本 v{ver}（当前 v{cur}）。\n\n\
-             是否现在下载并安装？\n\n\
-             · 点「是」：开始下载，窗口里会显示下载进度，下载完自动弹出安装向导\n\
+             是否现在安装？\n\n\
+             · 点「是」：后台下载并自动安装，全程无需「下一步」，装完自动重启邦信\n\
              · 点「否」：稍后再说（6 小时内不再打扰；想立刻升级可点左下角版本号）"
         );
         let caption = "邦信 · 升级提示";
@@ -106,6 +106,29 @@ mod imp {
             if let Some(j) = self.join.take() {
                 let _ = j.join();
             }
+        }
+
+        /// 安装阶段的小窗（2026-11-13 老8：点「是」之后要有友好提示，不能一片空白）。
+        ///
+        /// 安装本身要在 `taskkill x8im.exe` 之后才动得了 Program Files，所以这 20~40 秒
+        /// 里本进程随时会被带走 —— 窗口**故意不 finish**：句柄 drop 只 detach 线程，
+        /// 窗口留在屏幕上，直到 taskkill 把本进程结束才一起消失，正好衔接「自动重启」。
+        /// 进度条自己匀速走到 95% 停住（安装没有真实百分比，动起来就够传达「在干活」）。
+        pub fn open_installing(ver: &str) -> Self {
+            let me = Self::open(
+                &format!("邦信 · 正在安装更新 v{ver}"),
+                "正在应用更新文件，请稍候…  装完邦信会自动重启，无需任何操作",
+            );
+            let st = me.st.clone();
+            std::thread::spawn(move || {
+                let mut pct = 0u32;
+                while !st.done.load(Ordering::SeqCst) && pct < 95 {
+                    std::thread::sleep(std::time::Duration::from_millis(600));
+                    pct += 2;
+                    st.pct.store(pct.min(95), Ordering::Relaxed);
+                }
+            });
+            me
         }
     }
 

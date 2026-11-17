@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-pet-set-muted"
+description = "Enables the pet_set_muted command without any pre-configured scope."
+commands.allow = ["pet_set_muted"]
+
+[[permission]]
+identifier = "deny-pet-set-muted"
+description = "Denies the pet_set_muted command without any pre-configured scope."
+commands.deny = ["pet_set_muted"]

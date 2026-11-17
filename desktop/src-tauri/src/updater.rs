@@ -382,16 +382,38 @@ fn run(app: &tauri::AppHandle, why: &str) -> Result<String, String> {
     let path = stage_setup(&ctx, &bytes, &ver)?;
     upd_log(&format!("[updater] ④安装包就位 {}", path.display()));
 
-    // ── 5. 拉起安装向导（下一步 → 下一步）──────────────────────────────────
-    // 先写 marker 再启动：即使 UAC 被拒或用户点取消，也不会被 60s 复查反复重弹。
+    // ── 5. 静默安装（不再弹 NSIS 向导「下一步 / 下一步」）────────────────────
+    // 2026-11-13 老8 定口径：**确认必须保留**（点「是」= 用户同意），但确认之后的
+    // 安装过程要全自动 —— 走安装期注册的计划任务 `BangXin AutoUpdate`：
+    //   schtasks /Run → updater-task.cmd → setup.exe /S /UPDATE /R → 自动重启。
+    // 任务不可用（企业管控禁用 schtasks / 老客户端没注册）时降级为提权直跑同一份 .cmd；
+    // 两条都不通才退回「弹向导」（至少还能装，而不是彻底没反应）。
+    // 先写 marker 再触发：即使 UAC 被拒或用户取消，也不会被 60s 复查反复重弹。
     let _ = std::fs::write(&marker, now_secs().to_string());
     beat.fire(app, Phase::Applying, total, total, true);
-    launch_setup(&path)?;
-    upd_log("[updater] ⑤已拉起安装程序（NSIS 向导，用户点「下一步」完成安装）");
+    // 2026-11-13 老8：点「是」之后不能一片空白（以前只闪一个 cmd 黑窗）。
+    // 客户端自己的原生小窗：「正在安装更新 vX，装完自动重启，无需操作」。
+    // 故意不 finish —— 本进程随后会被 updater-task.cmd 的 taskkill 带走，窗口随之消失，
+    // 正好接上「自动重启」，中间不留真空。
+    let installing = crate::upd_ui::NativeProgress::open_installing(&ver);
+    match crate::apply_patch_task(&ctx) {
+        Ok(()) => {
+            upd_log("[updater] ⑤已触发静默安装任务（/S /UPDATE /R，无向导）");
+            // 保留 installing：drop 只 detach 线程，窗口留在屏幕上等 taskkill 收尾
+            drop(installing);
+        }
+        Err(e) => {
+            // 回退向导：此时用户要看 NSIS 向导，先把「正在安装」小窗收掉，避免两层窗口打架
+            installing.finish();
+            upd_log(&format!("[updater] ⑤静默任务不可用（{e}），回退安装向导"));
+            launch_setup(&path)?;
+            upd_log("[updater] ⑤已拉起安装程序（NSIS 向导，兜底通道）");
+        }
+    }
 
     FAILS.store(0, Ordering::SeqCst);
     fire_plain(app, Phase::Done, "");
-    Ok(format!("已拉起 {ver} 安装向导"))
+    Ok(format!("已触发 {ver} 静默安装"))
 }
 
 fn http_text(url: &str) -> Result<String, String> {
@@ -483,7 +505,10 @@ fn stage_setup(
 ) -> Result<std::path::PathBuf, String> {
     let dir = ctx.updates.clone();
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建更新目录失败: {e}"))?;
-    let file = format!("{}_Setup_{ver}.exe", ctx.prefix);
+    // 🔴 命名必须与 installer.nsh 里 updater-task.cmd 的匹配式一致：
+    //    `dir /b /o-d "%UPD%\BangXin_*_x64-setup.exe"` —— 原先叫 `BangXin_Setup_{ver}.exe`，
+    //    任务通道根本找不到包，静默安装会静默失败（什么都不发生）。2026-11-13 修。
+    let file = format!("{}_{ver}_x64-setup.exe", ctx.prefix);
     let final_path = dir.join(&file);
     let part_path = dir.join(format!("{file}.part"));
     std::fs::write(&part_path, bytes).map_err(|e| format!("写入安装包失败: {e}"))?;
@@ -596,15 +621,24 @@ fn sweep_updates(app: &tauri::AppHandle) {
             || name.contains("_x64-portable.zip")
             || name == "task-started.txt";
 
-        // 安装包名字：{prefix}_Setup_{ver}.exe；标记：setup-launched-{ver}.txt
-        let ver_in_name = name
-            .strip_suffix(".exe")
-            .and_then(|s| s.find("_Setup_").map(|i| s[i + 7..].to_string()))
-            .or_else(|| {
-                name.strip_prefix("setup-launched-")
-                    .and_then(|s| s.strip_suffix(".txt"))
-                    .map(|s| s.to_string())
-            });
+        // 安装包名字：新版 `{prefix}_{ver}_x64-setup.exe`、老版 `{prefix}_Setup_{ver}.exe`；
+        // 标记：setup-launched-{ver}.txt。三种都要能解析出版本号，否则装完不清理会一直堆。
+        let ver_in_name = name.strip_suffix(".exe").and_then(|base| {
+            if let Some(i) = base.find("_Setup_") {
+                return Some(base[i + 7..].to_string());
+            }
+            if let Some(head) = base.strip_suffix("_x64-setup") {
+                if let Some(i) = head.rfind('_') {
+                    return Some(head[i + 1..].to_string());
+                }
+            }
+            None
+        })
+        .or_else(|| {
+            name.strip_prefix("setup-launched-")
+                .and_then(|s| s.strip_suffix(".txt"))
+                .map(|s| s.to_string())
+        });
 
         let stale = ver_in_name
             .map(|v| !matches!(cmp_ver(&v, &cur), std::cmp::Ordering::Greater))
