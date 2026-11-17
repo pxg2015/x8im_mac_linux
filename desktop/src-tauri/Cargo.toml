@@ -10,7 +10,7 @@ tauri-build = { version = "2", features = [] }
 indexmap = { version = "1.9", features = ["std"] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon"] }
+tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
 # EnsureOut 返回值序列化（tauri command 返回结构体必需）
 serde = { version = "1", features = ["derive"] }
 # 单实例锁：同一台机器只允许一个 X8.IM 实例（第二次启动聚焦已有窗口后退出）

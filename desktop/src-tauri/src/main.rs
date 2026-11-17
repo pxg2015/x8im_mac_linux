@@ -4803,11 +4803,14 @@ fn fde_build_window(
     // 建出「全透明空窗」：窗口存在、visible=true，但一个像素都不画，用户看到的就是
     // 「AI邦 根本没出来」（Windows 的等价坑见下面 WebView2 那段注释）。
     // 所以 mac 从**不透明**档起试，先保证看得见；要透明美化得先把 private api 打开。
+    // 2026-11-17 1.7.16 老8 选定方案 A：已开 macos-private-api + macOSPrivateApi，
+    // mac 恢复透明优先。1.7.14/1.7.15 的不透明优先只为排查「白块看不见」，那次的真因
+    // 是浮窗页没打进包（404），现已修复，透明档不会再出「全透明空窗」，白底方块也能去掉。
     #[cfg(target_os = "macos")]
     let attempts: [(bool, bool, bool); 3] = [
-        (false, false, true),
-        (false, true, true),
         (true, false, true),
+        (false, false, true),
+        (false, true, false),
     ];
     #[cfg(not(target_os = "macos"))]
     let attempts: [(bool, bool, bool); 3] = [
