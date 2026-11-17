@@ -34,6 +34,8 @@ mod upd_ui;
 // 2026-11-07 方案 B PoC：主窗 origin 不变，/app/assets/* 由随包 dist 响应。
 // 未配置 X8_LOCAL_ASSETS_DIR 且 resource_dir()/app-assets 不存在时整个模块不激活。
 #[cfg(windows)]
+mod local_assets;
+
 /// 🔴 2026-11-16 Apple 吊销整改：mac 本地微信读取向导的**桩实现**。
 /// 原 `mac_wx_setup.rs`（重签 WeChat.app / 注入 get-task-allow / lldb attach 取库密钥 /
 /// 恢复原签名）已整体停用，文件留在 `_internal_wxlocal/` 以备申诉后复审。
@@ -59,7 +61,6 @@ mod mac_wx_setup {
     }
 }
 
-mod local_assets;
 mod p2p_sidecar;
 mod mail;   // 2026-11-07 内置邮件（Rust 原生 IMAP/SMTP，方案 A）
 mod mail_cache; // 2026-11-08 客户端 SQLite 邮件缓存（清单/正文秒开）
@@ -875,7 +876,6 @@ fn macos_cached_exe() -> Option<std::path::PathBuf> {
 // 我们自己的包经 Developer ID 签名 + 公证后不需要剥隔离标记；直接 exec 也不经过
 // LaunchServices 的隔离检查，删除后不影响远程协助主链路。
 
-
 /// mac：检查某 RustDesk.app 的框架符号链接是否完好（纯只读、不提权）。
 ///
 /// 🩸 2026-10-18 甘真机：Tauri 把 RustDesk.app 作为 resource 打包时会解引用符号链接，
@@ -1435,7 +1435,12 @@ fn ensure_rustdesk_blocking(app: tauri::AppHandle, expected_rid: String, passwor
             });
         }
         // Err 里带真实原因（用户取消 / 位置校验不过 / IPC 无 ACK），不再压成一句万能文案
+        // 🔴 2026-11-16 Apple 吊销整改：mac 不再自动写永久密码（原走 osascript 提权，
+        // 是本次账号被吊销的触发项之一）；密码改为用户在 RustDesk 界面手动查看/输入。
+        #[cfg(all(unix, not(target_os = "macos")))]
         unix_set_permanent_password(&exe, pw)?;
+        #[cfg(target_os = "macos")]
+        let _ = (&exe, pw);
         // 清理临时实例（open_rustdesk 之后按需再拉；与 Windows 就绪链路同套路）
         kill_rustdesk_procs();
         // 密码就绪后才切审批模式（免 Accept 按钮；官方无 hide_cm，面板 3s 自最小化）
@@ -2556,7 +2561,6 @@ mod evq {
     }
 }
 
-
 /// 下载目录（Windows `%USERPROFILE%\Downloads`；其余 `~/Downloads`）。
 /// 2026-10-23 S2：抽成函数 —— download_file 落盘与 reveal_file 的目录校验必须用同一份定义，
 /// 分两处写字面量迟早会漂移（改一处忘一处，校验判错直接变「任意路径可定位」）。
@@ -3643,7 +3647,6 @@ async fn download_file(app: tauri::AppHandle, url: String, token: String, name: 
     // （旧写法 `format!("{}/{}")` 在 Windows 上产生混合分隔符，explorer /select, 认不出来）
     let safe = sanitize_filename(&name);
     let dest = downloads.join(&safe);
-
 
     // 2026-10-23 重构：**弃用系统 curl，改为进程内 blocking HTTP 下载**。
     // 原因（老8 真机报错）：`curl: (6) getaddrinfo() thread failed to start`
@@ -5935,20 +5938,25 @@ fn task_ctx() -> Result<TaskCtx, String> {
 //   ③ 这里：触发前落「升级中」标记；启动后自检——成功则收尾清包，
 //      连续 3 次升不上去就落 giveup 停止自动重试（防「下载→安装→失败」死循环）
 
+#[cfg(windows)]
 fn upgrade_dir() -> Option<std::path::PathBuf> {
     programdata_dir().ok().map(|p| p.join("BangXin"))
 }
+#[cfg(windows)]
 fn upgrade_marker_path() -> Option<std::path::PathBuf> {
     upgrade_dir().map(|d| d.join("updating.json"))
 }
+#[cfg(windows)]
 fn upgrade_giveup_path() -> Option<std::path::PathBuf> {
     upgrade_dir().map(|d| d.join("upgrade-giveup.txt"))
 }
+#[cfg(windows)]
 fn upgrade_task_failed_path() -> Option<std::path::PathBuf> {
     upgrade_dir().map(|d| d.join("updates").join("task-failed.txt"))
 }
 
 /// 从 updates 里最新的包名解析目标版本（`BangXin_1.7.10_x64-setup.exe` / `-portable.zip`）。
+#[cfg(windows)]
 fn newest_update_target(updates: &std::path::Path) -> Option<String> {
     let mut best: Option<(std::time::SystemTime, String)> = None;
     for e in std::fs::read_dir(updates).ok()?.flatten() {
@@ -5971,6 +5979,7 @@ fn newest_update_target(updates: &std::path::Path) -> Option<String> {
     best.map(|(_, v)| v)
 }
 
+#[cfg(windows)]
 fn parse_ver(s: &str) -> (u32, u32, u32) {
     let mut it = s.trim().split('.');
     let a = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
@@ -5980,6 +5989,7 @@ fn parse_ver(s: &str) -> (u32, u32, u32) {
 }
 
 /// 触发静默安装**之前**落标记：目标版本 + 第几次尝试。只增不减，成功才清。
+#[cfg(windows)]
 fn upgrade_mark_start(updates: &std::path::Path) {
     let Some(target) = newest_update_target(updates) else {
         return;
@@ -6013,6 +6023,7 @@ fn upgrade_mark_start(updates: &std::path::Path) {
 }
 
 /// 启动后自检上次升级结果（代价是几行文件操作，直接放在后台线程里跑）。
+#[cfg(windows)]
 fn upgrade_selfcheck(app: &tauri::AppHandle) {
     let cur = app.package_info().version.to_string();
     let Some(marker) = upgrade_marker_path() else { return };
@@ -6758,7 +6769,6 @@ fn decode_sig_text(s: &str) -> Result<String, String> {
 /// 阶段经 `x8-upd-stage` 事件推给前端。这样即使前端 JS / WebView2 抽风，升级照跑。
 // win_upd_start 已迁移到 updater 模块（同步 fn，见 updater.rs）
 
-
 /// 版本号比较：把 "1.6.3" / "1.6.10" 拆成数字段逐段比。
 /// 返回 Ordering；无法解析的段按 0 处理（"1.6.x" 之类）。
 #[cfg(windows)]
@@ -6781,7 +6791,6 @@ fn cmp_ver(a: &str, b: &str) -> std::cmp::Ordering {
     }
     std::cmp::Ordering::Equal
 }
-
 
 /// 2026-11-02 白屏自愈：WebView2 长挂机 / 系统睡眠后渲染上下文丢失，
 /// 主窗客户区变白板（标题栏是系统画的所以照常显示）。唯一稳定恢复手段是 reload 远程页。
@@ -7782,7 +7791,6 @@ async fn x8_rebuild_ui(app: tauri::AppHandle) -> Result<String, String> {
 }
 
 
-
 fn main() {
     // 2026-10-23 老8：先上硬单实例锁，再初始化任何 GUI/WebView（顺序不能反，
     // 反了会先闪一下登录窗再退出，观感像崩溃）。
@@ -8232,6 +8240,8 @@ fn main() {
             // 2026-11-17：托盘点击「看得见、点不动」的兜底——常驻自愈线程（见 start_tray_heal）。
             start_tray_heal(app.handle().clone());
             // 2026-11-17 C：上次自动升级到底成没成？5 秒后自检一次（成功清残留包 / 失败计数）。
+            // 仅 Windows：整套升级状态机依赖 ProgramData / schtasks / NSIS。
+            #[cfg(windows)]
             {
                 let h = app.handle().clone();
                 std::thread::spawn(move || {
