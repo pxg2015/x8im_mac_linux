@@ -37,7 +37,9 @@
     box-shadow:0 8px 22px rgba(16,22,38,.28),0 0 0 2.5px #fff,0 0 0 4px rgba(0,130,252,.22)}
   /* 头像加载失败兜底：至少是个看得见的蓝圆，不能只剩一块白 */
   .pet .face.noface{background:radial-gradient(circle at 50% 42%,#9ad4ff 0%,#0082fc 72%)}
-  .pet .face img{width:100%;height:100%;object-fit:cover;display:block}
+  .pet .face img,.pet .face video{width:100%;height:100%;object-fit:cover;display:block}
+  /* 视频形象（2026-11-17）：默认隐藏，setAvatar 识别到 data:video/ 才显示 */
+  .pet .face video[hidden]{display:none}
   .bob{animation:bob 2.8s ease-in-out infinite}
   @keyframes bob{0%,100%{transform:translateY(0)}50%{transform:translateY(-4px)}}
   /* 新消息：跳三下（比静态角标明显得多，但不夸张） */
@@ -105,6 +107,7 @@
     <div class="face bob" id="bob">
       <img src="fde-avatar.png" alt="AI 邦灵" draggable="false"
            onerror="this.style.display='none';this.parentNode.classList.add('noface')">
+      <video id="petVideo" hidden muted loop playsinline autoplay></video>
     </div>
     <span class="badge" id="badge">1</span>
     <span class="x" id="closeBtn" title="关闭 AI 邦灵（托盘「召唤 AI 邦灵」可再叫出来）">✕</span>
@@ -298,14 +301,34 @@
     if (s && typeof s.avatar === 'string') setAvatar(s.avatar);
   }, function () { /* 老客户端没有这个命令：静默忽略 */ });
 
-  // 形象可配（2026-11-16 老8）：空串 = 内置卡通精灵；否则用主窗传来的头像（data URL）。
-  // 头像加载失败（防盗链 / 链接过期 / 文件被删）一律回退卡通，不让精灵开天窗。
+  // 形象可配（2026-11-16 老8）：空串 = 内置卡通精灵；否则用主窗传来的 data URL。
+  // 图片（data:image/…）= 静态头像；视频（data:video/…）= 循环静音播（2026-11-17）。
+  // 加载失败一律回退卡通，不让精灵开天窗。
   var faceImg = document.querySelector('.face img');
+  var petVideo = document.getElementById('petVideo');
   var DEFAULT_FACE = 'fde-avatar.png';
+  function toSprite() {
+    petVideo.hidden = true;
+    try { petVideo.pause(); petVideo.removeAttribute('src'); petVideo.load(); } catch (e) {}
+    faceImg.style.display = '';
+    if (faceImg.src.indexOf(DEFAULT_FACE) < 0) faceImg.src = DEFAULT_FACE;
+  }
   function setAvatar(u) {
     u = (u || '').trim();
-    if (!u) { if (faceImg.src.indexOf(DEFAULT_FACE) < 0) faceImg.src = DEFAULT_FACE; return; }
-    faceImg.onerror = function () { faceImg.onerror = null; faceImg.src = DEFAULT_FACE; };
+    if (!u) { toSprite(); return; }
+    if (u.indexOf('data:video/') === 0) {
+      // 视频形象：隐藏图片、循环静音播；失败回退卡通
+      faceImg.style.display = 'none';
+      petVideo.onerror = function () { petVideo.onerror = null; toSprite(); };
+      petVideo.hidden = false;
+      petVideo.src = u;
+      try { petVideo.currentTime = 0; var pr = petVideo.play(); if (pr && pr.catch) pr.catch(function () {}); } catch (e) {}
+      return;
+    }
+    petVideo.hidden = true;
+    try { petVideo.pause(); petVideo.removeAttribute('src'); petVideo.load(); } catch (e) {}
+    faceImg.style.display = '';
+    faceImg.onerror = function () { faceImg.onerror = null; toSprite(); };
     faceImg.src = u;
   }
   window.__fdeAvatar = setAvatar;
