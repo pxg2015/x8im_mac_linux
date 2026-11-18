@@ -326,6 +326,7 @@ pub(crate) fn x8bridge_dispatch(
         }
         "pet_set_muted" => Ok(json!(pet_set_muted(bv("on", false)))),
         "pet_set_avatar" => Ok(json!(pet_set_avatar(app.clone(), sv("url")))),
+        "pet_set_size" => Ok(json!(pet_set_size(app.clone(), sv("size")))),
         "away_notice" => {
             away_notice(app.clone(), osv("title"), osv("body"));
             Ok(json!(null))

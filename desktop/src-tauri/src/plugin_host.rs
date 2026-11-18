@@ -43,15 +43,9 @@ const WATCHDOG_SECS: u64 = 30;
 /// 重启失败的退避上限（秒）。2026-11-10 P2-4：不再「3 次失败后永久放弃」，
 /// 改为指数退避后继续重试，界面状态可以自己恢复。
 const MAX_BACKOFF_SECS: u64 = 300;
-/// 拉起后等就绪的上限。探测间隔 100ms。
-/// 2026-11-12：8s → 30s。插件启动变慢的真实原因（抢单实例锁最长 7s、争端口最长
-/// 10s、大库初始化）本来就可能超过 8s，超时就被判「启动失败」→ 自动回退旧版，
-/// 用户看到的是「装上了又变回旧版本」。判据同时改成以 ready 标记为主。
-const BOOT_TIMEOUT_MS: u64 = 30000;
+/// 拉起后等端口就绪的上限。探测间隔从 200ms 缩到 100ms（P2-3），总时长不变。
+const BOOT_TIMEOUT_MS: u64 = 8000;
 const PROBE_INTERVAL_MS: u64 = 100;
-/// 插件「已就绪」标记文件名，与 wxgo `SetReadyFile(<data-dir>/wx_ready.json)` 一致。
-/// 放数据目录而非临时目录：mac 上插件由 launchd 拉起，其 TMPDIR 未必与本进程相同。
-const READY_FILE: &str = "wx_ready.json";
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -326,8 +320,6 @@ impl Plugin {
     }
 
     pub fn running(&self) -> bool {
-        // 2026-11-16 整改：插件只在宿主直接 spawn 的模式下运行（Windows/Linux）。
-        // macOS 不再走 LaunchAgent/提权通道，因此也不需要端口探活这一套。
         let mut g = self.child.lock().unwrap();
         match g.as_mut() {
             Some(c) => matches!(c.try_wait(), Ok(None)),
@@ -404,9 +396,15 @@ impl Plugin {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755));
         }
-        // 2026-11-16 整改：已删除 macOS 分支里的「剥离文件隔离属性」调用。
-        // 理由：给下载来的可执行文件剥离隔离属性属 Gatekeeper bypass，是审核红线；
-        // 且签名分发版已不再下载执行任何外部组件（见 wx_updater::prepare）。
+        #[cfg(target_os = "macos")]
+        {
+            // 未签名的 Go 二进制被下载后可能带 com.apple.quarantine，
+            // Gatekeeper 会直接拦下；本机自己执行的文件移除该属性即可。
+            let _ = std::process::Command::new("/usr/bin/xattr")
+                .args(["-d", "com.apple.quarantine"])
+                .arg(&target)
+                .output();
+        }
         Ok(target)
     }
 
@@ -438,47 +436,11 @@ impl Plugin {
         Ok(out)
     }
 
-    /// 等插件就绪。主判据 = 插件自己写的 ready 标记（端口 listen 成功后才落），
-    /// 兜底 = 健康接口能通（旧版插件不写标记，升级过渡期必须兼容）。
-    /// `deadline_ms` 总上限；非 mac 分支还会在子进程已死时提前返回。
-    fn wait_ready(&self, ready: &Path, deadline_ms: u64) -> bool {
-        let tries = deadline_ms / PROBE_INTERVAL_MS;
-        for i in 0..tries {
-            if ready.is_file() {
-                return true;
-            }
-            // 健康接口每秒探一次即可（握手前还要再校验 token/pid）。
-            if i % 10 == 9 && self.get(&self.spec.health, 800).is_ok() {
-                return true;
-            }
-            // 非 mac：子进程没了就别傻等满 30s（launchd 域下本进程看不到 pid）。
-            #[cfg(not(target_os = "macos"))]
-            {
-                if !self.running() {
-                    return ready.is_file() || self.get(&self.spec.health, 800).is_ok();
-                }
-            }
-            std::thread::sleep(Duration::from_millis(PROBE_INTERVAL_MS));
-        }
-        ready.is_file() || self.get(&self.spec.health, 800).is_ok()
-    }
-
     /// 确保插件在跑；已跑则直接返回端口。
     pub fn ensure(&self, app: &AppHandle) -> Result<u16, String> {
         if SHUTDOWN.load(Ordering::Relaxed) {
             return Err("应用正在退出".to_string());
         }
-
-        // 🔴 2026-11-16 Apple 吊销整改：macOS 不再经 LaunchAgent / 提权通道拉起外部组件，
-        // 也不再 attach 任何第三方进程。签名分发版不包含本地微信读取能力。
-        #[cfg(target_os = "macos")]
-        {
-            return Err("当前版本未包含本地微信读取能力（签名分发版已移除该功能）".to_string());
-        }
-
-        // ── 非 macOS（Windows / Linux）：本进程直接 spawn 子进程，持句柄、靠 stdin 传令牌。 ──
-        #[cfg(not(target_os = "macos"))]
-        {
         // 已在跑 → 复用
         {
             let mut g = self.child.lock().unwrap();
@@ -505,10 +467,6 @@ impl Plugin {
 
         let data_dir = crate::mail_cache::data_dir(app)?;
         let db = crate::mail_cache::db_path(app)?;
-        // 清掉上一轮就绪标记（同 mac 分支，防残留文件误判就绪）。
-        let ready = data_dir.join(READY_FILE);
-        let _ = std::fs::remove_file(&ready);
-        std::fs::create_dir_all(&data_dir).ok();
 
         let token = self.gen_token()?;
         *self.token.lock().unwrap() = token.clone();
@@ -570,18 +528,20 @@ impl Plugin {
         }
         *self.child.lock().unwrap() = Some(child);
 
-        // 等就绪：ready 标记为主、健康接口兜底，总上限 30s。
-        if self.wait_ready(&ready, BOOT_TIMEOUT_MS) {
-            return self.handshake();
+        // 等端口就绪（探测间隔 100ms，总上限仍为 8s）
+        let tries = BOOT_TIMEOUT_MS / PROBE_INTERVAL_MS;
+        for _ in 0..tries {
+            std::thread::sleep(Duration::from_millis(PROBE_INTERVAL_MS));
+            if self.get(&self.spec.health, 800).is_ok() {
+                return self.handshake();
+            }
+            // 进程已经死了就别傻等
+            if !self.running() {
+                break;
+            }
         }
         self.stop();
-        Err(format!(
-            "插件 {} 启动超时（{}s 内未就绪，端口 {} 未监听）。插件日志见数据目录 wxgo.log",
-            self.spec.id,
-            BOOT_TIMEOUT_MS / 1000,
-            self.spec.port
-        ))
-        }
+        Err(format!("插件 {} 启动超时（端口未就绪）", self.spec.id))
     }
 
     /// 契约校验：健康接口必须带 contract_key，且不低于 contract_min。
@@ -641,28 +601,23 @@ impl Plugin {
 
     /// 2026-11-10 P1-1：先请插件优雅收尾，等 2s，超时才 TerminateProcess。
     fn stop_with(&self, graceful: bool) {
-        // 🔴 2026-11-16 整改：macOS 不再使用 LaunchAgent 常驻，故删除 bootout / 端口反杀
-        // 这套 mac 专用收尾（该段曾调用系统服务管理器与按端口杀进程）。
-        #[cfg(not(target_os = "macos"))]
-        {
-            let mut g = self.child.lock().unwrap();
-            let Some(mut c) = g.take() else { return };
-            let tok = self.token.lock().unwrap().clone();
-            if graceful && !tok.is_empty() {
-                let _ = self.post("/api/app/shutdown", "{}", 600);
-                // 最多等 3s（报告建议 2~3s）：正常无在途采集时插件百毫秒内就能退干净。
-                for _ in 0..30 {
-                    if matches!(c.try_wait(), Ok(Some(_))) {
-                        self.pid.store(0, Ordering::Relaxed);
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_millis(100));
+        let mut g = self.child.lock().unwrap();
+        let Some(mut c) = g.take() else { return };
+        let tok = self.token.lock().unwrap().clone();
+        if graceful && !tok.is_empty() {
+            let _ = self.post("/api/app/shutdown", "{}", 600);
+            // 最多等 3s（报告建议 2~3s）：正常无在途采集时插件百毫秒内就能退干净。
+            for _ in 0..30 {
+                if matches!(c.try_wait(), Ok(Some(_))) {
+                    self.pid.store(0, Ordering::Relaxed);
+                    return;
                 }
+                std::thread::sleep(Duration::from_millis(100));
             }
-            let _ = c.kill();
-            let _ = c.wait();
-            self.pid.store(0, Ordering::Relaxed);
         }
+        let _ = c.kill();
+        let _ = c.wait();
+        self.pid.store(0, Ordering::Relaxed);
     }
 
     /// 看门狗健康判据（P1-2）：进程存活 + 健康接口能带正确 token 应答 +

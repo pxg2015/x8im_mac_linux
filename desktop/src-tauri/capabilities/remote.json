@@ -70,6 +70,7 @@
     "allow-pet-pos-save",
     "allow-pet-set-muted",
     "allow-pet-set-avatar",
+    "allow-pet-set-size",
     "allow-pet-status",
     "allow-upd-float-show",
     "allow-upd-float-hide",

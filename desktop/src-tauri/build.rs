@@ -108,6 +108,7 @@ fn main() {
             "pet_pos_save",
             "pet_set_muted",
             "pet_set_avatar",
+            "pet_set_size",
             "pet_status",
             // 2026-10-23 升级中进度小窗（正在下载 / 已用 / 剩余时间）
             "upd_float_show",

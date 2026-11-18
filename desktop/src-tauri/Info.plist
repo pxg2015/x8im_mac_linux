@@ -1,7 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  邦信 macOS 隐私用途声明（2026-10-26 补）
+  邦信 macOS 包附加声明（隐私用途 + 界面语言）
+
+  一、隐私用途声明（2026-10-26 补）
 
   为什么必须有：Tauri 默认生成的 Info.plist 不含任何 *UsageDescription
   （tauri-bundler 的 macos/app.rs 只插 LSRequiresCarbon / NSHighResolutionCapable /
@@ -17,8 +19,34 @@
   该功能已整段移除，故本条目的必要性消失；保留它只会让审核方认为本 app 仍在用 UI 脚本
   操控其他应用。若将来恢复任何 Apple Events 用法，必须同时恢复本声明并说明用途。
 
+  二、界面语言（2026-11-18 补，老8 报「mac 点图片弹出来的文件框是英文的」）
+
+  现象：mac 系统语言是中文，但邦信点「发送图片 / 发送文件」弹出的 NSOpenPanel
+  （Recents / Shared / Favorites / Applications / Documents / Desktop / Downloads /
+  Locations / Tags 全是英文），与系统、与客户端界面不一致。
+
+  根因：**面板文字不是我们的代码写的**，是 macOS 的 AppKit 系统面板。自 macOS 10.15 起
+  开/存面板由独立系统进程 com.apple.appkit.xpc.openAndSavePanelService 渲染，
+  它**只认 app bundle 自己声明的界面语言**（CFBundleLocalizations）；
+  没声明 → 一律退回英文（与系统语言无关）。
+  我们的包没有 .lproj 资源、也没有 CFBundleLocalizations，所以是英文。
+
+  修法（就加这两个键，不改任何业务代码）：
+    · CFBundleLocalizations = [zh-Hans, zh_CN, en]
+      —— 按优先级排。系统是中文 → 命中 zh-Hans → 面板中文；
+         系统是英文 → 命中 en → 面板英文（跟着系统走，不硬编码中文）。
+      Apple 对简体中文的写法就是 zh-Hans（不是 zh-CN / zh_CN）；
+      额外带一个 zh_CN 是为兼容老系统的语言列表写法。
+    · CFBundleDevelopmentRegion = zh_CN
+      —— 开发语言改成中文：系统找不到匹配语言时兜底中文。
+      （Tauri 默认写的是 en；若合并时不覆盖本键，CFBundleLocalizations 也足够生效。）
+
+  ⚠️ 副作用说明：CFBundleLocalizations 只影响**系统提供的界面文字**
+  （文件/存盘面板、覆盖确认框等）。邦信自己的界面是网页（远端 /app/），语言本来就是中文，
+  不受这个键影响。系统菜单（拷贝/粘贴等）会跟着系统语言走，这也是我们要的「一致」。
+
   Tauri 会自动把本文件与默认模板合并（bundle.macOS.infoPlist 的默认查找位置
-  即 tauri 配置同目录），所以这里只放新增的三条，不写 CFBundle* 等已有键。
+  即 tauri 配置同目录 = src-tauri/），所以这里只放要新增/覆盖的键。
 -->
 <plist version="1.0">
 <dict>
@@ -26,5 +54,14 @@
   <string>邦信需要使用麦克风，以便在会议中发言。</string>
   <key>NSCameraUsageDescription</key>
   <string>邦信需要使用摄像头，以便在会议中开启视频。</string>
+  <!-- 界面语言：让 macOS 原生文件面板跟着系统语言走（中文系统 → 中文面板） -->
+  <key>CFBundleLocalizations</key>
+  <array>
+    <string>zh-Hans</string>
+    <string>zh_CN</string>
+    <string>en</string>
+  </array>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>zh_CN</string>
 </dict>
 </plist>

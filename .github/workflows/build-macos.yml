@@ -431,6 +431,17 @@ jobs:
             echo "::error::Info.plist 隐私用途声明缺失 —— 会议/藏窗会在 macOS 上被 TCC 终止进程"
             exit 1
           }
+          # 🔴 2026-11-18（老8 报「mac 点图片弹出来的文件框是英文的」）：
+          # macOS 的 NSOpenPanel/NSSavePanel 由系统 openAndSavePanelService 渲染，
+          # **只认 bundle 自己声明的 CFBundleLocalizations**；不声明 → 一律英文（与系统语言无关）。
+          # 少了这一条 = 老8 报的英文面板回归，直接红掉。
+          LOC=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleLocalizations' "$PLIST" 2>/dev/null || true)
+          echo "  · CFBundleLocalizations = ${LOC:-<缺失>}"
+          echo "$LOC" | grep -q 'zh-Hans' || {
+            echo "::error::CFBundleLocalizations 未声明 zh-Hans —— mac 原生文件/存盘面板会退回英文"
+            exit 1
+          }
+          echo "  ✓ 已声明 zh-Hans（mac 原生面板随系统语言显示）"
           # 反向断言：Apple Events 声明不得回归（见 x8im/docs/apple_appeal_20261116.md）
           if /usr/libexec/PlistBuddy -c "Print :NSAppleEventsUsageDescription" "$PLIST" >/dev/null 2>&1; then
             echo "::error::Info.plist 又出现 NSAppleEventsUsageDescription —— 该能力已因 Apple 吊销移除，不要恢复"
@@ -488,7 +499,12 @@ jobs:
                 echo "::error::dmg 内缺 $K"; hdiutil detach "$MNT" -quiet; exit 1
               }
             done
-            echo "  ✓ dmg 内 Info.plist 齐全（$(basename "$DMG")，版本 ${DV}）"
+            DLOC=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleLocalizations' "$DPLIST" 2>/dev/null || true)
+            echo "$DLOC" | grep -q 'zh-Hans' || {
+              echo "::error::dmg 内 CFBundleLocalizations 未声明 zh-Hans —— mac 原生面板会退回英文"
+              hdiutil detach "$MNT" -quiet; exit 1
+            }
+            echo "  ✓ dmg 内 Info.plist 齐全（$(basename "$DMG")，版本 ${DV}，面板语言已声明）"
             hdiutil detach "$MNT" -quiet
             rm -rf "$MNT"
           done

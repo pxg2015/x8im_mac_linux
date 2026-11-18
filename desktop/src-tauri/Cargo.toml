@@ -67,6 +67,17 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 webkit2gtk = { version = "2.0.2", features = ["v2_38"] }
 
+# ── 2026-11-18：macOS 自带文件选择器（NSOpenPanel）──
+# 不用 WKWebView 的 `<input type="file">`：不过滤类型、拿不到绝对路径、
+# 起始目录不受控（可能落 iCloud 目录 → 枚举卡住 → 老8 报「点图片按钮反应太慢」）。
+# 🔴 版本必须与 wry/tauri 已锁定的完全一致（objc2-app-kit 0.3.2 / objc2-foundation 0.3.2），
+# 否则会拉进第二条 objc2 版本线 → 编译冲突。这里写死 0.3.2 且只开用得到的 feature。
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "NSApplication", "NSWindow", "NSPanel", "NSResponder", "NSOpenPanel", "NSSavePanel"] }
+# NSArray：mac_pick.rs 用 NSArray::from_retained_slice 组图片扩展名白名单。
+# app-kit 的 NSOpenPanel feature 会传递开启 objc2-foundation/NSArray，这里仍显式声明（自证依赖）。
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "NSArray", "NSString", "NSURL"] }
+
 # 2026-10-16 老8 诉求：X8Assist 主窗口（你的桌面/控制远程桌面）不要盖在 X8.IM 上。
 # 方案 = 启动后 EnumWindows 找 X8Assist 的可见窗口 ShowWindow(SW_HIDE)。
 # 2026-10-19 追加：Win32_UI_Shell —— 托盘气泡提示（Shell_NotifyIconW + NIF_INFO）。

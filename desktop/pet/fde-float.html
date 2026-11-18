@@ -23,6 +23,30 @@
 <style>
   html,body{margin:0;padding:0;width:100%;height:100%;background:transparent;overflow:hidden;
     user-select:none;-webkit-user-select:none;font-family:"Microsoft YaHei","PingFang SC",system-ui,sans-serif}
+  /* ── AI 邦灵 尺寸三档（2026-11-18 老8：大 / 中 / 小，默认小） ──
+     档位由 Rust 侧注入（pet.json: size → pet_set_size → __fdeSize('s'|'m'|'l')），
+     建窗瞬间由 on_page_load 注入一次。窗口尺寸跟着档位走（Rust: fde_float_wh）：
+       小 s = 96x150（pet 56px）· 中 m = 120x174（pet 74px）· 大 l = 148x196（pet 92px）
+     变量化而非写死像素：改一档只动这里 + Rust 的 FDE_FLOAT_SIZE_* 两处。
+     🔴 优先级：html[data-sz] (0,1,1) > :root (0,1,0) → 档位永远压得住下面的兼容媒体查询。 */
+  :root{
+    --pet:56px;        /* 精灵直径 */
+    --tipw:74px;       /* 气泡内容最大宽（不含 padding） */
+    --tipfs:10px;      /* 气泡字号 */
+    --tiplh:15px;      /* 气泡行高 */
+    --tippad:4px 7px;  /* 气泡内边距 */
+    --tipmt:8px;       /* 气泡上间距 */
+    --badge:17px;      /* 未读角标 */
+    --badgef:9.5px;    /* 角标字号 */
+    --xbtn:15px;       /* 关闭按钮 */
+    --namefs:9px;      /* 名字牌字号 */
+    --nameh:13px;
+    --menutop:26px;
+  }
+  html[data-sz="m"]{--pet:74px;--tipw:96px;--tipfs:10.5px;--tiplh:15px;--tippad:5px 8px;--tipmt:9px;
+    --badge:19px;--badgef:10.5px;--xbtn:17px;--namefs:9.5px;--nameh:15px;--menutop:30px}
+  html[data-sz="l"]{--pet:92px;--tipw:136px;--tipfs:11px;--tiplh:15px;--tippad:5px 9px;--tipmt:11px;
+    --badge:20px;--badgef:11px;--xbtn:18px;--namefs:10px;--nameh:16px;--menutop:34px}
   #wrap{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;
     padding:4px 4px 6px;box-sizing:border-box;opacity:0;transform:translateY(26px) scale(.86);
     transition:opacity .26s cubic-bezier(.2,.8,.3,1),transform .42s cubic-bezier(.2,1.3,.4,1)}
@@ -30,7 +54,7 @@
   #wrap.out{opacity:0;transform:translateY(10px) scale(.9);transition-duration:.24s}
 
   /* 精灵本体 */
-  .pet{position:relative;width:92px;height:92px;flex:0 0 auto;cursor:pointer}
+  .pet{position:relative;width:var(--pet);height:var(--pet);flex:0 0 auto;cursor:pointer}
   .pet .ring{position:absolute;inset:-5px;border-radius:50%;
     background:radial-gradient(circle,rgba(0,130,252,.34) 0%,rgba(0,130,252,0) 68%);opacity:0}
   .pet .face{position:absolute;inset:0;border-radius:50%;overflow:hidden;background:#fff;
@@ -54,17 +78,17 @@
   .ring.on{animation:ring 1.1s ease-out 3}
   @keyframes ring{0%{opacity:.9;transform:scale(.86)}70%{opacity:0;transform:scale(1.35)}100%{opacity:0}}
 
-  .badge{position:absolute;right:-3px;top:-3px;min-width:20px;height:20px;padding:0 5px;border-radius:10px;
-    background:#ff3b30;color:#fff;font:700 11px/20px "Microsoft YaHei",sans-serif;text-align:center;
+  .badge{position:absolute;right:-3px;top:-3px;min-width:var(--badge);height:var(--badge);padding:0 5px;border-radius:10px;
+    background:#ff3b30;color:#fff;font:700 var(--badgef)/var(--badge) "Microsoft YaHei",sans-serif;text-align:center;
     box-shadow:0 0 0 2px #fff,0 2px 6px rgba(255,59,48,.4)}
   .badge[hidden]{display:none}
 
   /* 关闭按钮（2026-11-17 二改 老8：平时不显示，鼠标移到 AI 邦灵 上才出现，
      移开后延迟 1000ms 再自动隐藏；隐藏态 pointer-events:none 保证点不到、不挡拖动）。
      放左上角避开右上角的未读角标。 */
-  .x{position:absolute;left:-8px;top:-3px;width:18px;height:18px;border-radius:50%;z-index:7;
+  .x{position:absolute;left:-8px;top:-3px;width:var(--xbtn);height:var(--xbtn);border-radius:50%;z-index:7;
     background:rgba(255,255,255,.94);color:#5b6676;text-align:center;cursor:pointer;
-    font:700 13px/18px "Microsoft YaHei",sans-serif;
+    font:700 calc(var(--xbtn) - 5px)/var(--xbtn) "Microsoft YaHei",sans-serif;
     box-shadow:0 1px 4px rgba(16,22,38,.3),0 0 0 1px rgba(16,22,38,.07);
     opacity:0;pointer-events:none;
     transition:opacity .15s ease 1s,background .15s,color .15s,transform .15s}
@@ -73,33 +97,35 @@
 
   /* 名字牌：贴在精灵底部，一眼知道这是 AI 邦灵 */
   .name{position:absolute;left:50%;bottom:-7px;transform:translateX(-50%);
-    padding:0 8px;height:16px;border-radius:8px;background:linear-gradient(135deg,#0082FC,#00a6ff);
-    color:#fff;font:700 10px/16px "Microsoft YaHei",sans-serif;letter-spacing:.5px;white-space:nowrap;
+    padding:0 8px;height:var(--nameh);border-radius:8px;background:linear-gradient(135deg,#0082FC,#00a6ff);
+    color:#fff;font:700 var(--namefs)/var(--nameh) "Microsoft YaHei",sans-serif;letter-spacing:.5px;white-space:nowrap;
     box-shadow:0 2px 6px rgba(0,130,252,.42)}
 
-  /* 文案气泡 */
-  .tip{margin-top:11px;max-width:136px;padding:5px 9px;border-radius:10px;border-bottom-left-radius:3px;
-    background:rgba(16,22,38,.9);color:#fff;font:500 11px/15px "Microsoft YaHei",sans-serif;
-    display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;
+  /* 文案气泡
+     🔴 max-width 不含 padding（content-box），实际总宽 = max-width + 左右 padding。
+        各档 --tipw 已按「窗口宽 - wrap padding - 气泡 padding」扣好，最长文案也不横向溢出。
+     🔴 两行截断**不再用 -webkit-line-clamp**（2026-11-18 实测：Chrome 121+ 随
+        display:-webkit-box 一起移除，line-clamp 计算值还在但不生效，标准 line-clamp 属性
+        也救不回来 → 表现为第 3 行溢出气泡背景）。
+        改由 JS 二分截断（fitTip）+ max-height 兜底，两行由脚本保证。 */
+  .tip{margin-top:var(--tipmt);max-width:var(--tipw);padding:var(--tippad);border-radius:10px;border-bottom-left-radius:3px;
+    background:rgba(16,22,38,.9);color:#fff;font:500 var(--tipfs)/var(--tiplh) "Microsoft YaHei",sans-serif;
+    flex:0 0 auto;max-height:calc(var(--tiplh) * 2);overflow:hidden;
     word-break:break-all;box-shadow:0 4px 12px rgba(16,22,38,.3)}
   .tip[hidden]{display:none}
 
-  /* 右键小菜单（窗口只有 148 宽，菜单就盖在精灵身上） */
-  .menu{position:absolute;left:6px;right:6px;top:34px;padding:4px;border-radius:9px;background:#fff;
+  /* 右键小菜单（窗口窄，菜单就盖在精灵身上） */
+  .menu{position:absolute;left:6px;right:6px;top:var(--menutop);padding:4px;border-radius:9px;background:#fff;
     box-shadow:0 8px 24px rgba(16,22,38,.26),0 0 0 1px rgba(16,22,38,.06);display:none;z-index:9}
   .menu.on{display:block}
   .menu div{padding:5px 8px;border-radius:6px;font-size:11.5px;color:#3b4654;cursor:pointer;white-space:nowrap}
   .menu div:hover{background:#eef4ff;color:#0082FC}
 
-  /* 兼容老客户端（1.6.99 及以前窗口是 132×148）：页面先发、客户端后发也不会被裁。
-     小窗下精灵缩一档、名字牌让位、气泡收窄，保证不出滚动条、不被截断。 */
-  @media (max-height:170px),(max-width:140px){
-    .pet{width:74px;height:74px}
-    .name{display:none}
-    .tip{margin-top:7px;max-width:112px;font-size:10.5px;line-height:14px;padding:4px 8px}
-    .menu{top:26px}
-    .x{width:16px;height:16px;left:-6px;top:-2px;font-size:11px;line-height:16px}
-  }
+  /* 🔴 老客户端（1.6.99 及以前窗口固定 132×148 / 148×196）不注入 data-sz →
+     走 :root 默认档（= 小，与「默认小尺寸」口径一致）。精灵缩小后窗口留白多一点，
+     但 #wrap 是底部对齐，内容仍完整可见、不被裁、不出滚动条。
+     故这里**不再按窗口宽度另做一套缩放** —— 那会让「默认小」变成「默认中」，
+     与老8 定的默认档冲突（2026-11-18 验收实测：74px ≠ 小）。 */
 </style>
 </head>
 <body>
@@ -143,6 +169,45 @@
     return { then: function () {} };
   }
 
+  // 🔴 两行截断（2026-11-18）：-webkit-line-clamp 在 Chrome 121+ 已随 display:-webkit-box
+  // 一起移除 → 第 3 行溢出气泡背景（实测 clientH 38 / scrollH 68）。
+  // 标准 line-clamp 属性、flex+max-height 都救不回来（实测均无效）。
+  // 这里用 JS 二分：按**实际渲染高度**裁文本，中英文混排都准，不靠估字数。
+  // 内容区可用高度 = 2 行 × line-height（--tiplh）。
+  var tipRaw = '';        // 原始文案（未截断），改档位后要重新裁
+  function tipContentH() {
+    var cs = getComputedStyle(tip);
+    return tip.scrollHeight - (parseFloat(cs.paddingTop) || 0) - (parseFloat(cs.paddingBottom) || 0);
+  }
+  function tipLimitH() {
+    var lh = parseFloat(getComputedStyle(tip).lineHeight);
+    if (!lh || isNaN(lh)) lh = 15;
+    return lh * 2;
+  }
+  function fitTip(text) {
+    tipRaw = text || '';
+    if (!tipRaw) { tip.textContent = ''; return ''; }
+    // 🔴 隐藏态（display:none）时 scrollHeight 恒为 0 → 会误判「装得下」而不截断。
+    //    量的时候临时显示，量完还原。
+    var wasHidden = tip.hidden;
+    if (wasHidden) tip.hidden = false;
+    tip.textContent = tipRaw;
+    var limit = tipLimitH();
+    var out = tipRaw;
+    if (tipContentH() > limit + 0.5) {           // 装不下 → 需要截断
+      var lo = 0, hi = tipRaw.length;              // 二分最长的可放下前缀
+      while (lo < hi) {
+        var mid = (lo + hi + 1) >> 1;
+        tip.textContent = tipRaw.slice(0, mid) + '…';
+        if (tipContentH() <= limit + 0.5) lo = mid; else hi = mid - 1;
+      }
+      out = lo > 0 ? tipRaw.slice(0, lo) + '…' : '';
+      tip.textContent = out;
+    }
+    if (wasHidden) tip.hidden = true;
+    return out;
+  }
+
   function render(n, t) {
     n = (n | 0) > 0 ? (n | 0) : 0;
     if (n > 0) {
@@ -153,7 +218,7 @@
     }
     t = (t || '').trim();
     tip.hidden = !t;
-    tip.textContent = t || '';
+    fitTip(t);
     return n;
   }
 
@@ -202,12 +267,25 @@
   // Rust 侧建窗后走 IPC 注入（不依赖 URL query，mac 的 asset 协议对 query 处理与 win 不同）
   window.__fdeInit = function (n, t, keep) { entrance(render(n, t), keep); };
 
+  // 尺寸档位（2026-11-18 老8：大/中/小，默认小）：Rust 建窗时注入一次 + 改档时注入。
+  // 写 data-sz 到 <html>，CSS 变量按档位切换。
+  // 老客户端没有这个函数 → 页面保持 :root 默认（= 小），与「默认小」一致。
+  window.__fdeSize = function (sz) {
+    sz = (sz === 'l' || sz === 'm') ? sz : 's';
+    document.documentElement.setAttribute('data-sz', sz);
+    // 档位变了 → 气泡可用宽度/字号都变了 → 原来的截断点不再准，重新裁一次
+    if (tipRaw) fitTip(tipRaw);
+  };
+  // 兜底：URL 上带了 sz（Windows 的 query 能带）就先用上，Rust 注入会覆盖。
+  var qsz = q.get('sz');
+  if (qsz) window.__fdeSize(qsz);
+
   // Rust 复用已开窗口时调用：原地更新数字/文案，不整窗刷新（避免白闪）
   window.__fdeUpdate = function (n, t, keep) { entrance(render(n, t), keep); };
   // 2026-11-17 老8：群里 @我 / 私聊来消息，即使未读数没变（人正开着那个会话）也要跳。
   // Rust 侧 eval 调用：只跳不重建，也不挂淡出常驻（keep=1）。
   window.__fdeBump = function (t) {
-    if (typeof t === 'string' && t) { tip.textContent = t.slice(0, 120); tip.hidden = false; }
+    if (typeof t === 'string' && t) { tip.hidden = false; fitTip(t.slice(0, 120)); }
     wrap.classList.remove('out');
     wrap.classList.add('in');
     doHop();

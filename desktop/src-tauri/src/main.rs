@@ -100,6 +100,11 @@ mod updater {
 /// Windows 侧一个字都不动。
 mod mac_updater;
 
+/// macOS 原生文件选择器（2026-11-18）：自己弹 NSOpenPanel，不过 WebView 的 input.click()。
+/// 详见 mac_pick.rs 头部。Windows 侧不需要 → 整模块只在 mac 编译。
+#[cfg(target_os = "macos")]
+mod mac_pick;
+
 /// 远程协助组件（RustDesk/X8Assist）可执行文件路径。
 ///
 /// 2026-11-11 方案 A：组件**不再打进安装包**，改为按需下载（安装包 28~34MB → ~6MB）。
@@ -2629,9 +2634,10 @@ fn retention_days_save(days: u32) -> u32 {
     d
 }
 
-/// 自动落盘目录：`<下载目录>/downfiles`（前端收即落盘传的 subdir，见 save_target_dir）。
+/// 自动落盘目录：=「保存目录」（2026-11-18 起可指定；默认 安装目录\downfiles）。
+/// 具体解析见下面「保存目录」一节。
 fn auto_saved_dir() -> std::path::PathBuf {
-    downloads_dir().join("downfiles")
+    resolve_save_dir().0
 }
 
 /// 扫描 downfiles：`purge_days` 有值时顺带删除超期文件。
@@ -2653,10 +2659,18 @@ fn scan_auto_saved(purge_days: Option<u32>) -> (usize, u64, usize) {
         if !md.is_file() {
             continue; // 子目录一律不碰（用户可能自己往里放东西）
         }
+        // 自己的临时文件（写权限探测用的 .x8w_*）不计入占用
+        if p.file_name()
+            .map(|n| n.to_string_lossy().starts_with(".x8"))
+            .unwrap_or(false)
+        {
+            continue;
+        }
         count += 1;
         bytes += md.len();
         let Some(cut) = cutoff else { continue };
-        if !in_downloads(&p) {
+        // 只删「当前保存目录」下的直接子文件 —— 不递归、不碰下载目录根、也不碰目录之外
+        if !in_dir_child(&p, &dir) {
             continue;
         }
         let mt = md.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
@@ -2671,13 +2685,16 @@ fn scan_auto_saved(purge_days: Option<u32>) -> (usize, u64, usize) {
 
 fn retention_state_json(extra: serde_json::Value) -> serde_json::Value {
     let (count, bytes, _) = scan_auto_saved(None);
+    let (dir, fallback) = resolve_save_dir();
     let mut v = serde_json::json!({
         "days": retention_days_load(),
         "min": RETENTION_MIN_DAYS,
         "max": RETENTION_MAX_DAYS,
         "count": count,
         "bytes": bytes,
-        "dir": auto_saved_dir().to_string_lossy(),
+        "dir": dir.to_string_lossy(),
+        "default_dir": default_save_dir().to_string_lossy(),
+        "fallback": fallback,
     });
     if let (Some(o), Some(e)) = (v.as_object_mut(), extra.as_object()) {
         for (k, val) in e {
@@ -2709,6 +2726,162 @@ fn file_retention_clean(days: Option<u32>) -> Result<serde_json::Value, String> 
     let (_, _, removed) = scan_auto_saved(Some(d));
     si_log(&format!("[retention] manual clean keep {d}d, removed {removed}"));
     Ok(retention_state_json(serde_json::json!({ "removed": removed })))
+}
+
+// ==================== 保存目录（可指定）· 2026-11-18 ====================
+// 需求（老8）：聊天文件自动保存的目录要能指定，默认 = 当前（安装）目录下的 \downfiles。
+// 配置落 %LOCALAPPDATA%\BangXin\file_save_dir.json（与 file_retention.json 同级，升级不受影响）。
+//
+// 三条硬约束：
+//   ① 目录只能改成**用户经系统文件夹对话框亲自选中**的那个（http_local.rs 的 /pickdir 记账），
+//      页面不能凭空把落盘改到任意路径 —— 那是「任意路径写盘」的口子。
+//   ② 目录不可写（Program Files 普通用户无写权）→ 自动回落用户数据目录，**绝不静默失败**。
+//   ③ 清理只碰「当前保存目录」下的直接子文件，不递归、不碰下载目录根（老8 定的口径不变）。
+//
+// 注意（2026-11-18）：默认目录改到安装目录后，**分块落盘的路径校验**（in_downloads）
+// 必须一并放宽 —— 否则落到安装目录的 .part 会被判成「非法写入路径」。
+
+/// 保存目录配置文件路径。
+fn save_dir_cfg_path() -> std::path::PathBuf {
+    bangxin_user_dir().join("file_save_dir.json")
+}
+
+/// 用户指定的保存目录（None = 未指定 → 用默认）。
+fn save_dir_custom() -> Option<std::path::PathBuf> {
+    let raw = std::fs::read_to_string(save_dir_cfg_path()).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let s = v.get("dir").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+    if s.is_empty() {
+        return None;
+    }
+    let p = std::path::PathBuf::from(&s);
+    if !p.is_absolute() {
+        return None;
+    }
+    Some(p)
+}
+
+/// 写回保存目录；传 None/空 = 恢复默认（删配置）。
+fn save_dir_custom_save(dir: Option<&str>) -> Option<std::path::PathBuf> {
+    let d = dir.unwrap_or("").trim();
+    if d.is_empty() {
+        let _ = std::fs::remove_file(save_dir_cfg_path());
+        return None;
+    }
+    let p = std::path::PathBuf::from(d);
+    if !p.is_absolute() {
+        return None;
+    }
+    let _ = std::fs::create_dir_all(bangxin_user_dir());
+    let _ = std::fs::write(
+        save_dir_cfg_path(),
+        serde_json::json!({ "dir": d }).to_string(),
+    );
+    Some(p)
+}
+
+/// 默认保存目录 = **安装目录**下的 downfiles（老8 口径：当前目录下的 \downfiles）。
+/// Windows 取 exe 所在目录（C:\Program Files\BangXin）；mac/linux 的 .app 包内不可写，
+/// 直接用用户数据目录（~/Library/Application Support/BangXin 等）。
+fn default_save_dir() -> std::path::PathBuf {
+    if cfg!(windows) {
+        let base = std::env::current_exe()
+            .ok()
+            .and_then(|e| e.parent().map(|p| p.to_path_buf()))
+            .unwrap_or_else(downloads_dir);
+        base.join("downfiles")
+    } else {
+        bangxin_user_dir().join("downfiles")
+    }
+}
+
+/// 目录可写性实测：建一个临时文件再删。
+/// 为什么必须实测：「目录存在」不等于「能写」—— Program Files 下的目录存在但普通用户建不了文件，
+/// 只有真写一次才测得出来（2026-11-18 老8 定的默认目录正好踩在这条上）。
+fn dir_writable(dir: &std::path::Path) -> bool {
+    let probe = dir.join(format!(".x8w_{}", std::process::id()));
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// 实际生效的保存目录 = 指定 > 默认；不可写则回落用户数据目录。
+/// 返回 (目录, 是否已回落)。
+fn resolve_save_dir() -> (std::path::PathBuf, bool) {
+    let want = save_dir_custom().unwrap_or_else(default_save_dir);
+    if std::fs::create_dir_all(&want).is_ok() && dir_writable(&want) {
+        return (want, false);
+    }
+    let fb = bangxin_user_dir().join("downfiles");
+    let _ = std::fs::create_dir_all(&fb);
+    (fb, true)
+}
+
+/// p 是否是 dir 下的**直接**子路径（清理白名单 / 写盘白名单共用）。
+fn in_dir_child(p: &std::path::Path, dir: &std::path::Path) -> bool {
+    let (a, b) = match (p.canonicalize(), dir.canonicalize()) {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => (p.to_path_buf(), dir.to_path_buf()),
+    };
+    a.parent().map(|x| x == b).unwrap_or(false)
+}
+
+/// 允许写入的根 = 下载目录 ∪ 当前保存目录。
+/// 2026-11-18：保存目录默认已是「安装目录\downfiles」（不在下载目录之下），
+/// 分块落盘仍用旧的 in_downloads 校验会直接报「非法写入路径」→ 这里把保存目录也算进来。
+fn in_write_allowed(p: &std::path::Path) -> bool {
+    if in_downloads(p) {
+        return true;
+    }
+    let d = auto_saved_dir();
+    in_dir_child(p, &d)
+}
+
+/// 危险目录黑名单：盘根 / 系统目录**本身**（它们的子目录是允许的 —— 默认安装目录就在 Program Files 下）。
+fn is_dangerous_save_dir(p: &str) -> bool {
+    let s = p.trim().trim_end_matches(['/', '\\']);
+    if s.is_empty() {
+        return true;
+    }
+    // 盘根：C:\ 、 D:\ 、 /
+    let root_like = std::path::Path::new(s).components().count() <= 1
+        || (s.len() == 2 && s.ends_with(':'));
+    if root_like {
+        return true;
+    }
+    const BAD: [&str; 9] = [
+        "C:\\Windows",
+        "C:\\Program Files",
+        "C:\\Program Files (x86)",
+        "C:\\Users",
+        "C:\\ProgramData",
+        "/System",
+        "/Library",
+        "/Applications",
+        "/Users",
+    ];
+    BAD.iter().any(|b| b.eq_ignore_ascii_case(s))
+}
+
+/// 保存目录状态（给前端个人资料面板显示）。
+fn save_dir_state_json() -> serde_json::Value {
+    let (dir, fallback) = resolve_save_dir();
+    serde_json::json!({
+        "ok": true,
+        "dir": dir.to_string_lossy(),
+        "default_dir": default_save_dir().to_string_lossy(),
+        "custom": save_dir_custom().is_some(),
+        "fallback": fallback,
+    })
 }
 
 // ── 开机自启动（2026-11-14 老8）────────────────────────────────────────────
@@ -3244,6 +3417,10 @@ fn save_target_dir(subdir: Option<&str>) -> std::path::PathBuf {
             let cleaned: String = sd.chars().filter(|c| !matches!(c, '/' | '\\')).collect();
             if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
                 downloads
+            } else if cleaned == "downfiles" {
+                // 2026-11-18：downfiles = 「自动落盘目录」→ 走可指定的保存目录
+                // （默认 安装目录\downfiles；用户可在个人资料里改成任意目录）
+                auto_saved_dir()
             } else {
                 downloads.join(cleaned)
             }
@@ -3331,7 +3508,7 @@ async fn save_chunk_begin(name: String, subdir: Option<String>) -> Result<String
 #[tauri::command]
 async fn save_chunk_append(token: String, b64: String) -> Result<u64, String> {
     let tmp = std::path::PathBuf::from(&token);
-    if !in_downloads(&tmp) {
+    if !in_write_allowed(&tmp) {
         return Err("非法写入路径".into());
     }
     tauri::async_runtime::spawn_blocking(move || {
@@ -3353,7 +3530,7 @@ async fn save_chunk_append(token: String, b64: String) -> Result<u64, String> {
 #[tauri::command]
 async fn save_chunk_end(token: String, name: String) -> Result<String, String> {
     let tmp = std::path::PathBuf::from(&token);
-    if !in_downloads(&tmp) {
+    if !in_write_allowed(&tmp) {
         return Err("非法写入路径".into());
     }
     tauri::async_runtime::spawn_blocking(move || {
@@ -4477,8 +4654,38 @@ fn start_tray_heal(app: tauri::AppHandle) {
 // 改浮窗样式只发 web，不用重新发客户端。
 
 /// 浮窗尺寸（逻辑像素）：2026-11-16 升级为「AI 邦灵」精灵 —— 96px 精灵 + 气泡两行。
-const FDE_FLOAT_W: f64 = 148.0;
-const FDE_FLOAT_H: f64 = 196.0;
+/// 🔴 2026-11-18 老8：AI 邦灵可切 **大 / 中 / 小** 三档，默认**小**。
+/// 窗口尺寸必须跟着档位走 —— 窗口是透明无边框的，尺寸就是精灵 + 气泡的画布；
+/// 窗口不变而只缩内容，精灵会飘在窗口中央（#wrap 底部对齐 → 精灵悬空）。
+/// 三档与浮窗页 CSS 变量一一对应（web/public/fde-float.html）：
+///   小 s = 96x150（pet 56px）· 中 m = 120x174（pet 74px）· 大 l = 148x196（pet 92px）
+const FDE_FLOAT_SIZE_S: (f64, f64) = (96.0, 150.0);
+const FDE_FLOAT_SIZE_M: (f64, f64) = (120.0, 174.0);
+const FDE_FLOAT_SIZE_L: (f64, f64) = (148.0, 196.0);
+
+/// 档位 → 窗口尺寸。未知值一律回落到「小」（新装默认）。
+fn fde_float_wh(size: &str) -> (f64, f64) {
+    match size {
+        "l" => FDE_FLOAT_SIZE_L,
+        "m" => FDE_FLOAT_SIZE_M,
+        _ => FDE_FLOAT_SIZE_S,
+    }
+}
+
+/// AI 邦灵 尺寸档位（pet.json: size）= "s" | "m" | "l"。**默认 "s"（小）**。
+/// 老8 2026-11-18 原话：「当前为大，默认为小尺寸」。
+fn pet_size() -> String {
+    let v = pet_cfg_load()
+        .get("size")
+        .and_then(|x| x.as_str())
+        .unwrap_or("s")
+        .to_string();
+    match v.as_str() {
+        "l" => "l".to_string(),
+        "m" => "m".to_string(),
+        _ => "s".to_string(),
+    }
+}
 /// 🔴 必须与 tauri.conf.json 主窗 `additionalBrowserArgs` **逐字一致**。
 /// WebView2 同一进程只接受一套 Environment 参数：第二次 `CreateCoreWebView2EnvironmentWithOptions`
 /// 若 args 不同，直接返回 ERROR_INVALID_STATE(0x8007139F)「组或资源的状态不是执行请求操作的正确状态」。
@@ -4618,14 +4825,14 @@ fn primary_work_area() -> Option<(i32, i32, i32, i32)> {
 /// 拿不到屏时下面会回落成 1920×1080 / sf=1 的假设值 → 算出的 x=1756 在 Retina 逻辑宽
 /// 1512 的屏上是**屏外**，窗口建出来却永远看不见（置顶也一样）。
 /// 所以非 Windows 平台一律把落点夹回「当前屏可视区」，宁可位置不完美也要在屏上。
-fn clamp_to_monitor(x: f64, y: f64, sf: f64, mpx: i32, mpy: i32, mw: u32, mh: u32) -> (f64, f64) {
+fn clamp_to_monitor(x: f64, y: f64, sf: f64, mpx: i32, mpy: i32, mw: u32, mh: u32, fw: f64, fh: f64) -> (f64, f64) {
     let sf = if sf > 0.1 { sf } else { 1.0 };
     let left = mpx as f64 / sf;
     let top = mpy as f64 / sf;
     let right = (mpx as f64 + mw as f64) / sf;
     let bottom = (mpy as f64 + mh as f64) / sf;
-    let max_x = (right - FDE_FLOAT_W - 8.0).max(left);
-    let max_y = (bottom - FDE_FLOAT_H - 8.0).max(top);
+    let max_x = (right - fw - 8.0).max(left);
+    let max_y = (bottom - fh - 8.0).max(top);
     (x.clamp(left, max_x), y.clamp(top, max_y))
 }
 
@@ -4634,6 +4841,9 @@ fn clamp_to_monitor(x: f64, y: f64, sf: f64, mpx: i32, mpy: i32, mw: u32, mh: u3
 ///   ② 回落位置 = **主窗所在那块屏**的工作区右下角（距右 16 / 距底 8 逻辑像素）
 /// 旧实现死钉 primary_monitor，双屏用户主窗在副屏时精灵会跑到另一块屏上。
 fn fde_float_pos(app: &tauri::AppHandle) -> (f64, f64) {
+    // 🔴 2026-11-18：窗口尺寸随「AI 邦灵尺寸」档位走（默认小）。
+    // 落点算的是**窗口左上角**，窗口大小变了，贴右下角/贴记忆点都得按新尺寸算。
+    let (fw, fh) = fde_float_wh(&pet_size());
     // 主窗所在屏优先；拿不到再退回主屏
     let mon = app
         .get_webview_window("main")
@@ -4671,16 +4881,16 @@ fn fde_float_pos(app: &tauri::AppHandle) -> (f64, f64) {
         #[cfg(target_os = "windows")]
         {
             // 换算成物理像素问一句「这个点还在某块屏的工作区里吗」
-            let cx = ((sx + FDE_FLOAT_W / 2.0) * sf) as i32;
-            let cy = ((sy + FDE_FLOAT_H / 2.0) * sf) as i32;
-            if work_area_at(cx, cy).is_some() && sx > -FDE_FLOAT_W && sy > -FDE_FLOAT_H {
+            let cx = ((sx + fw / 2.0) * sf) as i32;
+            let cy = ((sy + fh / 2.0) * sf) as i32;
+            if work_area_at(cx, cy).is_some() && sx > -fw && sy > -fh {
                 return (sx, sy);
             }
         }
         #[cfg(not(target_os = "windows"))]
         {
             // mac/linux：拖过的点也要夹回当前屏（换屏 / 缩放变了之后老坐标会跑出屏外）
-            let (cx, cy) = clamp_to_monitor(sx, sy, sf, mpx, mpy, mw, mh);
+            let (cx, cy) = clamp_to_monitor(sx, sy, sf, mpx, mpy, mw, mh, fw, fh);
             if (cx - sx).abs() > 1.0 || (cy - sy).abs() > 1.0 {
                 nav_write(&format!(
                     "[pet] 落点: 记忆点 ({sx:.0},{sy:.0}) 不在屏内 → 夹到 ({cx:.0},{cy:.0})"
@@ -4697,16 +4907,16 @@ fn fde_float_pos(app: &tauri::AppHandle) -> (f64, f64) {
         if let Some((l, t, r, b)) = work_area_at(cx, cy) {
             let w = (r - l) as f64 / sf;
             let h = (b - t) as f64 / sf;
-            return (w - FDE_FLOAT_W - 16.0, h - FDE_FLOAT_H - 8.0);
+            return (w - fw - 16.0, h - fh - 8.0);
         }
     }
     // 非 Windows / 取不到工作区：退回显示器整块，额外让出 56px 当任务栏
-    let x = (mpx as f64 + mw as f64) / sf - FDE_FLOAT_W - 16.0;
-    let y = (mpy as f64 + mh as f64) / sf - FDE_FLOAT_H - 8.0 - 56.0;
+    let x = (mpx as f64 + mw as f64) / sf - fw - 16.0;
+    let y = (mpy as f64 + mh as f64) / sf - fh - 8.0 - 56.0;
     if cfg!(windows) {
         (x, y)
     } else {
-        clamp_to_monitor(x, y, sf, mpx, mpy, mw, mh)
+        clamp_to_monitor(x, y, sf, mpx, mpy, mw, mh, fw, fh)
     }
 }
 
@@ -4789,6 +4999,12 @@ fn fde_build_window(
     // 真机实测：External(https://…) 建第二个 webview 一律 0x8007139F（L1~L4 全败），
     // 而主窗（App 协议 + 本地资源）正常 —— 差距就在 URL 形态上，故先按本地页验证。
     let mk_url = || tauri::WebviewUrl::App(path.into());
+    // 🔴 2026-11-18：窗口尺寸按「AI 邦灵尺寸」档位（大/中/小，默认小）。
+    // 精灵在页里是底部对齐（#wrap justify-content:flex-end），窗口必须贴合内容，
+    // 否则精灵会悬在窗口中央、点不到。
+    let (fw, fh) = fde_float_wh(&pet_size());
+    // 档位字符串：建窗完成时注入页面（页面 CSS 变量按 <html data-sz> 切）
+    let size_for_load = pet_size();
     // 🔴 2026-11-17 mac 白块（第四轮，老8 实测）：窗口建成、visible=true、rect 正确、
     // 不透明档，屏幕上就是一块 148×196 的纯白 —— 页面里 #wrap 初始 opacity:0，靠 JS
     // 加 .in 才显示，说明 **页面 JS 根本没跑起来**（Safari 直接开同一个线上页是正常的，
@@ -4820,6 +5036,7 @@ fn fde_build_window(
     ];
     for (i, (transparent, shadow, on_top)) in attempts.into_iter().enumerate() {
         let tip_for_load = tip_js.clone();
+        let sz_for_load = size_for_load.clone();
         let r = tauri::WebviewWindowBuilder::new(app, "fde-float", mk_url())
         .title("AI 邦灵")
         .additional_browser_args(X8_WEBVIEW_ARGS)
@@ -4830,7 +5047,7 @@ fn fde_build_window(
         // 唯一可靠解法：给浮窗一个**独立 data_directory**（独立 Environment），互不干涉。
         // 代价：多一个 msedgewebview2 进程组，只在浮窗存活期间；浮窗是静态页，不需要共享登录态。
         .data_directory(bangxin_user_dir().join("pet-webview"))
-        .inner_size(FDE_FLOAT_W, FDE_FLOAT_H)
+        .inner_size(fw, fh)
         .position(x, y)
         .decorations(false)
         .transparent(transparent)
@@ -4852,9 +5069,11 @@ fn fde_build_window(
                 payload.url()
             ));
             if matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
+                // 🔴 2026-11-18：尺寸档位一并注入（页面 CSS 变量按 data-sz 切换）
                 let js = format!(
-                    "window.__fdeUpdate ? (window.__fdeUpdate({n}, {}, 1), 'ok') : 'no-fn'",
-                    tip_for_load
+                    "window.__fdeSize && window.__fdeSize({sz}), window.__fdeUpdate ? (window.__fdeUpdate({n}, {}, 1), 'ok') : 'no-fn'",
+                    tip_for_load,
+                    sz = js_str(&sz_for_load)
                 );
                 match w.eval(&js) {
                     Ok(_) => nav_write("[pet] 加载完成，已注入参数重画"),
@@ -4871,8 +5090,8 @@ fn fde_build_window(
                 ));
                 if show_after {
                     // 保险：1px 抖一下，强制 WebView2 重算视口（隐藏期建窗偶发 0x0 视口）
-                    let _ = w.set_size(tauri::LogicalSize::new(FDE_FLOAT_W + 1.0, FDE_FLOAT_H));
-                    let _ = w.set_size(tauri::LogicalSize::new(FDE_FLOAT_W, FDE_FLOAT_H));
+                    let _ = w.set_size(tauri::LogicalSize::new(fw + 1.0, fh));
+                    let _ = w.set_size(tauri::LogicalSize::new(fw, fh));
                     let _ = w.set_position(tauri::LogicalPosition::new(x, y));
                 }
                 // 🔴 mac：WKWebView 首次布局偶发 0x0 视口（窗口 rect 正常、内容一片空白）。
@@ -4882,9 +5101,9 @@ fn fde_build_window(
                     let hw = w.clone();
                     std::thread::spawn(move || {
                         std::thread::sleep(std::time::Duration::from_millis(220));
-                        let _ = hw.set_size(tauri::LogicalSize::new(FDE_FLOAT_W, FDE_FLOAT_H + 1.0));
+                        let _ = hw.set_size(tauri::LogicalSize::new(fw, fh + 1.0));
                         std::thread::sleep(std::time::Duration::from_millis(90));
-                        let _ = hw.set_size(tauri::LogicalSize::new(FDE_FLOAT_W, FDE_FLOAT_H));
+                        let _ = hw.set_size(tauri::LogicalSize::new(fw, fh));
                         let _ = hw.set_position(tauri::LogicalPosition::new(x, y));
                         nav_write("[pet] mac 二次抖动尺寸完成");
                     });
@@ -4937,8 +5156,13 @@ fn fde_float_show_ex(app: &tauri::AppHandle, count: i64, tip: &str, silent: bool
     // 所以整段显示逻辑（取坐标 → eval → show / 建窗）统一投到主线程闭包里，不在这里先算。
     if app.get_webview_window("fde-float").is_some() {
         // 已存在：原地更新数字/文案 + 重播入场动画。不整窗 reload——reload 会白闪一下
+        // 🔴 2026-11-18：顺带同步尺寸档位（窗口开着期间改了档位，或配置被外部改过）。
+        // 尺寸不一致才 resize —— 免得每次来消息都抖一下窗口。
+        let (fw, fh) = fde_float_wh(&pet_size());
+        let sz_now = pet_size();
         let js = format!(
-            "window.__fdeUpdate && window.__fdeUpdate({n}, {}, {keep})",
+            "window.__fdeSize && window.__fdeSize({}), window.__fdeUpdate && window.__fdeUpdate({n}, {}, {keep})",
+            js_str(&sz_now),
             js_str(tip)
         );
         let h_main = app.clone();
@@ -4946,6 +5170,19 @@ fn fde_float_show_ex(app: &tauri::AppHandle, count: i64, tip: &str, silent: bool
             let (x, y) = fde_float_pos(&h_main);
             if let Some(w) = h_main.get_webview_window("fde-float") {
                 let _ = w.eval(&js);
+                // 尺寸对不上才改（窗口内容是底部对齐，尺寸错了精灵会悬空/被裁）
+                let need = w
+                    .inner_size()
+                    .map(|s| {
+                        let sc = w.scale_factor().unwrap_or(1.0);
+                        let sc = if sc > 0.1 { sc } else { 1.0 };
+                        (s.width as f64 / sc - fw).abs() > 1.0
+                            || (s.height as f64 / sc - fh).abs() > 1.0
+                    })
+                    .unwrap_or(false);
+                if need {
+                    let _ = w.set_size(tauri::LogicalSize::new(fw, fh));
+                }
                 let _ = w.set_position(tauri::LogicalPosition::new(x, y));
                 let _ = w.show();
             }
@@ -4954,7 +5191,9 @@ fn fde_float_show_ex(app: &tauri::AppHandle, count: i64, tip: &str, silent: bool
         }
     } else {
         // 本地打包页（dist/fde-float.html），带首次渲染所需的参数；后续更新走 __fdeUpdate
-        let path = format!("fde-float.html?n={}&t={}&k={keep}", n, url_encode(tip));
+        // 🔴 2026-11-18：sz=尺寸档位（Windows 的 query 能带；mac 靠 on_page_load 注入）
+        let sz0 = pet_size();
+        let path = format!("fde-float.html?n={}&t={}&k={keep}&sz={sz0}", n, url_encode(tip));
         let tip_owned = tip.to_string();
         let h_main = app.clone();
         if let Err(e) = app.run_on_main_thread(move || {
@@ -5214,11 +5453,48 @@ fn pet_status() -> serde_json::Value {
         "enabled": pet_enabled(),
         "muted": pet_muted(),
         "avatar": pet_avatar(),
+        "size": pet_size(),
         "pos": pet_saved_pos().map(|(x, y)| serde_json::json!({ "x": x, "y": y })).unwrap_or(serde_json::Value::Null)
     })
 }
 
-/// AI 邦灵 用哪个形象（pet.json: avatar）：空串 = 内置卡通精灵；data:/http(s) = 用户自己的头像。
+/// 设置 AI 邦灵 尺寸档位（"s" 小 / "m" 中 / "l" 大）。返回落盘后的值。
+///
+/// 🔴 2026-11-18 老8：「AI邦灵 可以设置 大中小 3个尺寸，当前为大，默认为小尺寸」。
+/// 落 pet.json: size（与 avatar/muted 同目录）。精灵窗开着就地改尺寸 + 挪回落点，
+/// 不用等下次弹出。
+#[tauri::command]
+fn pet_set_size(app: tauri::AppHandle, size: String) -> String {
+    let v = match size.trim() {
+        "l" => "l",
+        "m" => "m",
+        _ => "s",
+    }
+    .to_string();
+    let mut cfg = pet_cfg_load();
+    cfg["size"] = serde_json::json!(v);
+    pet_cfg_save(&cfg);
+    // 精灵窗开着：立刻改窗口尺寸 + 让页面换档（精灵本体缩放），并挪回右下角落点
+    if let Some(w) = app.get_webview_window("fde-float") {
+        let (fw, fh) = fde_float_wh(&v);
+        let _ = w.set_size(tauri::LogicalSize::new(fw, fh));
+        let js = format!("window.__fdeSize && window.__fdeSize({})", js_str(&v));
+        let _ = w.eval(&js);
+        // 尺寸变了，旧的记忆落点（窗口左上角）不再贴边 → 重算一次
+        let h_main = app.clone();
+        if let Err(e) = app.run_on_main_thread(move || {
+            let (x, y) = fde_float_pos(&h_main);
+            if let Some(w2) = h_main.get_webview_window("fde-float") {
+                let _ = w2.set_position(tauri::LogicalPosition::new(x, y));
+            }
+        }) {
+            nav_write(&format!("[pet] 改尺寸后重算落点失败: {e}"));
+        }
+    }
+    v
+}
+
+/// AI 邦灵 用哪个形象（pet.json: avatar）：空串 = 内置默认视频(fde-avatar.mp4)；'sprite' = 卡通精灵；data:/http(s) = 用户自己的头像/视频。
 ///
 /// 为什么存 data URL 而不是头像链接：精灵窗是**独立 webview**，没有主窗的登录 token，
 /// MM 头像接口要 Bearer 才给图（主窗拿到的是 blob:，跨窗不可用）。所以由主窗把头像
@@ -8045,6 +8321,7 @@ fn main() {
             pet_pos_save,
             pet_set_muted,
             pet_set_avatar,
+            pet_set_size,
             pet_status,
             // 2026-10-23 升级中进度小窗（老8：要看到正在下载 / 已用 / 剩余时间）
             upd_float_show,

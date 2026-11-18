@@ -31,6 +31,11 @@ const SAVE_HTTP_PORTS: std::ops::Range<u16> = 47615..47625;
 const SAVE_HTTP_MAX_CONN: usize = 24;
 static SAVE_HTTP_CONNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// 最近一次由系统「选择文件夹」对话框**亲自选中**的目录（2026-11-18）。
+/// 保存目录只认这个值：页面最多只能把落盘改成用户刚在系统对话框里选的那个目录，
+/// 不能凭空指定任意路径（那等于开放任意路径写盘）。
+static LAST_PICKED_DIR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
 /// 在飞连接计数守卫：拿到即占一个名额，drop 自动归还（线程 panic 也会归还）。
 struct SaveConnGuard;
 
@@ -265,21 +270,43 @@ fn save_http_handle(mut s: std::net::TcpStream, app: &tauri::AppHandle) -> std::
         return save_http_reply(&mut s, 200, &cors, &out.to_string());
     }
 
+    // GET /pickcap —— 能力探针（2026-11-18）
+    // 前端靠它判断「本机客户端是否支持 Rust 原生选择器」。
+    // 为什么不能按平台直接判断：mac 的原生选择器是 11-18 才加的，老客户端的 /pick
+    // 直接回 pick_unsupported。前端若对老客户端也 await 一次 /pick，user gesture 就没了
+    // （WKWebView 会静默丢弃 input.click()）→ 表现成「点发送文件完全没反应」（11-06 踩过）。
+    // 所以口径是：**老客户端 = 同步走 input.click()（保持原样），新客户端 = 走原生面板**。
+    // 老客户端没有这条路由 → 前端拿到 404 → 视为不支持 → 行为不变。
+    if path_only == "/pickcap" && method == "GET" {
+        let supported = cfg!(windows) || cfg!(target_os = "macos");
+        let body = format!("{{\"ok\":true,\"supported\":{supported}}}");
+        return save_http_reply(&mut s, 200, &cors, &body);
+    }
+
     // GET /pick?accept=image/* —— 系统文件选择框（2026-11-06）
     // 为什么要 Rust 来弹：`<input type="file">` 在 WebView2 下**拿不到绝对路径**，
     // 发送方就永远没法「定位到源目录」，只能把文件再落一份到 downfiles 里凑合（老8 否掉）。
     // 这里只回路径，字节由前端再走 /readfile 取；任何失败都返回 ok:false，前端回退旧文件框。
+    //
+    // 2026-11-18：mac 也走这条（App 自己的 NSOpenPanel）—— 老8 报「mac 点图片弹的框是英文的
+    // + 反应太慢」。面板若由 wry（WKWebView）弹：不过滤类型、拿不到绝对路径、起始目录不受控
+    // （可能落在 iCloud 云盘目录 → macOS 枚举云盘目录把面板卡住）。详见 src/mac_pick.rs。
     if path_only == "/pick" && method == "GET" {
-        #[cfg(windows)]
-        {
-            let mut want_img = false;
+        // accept=image/* → 只列图片（Windows / mac 共用口径）
+        #[cfg(any(windows, target_os = "macos"))]
+        let want_img = {
+            let mut img = false;
             for kv in query.split('&') {
                 if let Some((k, v)) = kv.split_once('=') {
                     if k == "accept" && pct_decode(v).starts_with("image") {
-                        want_img = true;
+                        img = true;
                     }
                 }
             }
+            img
+        };
+        #[cfg(windows)]
+        {
             let filter = if want_img {
                 "$d.Filter='图片|*.png;*.jpg;*.jpeg;*.gif;*.webp;*.bmp'"
             } else {
@@ -350,7 +377,52 @@ fn save_http_handle(mut s: std::net::TcpStream, app: &tauri::AppHandle) -> std::
                 }
             }
         }
-        #[cfg(not(windows))]
+        // 2026-11-18：mac 走 App 自己的 NSOpenPanel（不再经 WKWebView 的 input.click()）。
+        // AppKit 硬性要求面板在主线程创建 → 投到主线程弹，HTTP 线程在这里等结果。
+        #[cfg(target_os = "macos")]
+        {
+            let app2 = app.clone();
+            let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<(String, u64)>, String>>();
+            let dispatched = app2.run_on_main_thread(move || {
+                let _ = tx.send(crate::mac_pick::pick_files(want_img));
+            });
+            if dispatched.is_err() {
+                return save_http_reply(
+                    &mut s,
+                    200,
+                    &cors,
+                    "{\"ok\":false,\"error\":\"pick_dispatch_failed\"}",
+                );
+            }
+            // 用户可能挑很久 → 10 分钟上限（前端那边另有 90s 兜底）
+            let picked = match rx.recv_timeout(std::time::Duration::from_secs(600)) {
+                Ok(r) => r,
+                Err(_) => {
+                    return save_http_reply(
+                        &mut s,
+                        200,
+                        &cors,
+                        "{\"ok\":false,\"error\":\"pick_timeout\"}",
+                    );
+                }
+            };
+            let files = match picked {
+                Ok(v) => v,
+                Err(e) => {
+                    let body = serde_json::json!({ "ok": false, "error": e }).to_string();
+                    return save_http_reply(&mut s, 200, &cors, &body);
+                }
+            };
+            // 与 Windows 同一份 JSON 契约：{path, size} 列表 + rc=0（前端零改动复用）
+            let arr: Vec<serde_json::Value> = files
+                .iter()
+                .map(|(p, sz)| serde_json::json!({ "path": p, "size": sz }))
+                .collect();
+            let body = serde_json::json!({ "ok": true, "files": arr, "rc": 0 }).to_string();
+            return save_http_reply(&mut s, 200, &cors, &body);
+        }
+        // linux：仍不支持（前端回退 <input type=file>）
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
             return save_http_reply(
                 &mut s,
@@ -361,7 +433,94 @@ fn save_http_handle(mut s: std::net::TcpStream, app: &tauri::AppHandle) -> std::
         }
     }
 
+    // ── 保存目录（2026-11-18 老8：聊天文件保存目录可指定）────────────────────
+    // GET  /savedir              读当前生效目录 + 默认目录
+    // GET  /pickdir              弹系统「选择文件夹」对话框（用户亲自选 → 记账）
+    // POST /savedir?path=<路径>  写回（只认刚才用户亲自选中的那个；空 = 恢复默认）
+    //
+    // 为什么必须弹原生对话框：① WebView2 拿不到绝对路径（同 /pick 的坑）；
+    // ② 「让用户亲眼选一次」本身就是安全边界 —— 只有被选中过的路径才允许写回，
+    //    页面不能悄悄把落盘改到别处（那等于开放任意路径写盘）。
+    if path_only == "/savedir" && method == "GET" {
+        let body = save_dir_state_json().to_string();
+        return save_http_reply(&mut s, 200, &cors, &body);
+    }
+    if path_only == "/savedir" && method == "POST" {
+        let mut p = String::new();
+        for kv in query.split('&') {
+            if let Some((k, v)) = kv.split_once('=') {
+                if k == "path" {
+                    p = pct_decode(v);
+                }
+            }
+        }
+        let p = p.trim().to_string();
+        if p.is_empty() {
+            // 恢复默认（删配置 → 回到 安装目录\downfiles）
+            save_dir_custom_save(None);
+            si_log("[savedir] reset to default");
+            let body = save_dir_state_json().to_string();
+            return save_http_reply(&mut s, 200, &cors, &body);
+        }
+        // 只认用户亲自在系统对话框里选中的那个路径（LAST_PICKED_DIR 记账）
+        let last = LAST_PICKED_DIR
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .unwrap_or_default();
+        if p != last {
+            let body =
+                serde_json::json!({ "ok": false, "error": "目录未经用户选择确认" }).to_string();
+            return save_http_reply(&mut s, 403, &cors, &body);
+        }
+        if is_dangerous_save_dir(&p) {
+            let body =
+                serde_json::json!({ "ok": false, "error": "该目录不适合作为保存目录（不能是磁盘根或系统目录）" })
+                    .to_string();
+            return save_http_reply(&mut s, 400, &cors, &body);
+        }
+        save_dir_custom_save(Some(&p));
+        si_log(&format!("[savedir] set {p}"));
+        let body = save_dir_state_json().to_string();
+        return save_http_reply(&mut s, 200, &cors, &body);
+    }
+    if path_only == "/pickdir" && method == "GET" {
+        #[cfg(windows)]
+        {
+            // 初始位置 = 当前生效目录（不存在就用下载目录）—— 用户在熟悉的目录下挑
+            let (cur, _) = resolve_save_dir();
+            let init = if cur.is_dir() {
+                cur.to_string_lossy().to_string()
+            } else {
+                downloads_dir().to_string_lossy().to_string()
+            };
+            match pick_dir_dialog(&init) {
+                Some(p) => {
+                    // 记账：只有这个路径允许被 /savedir 写回
+                    if let Ok(mut g) = LAST_PICKED_DIR.lock() {
+                        *g = Some(p.clone());
+                    }
+                    let body = serde_json::json!({ "ok": true, "path": p }).to_string();
+                    return save_http_reply(&mut s, 200, &cors, &body);
+                }
+                None => {
+                    // 取消 / PowerShell 被策略拦住：前端据此不弹错误提示（当成用户取消）
+                    let body =
+                        serde_json::json!({ "ok": false, "error": "cancelled", "cancelled": true })
+                            .to_string();
+                    return save_http_reply(&mut s, 200, &cors, &body);
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let body = serde_json::json!({ "ok": false, "error": "pickdir_unsupported" }).to_string();
+            return save_http_reply(&mut s, 200, &cors, &body);
+        }
+    }
+
     // GET /readfile?path=<绝对路径> —— 原始字节（把原生对话框选中的文件读成 File）
+
     // 必须流式转发：2GB 上限的直传件一次性读进内存会直接把客户端打爆。
     if path_only == "/readfile" && method == "GET" {
         let mut p = String::new();
@@ -544,6 +703,115 @@ fn save_http_handle(mut s: std::net::TcpStream, app: &tauri::AppHandle) -> std::
         return save_http_reply(&mut s, 200, &cors, &body);
     }
 
+    // POST /saveas?name=<建议文件名>&ext=<扩展名> —— 弹系统「另存为」对话框后落盘
+    // 2026-11-18（图片查看器）：为什么必须走 Rust：
+    //   WebView2 不支持 showSaveFilePicker（原因同 /pick 的注释），系统另存为只能靠原生对话框；
+    //   而「弹框」与「写盘」必须同进程 —— 弹框拿到的是用户亲自选的绝对路径，
+    //   这个路径不允许由前端传进来（否则就是任意路径写盘）。
+    // 顺序：①先把请求体收进临时文件 ②弹框拿路径 ③拷过去。
+    //   ①在前是因为客户端此刻正在上传，先弹框会让用户对着一个空对话框等下载；
+    //   先收完再弹，用户看到对话框时数据已就绪。
+    if path_only == "/saveas" && method == "POST" {
+        let mut name = String::new();
+        let mut ext = String::new();
+        for kv in query.split('&') {
+            if let Some((k, v)) = kv.split_once('=') {
+                match k {
+                    "name" => name = pct_decode(v),
+                    "ext" => ext = pct_decode(v).trim_start_matches('.').to_ascii_lowercase(),
+                    _ => {}
+                }
+            }
+        }
+        if name.trim().is_empty() {
+            return save_http_reply(&mut s, 400, &cors, "{\"ok\":false,\"error\":\"no_name\"}");
+        }
+        // ① 收字节 → 临时文件（放在下载目录同盘，rename 到目标路径多为同盘原子操作）
+        let dir = downloads_dir();
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            let body = serde_json::json!({ "ok": false, "error": format!("无法创建目录：{}", e) }).to_string();
+            return save_http_reply(&mut s, 500, &cors, &body);
+        }
+        let safe = sanitize_filename(&name);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp = dir.join(format!(".x8saveas_{}_{}_{}", std::process::id(), stamp, safe));
+        let write_res = (|| -> std::io::Result<usize> {
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp)?;
+            let mut written = 0usize;
+            if !pre_body.is_empty() {
+                let take = if clen > 0 { pre_body.len().min(clen) } else { pre_body.len() };
+                f.write_all(&pre_body[..take])?;
+                written += take;
+            }
+            let mut buf = vec![0u8; 256 * 1024];
+            loop {
+                if clen > 0 && written >= clen {
+                    break;
+                }
+                let want = if clen > 0 { (clen - written).min(buf.len()) } else { buf.len() };
+                let n = s.read(&mut buf[..want])?;
+                if n == 0 {
+                    break;
+                }
+                f.write_all(&buf[..n])?;
+                written += n;
+            }
+            f.flush()?;
+            Ok(written)
+        })();
+        if let Err(e) = write_res {
+            let _ = std::fs::remove_file(&tmp);
+            let body = serde_json::json!({ "ok": false, "error": format!("写入失败：{}", e) }).to_string();
+            return save_http_reply(&mut s, 500, &cors, &body);
+        }
+        // ② 弹系统另存为
+        #[cfg(windows)]
+        {
+            match pick_save_path(&safe, &ext, &dir.to_string_lossy()) {
+                Some(p) => {
+                    // ③ 落到用户选的位置（同盘优先 rename，跨盘/被占用退回 copy）
+                    let target = std::path::PathBuf::from(&p);
+                    if let Some(par) = target.parent() {
+                        let _ = std::fs::create_dir_all(par);
+                    }
+                    let mut moved = std::fs::rename(&tmp, &target).is_ok();
+                    if !moved {
+                        moved = std::fs::copy(&tmp, &target).is_ok();
+                    }
+                    let _ = std::fs::remove_file(&tmp);
+                    if !moved {
+                        let body = serde_json::json!({ "ok": false, "error": "无法写入所选位置" }).to_string();
+                        return save_http_reply(&mut s, 500, &cors, &body);
+                    }
+                    let body = serde_json::json!({
+                        "ok": true, "path": p, "cancelled": false
+                    })
+                    .to_string();
+                    return save_http_reply(&mut s, 200, &cors, &body);
+                }
+                None => {
+                    let _ = std::fs::remove_file(&tmp);
+                    let body = serde_json::json!({ "ok": false, "error": "cancelled", "cancelled": true }).to_string();
+                    return save_http_reply(&mut s, 200, &cors, &body);
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = std::fs::remove_file(&tmp);
+            // mac/linux 暂不接原生另存为（跨端无法验证）→ 前端回落「保存到下载目录」
+            let body = serde_json::json!({ "ok": false, "error": "saveas_unsupported" }).to_string();
+            return save_http_reply(&mut s, 200, &cors, &body);
+        }
+    }
+
     if path_only != "/save" || method != "POST" {
         return save_http_reply(&mut s, 404, &cors, "{\"ok\":false,\"error\":\"not_found\"}");
     }
@@ -640,4 +908,132 @@ fn save_http_handle(mut s: std::net::TcpStream, app: &tauri::AppHandle) -> std::
             save_http_reply(&mut s, 500, &cors, &body)
         }
     }
+}
+
+// ============================================================================
+// 系统「选择文件夹」对话框（2026-11-18，保存目录指定用）
+// ----------------------------------------------------------------------------
+// 与 pick_save_path 同一套解法：PowerShell FolderBrowserDialog → base64 回传
+// （PowerShell 5.1 的 stdout 是 OEM 代码页，中文路径直读会乱码）。
+// 取消：对话框返回 Cancel → 脚本不输出 → 返回 None → 前端收到 cancelled。
+// ============================================================================
+#[cfg(windows)]
+fn pick_dir_dialog(init: &str) -> Option<String> {
+    // 路径里的单引号会破坏 PowerShell 的单引号串 → 先做一次转义
+    let esc_init = init.replace('\'', "''");
+    let script = format!(
+        "Add-Type -AssemblyName System.Windows.Forms|Out-Null;\
+         $d=New-Object System.Windows.Forms.FolderBrowserDialog;\
+         $d.Description='邦信 - 选择聊天文件保存目录';\
+         $d.ShowNewFolderButton=$true;\
+         $d.SelectedPath='{esc_init}';\
+         $w=New-Object System.Windows.Forms.Form;\
+         $w.TopMost=$true;$w.ShowInTaskbar=$false;$w.Opacity=0;$w.Width=1;$w.Height=1;\
+         $w.StartPosition='CenterScreen';$w.Show()|Out-Null;\
+         $r=$d.ShowDialog($w);$w.Close();\
+         if($r -eq 'OK'){{[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($d.SelectedPath))}}",
+    );
+    let out = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-STA",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            &script,
+        ])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .output();
+    let o = match out {
+        Ok(o) => o,
+        Err(_) => return None,
+    };
+    let txt = String::from_utf8_lossy(&o.stdout).to_string();
+    for line in txt.lines() {
+        let l = line.trim();
+        if l.is_empty() {
+            continue;
+        }
+        if let Ok(bytes) = b64_decode(l) {
+            if let Ok(p) = String::from_utf8(bytes) {
+                if !p.trim().is_empty() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    None
+}
+
+// ============================================================================
+// 系统「另存为」对话框（2026-11-18，图片查看器「另存」用）
+// ----------------------------------------------------------------------------
+// 为什么必须走 PowerShell 而不是浏览器 API：
+//   ① WebView2 不支持 showSaveFilePicker（与 /pick 同一个坑）；
+//   ② 「选路径」和「写盘」必须同进程 —— 弹框拿到的是用户亲自选的绝对路径，
+//      这个路径绝不能让前端传进来（那等于开放任意路径写盘）。
+// 做法：PowerShell System.Windows.Forms.SaveFileDialog 弹框 → 取回路径 → 写盘。
+// 编码坑：PowerShell 5.1 的 stdout 是 OEM 代码页，中文路径直接读会乱码，
+//   所以输出走 base64（与 /pick 同一套解法，b64_decode 复用 main.rs 的实现）。
+// 取消：对话框返回 Cancel 时脚本不输出任何东西 → 返回 None → 前端收到 cancelled。
+// ============================================================================
+#[cfg(windows)]
+fn pick_save_path(suggest_name: &str, ext: &str, init_dir: &str) -> Option<String> {
+    // 文件名里的单引号会破坏 PowerShell 的单引号串 → 先做一次转义
+    let esc = suggest_name.replace('\'', "''");
+    // 过滤器按扩展名给：图片给对应类型，其它给全部文件
+    let filter = match ext {
+        "png" => "PNG 图片|*.png|所有文件|*.*",
+        "jpg" | "jpeg" => "JPEG 图片|*.jpg;*.jpeg|所有文件|*.*",
+        "gif" => "GIF 图片|*.gif|所有文件|*.*",
+        "webp" => "WEBP 图片|*.webp|所有文件|*.*",
+        "bmp" => "BMP 图片|*.bmp|所有文件|*.*",
+        _ => "所有文件|*.*",
+    };
+    let esc_dir = init_dir.replace('\'', "''");
+    let script = format!(
+        "Add-Type -AssemblyName System.Windows.Forms|Out-Null;\
+         $d=New-Object System.Windows.Forms.SaveFileDialog;\
+         $d.FileName='{esc}';$d.Filter='{filter}';\
+         $d.InitialDirectory='{esc_dir}';$d.OverwritePrompt=$true;\
+         $d.Title='邦信 - 另存为';\
+         $w=New-Object System.Windows.Forms.Form;\
+         $w.TopMost=$true;$w.ShowInTaskbar=$false;$w.Opacity=0;$w.Width=1;$w.Height=1;\
+         $w.StartPosition='CenterScreen';$w.Show()|Out-Null;\
+         $r=$d.ShowDialog($w);$w.Close();\
+         if($r -eq 'OK'){{[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($d.FileName))}}",
+    );
+    let out = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-STA",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            &script,
+        ])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .output();
+    let o = match out {
+        Ok(o) => o,
+        Err(_) => return None,
+    };
+    let txt = String::from_utf8_lossy(&o.stdout).to_string();
+    for line in txt.lines() {
+        let l = line.trim();
+        if l.is_empty() {
+            continue;
+        }
+        if let Ok(bytes) = b64_decode(l) {
+            if let Ok(p) = String::from_utf8(bytes) {
+                if p.trim().is_empty() {
+                    continue;
+                }
+                return Some(p);
+            }
+        }
+    }
+    None
 }
