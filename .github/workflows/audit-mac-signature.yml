@@ -20,11 +20,12 @@ jobs:
         run: |
           set -u
           mkdir -p /tmp/audit /tmp/audit-report && cd /tmp/audit
-          for v in ${{ inputs.versions }}; do
+          # 🔴 inputs 是逗号分隔的字符串，必须先 tr 成空格再 for，否则被当成一个整体 → URL 拼错 404
+          for v in $(echo '${{ inputs.versions }}' | tr ',' ' '); do
             for a in apple-silicon intel; do
               curl -fsSL --max-time 300 -o "$a-$v.tar.gz" \
                 "https://download.x8fde.com/x8im/download/BangXin-$a-$v.app.tar.gz" \
-                || echo "SKIP $a-$v (不可下载)"
+                || { rm -f "$a-$v.tar.gz"; echo "SKIP $a-$v (不可下载)"; }
             done
           done
           ls -la /tmp/audit
