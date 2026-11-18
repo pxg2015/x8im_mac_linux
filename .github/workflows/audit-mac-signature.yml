@@ -10,7 +10,9 @@ on:
         default: '1.7.0,1.7.21'
 jobs:
   audit:
-    runs-on: macos-14
+    # 🔴 macos-14（Sonoma arm64）镜像 2026-11-02 已退役 → job 0 秒内被取消（形似 cancelled）
+    #    固定 macos-15（同 build-macos.yml 的选择）
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
