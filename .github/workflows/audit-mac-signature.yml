@@ -1,0 +1,53 @@
+name: audit-mac-signature
+# 申诉取证：对现役包 + 被吊销签名包跑 codesign / spctl 自查，产出报告 artifact
+on:
+  workflow_dispatch:
+    inputs:
+      versions:
+        description: '逗号分隔的版本号列表（默认审计现役 1.7.23 与被吊销签名的 1.7.0）'
+        default: '1.7.23,1.7.0'
+jobs:
+  audit:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 下载待审包（未签名现行包 + 带吊销签名的旧包）
+        run: |
+          set -u
+          mkdir -p /tmp/audit && cd /tmp/audit
+          for v in ${{ inputs.versions }}; do
+            for a in apple-silicon intel; do
+              curl -fsSL --max-time 300 -o "$a-$v.tar.gz" \
+                "https://download.x8fde.com/x8im/download/BangXin-$a-$v.app.tar.gz" \
+                || echo "SKIP $a-$v (不可下载)"
+            done
+          done
+          ls -la /tmp/audit
+
+      - name: codesign / spctl 自查
+        run: |
+          set -u
+          cd /tmp/audit
+          for f in *.tar.gz; do
+            [ -s "$f" ] || continue
+            echo "################ $f ################"
+            rm -rf x && mkdir x && tar -xzf "$f" -C x
+            app=$(find x -maxdepth 2 -name '*.app' -type d | head -1)
+            echo "--- codesign -dv --verbose=4 ---"
+            codesign -dv --verbose=4 "$app" 2>&1 || true
+            echo "--- codesign -vvv --deep --strict ---"
+            codesign -vvv --deep --strict "$app" 2>&1 || true
+            echo "--- spctl -a -t exec -vv ---"
+            spctl -a -t exec -vv "$app" 2>&1 || true
+            echo "--- CFBundleLocalizations / ShortVersion ---"
+            /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist" 2>&1 || true
+            /usr/libexec/PlistBuddy -c 'Print :CFBundleLocalizations' "$app/Contents/Info.plist" 2>&1 || true
+            rm -rf x
+          done
+
+      - name: 归档报告
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-signature-audit
+          path: /tmp/audit
