@@ -5494,7 +5494,8 @@ fn pet_set_size(app: tauri::AppHandle, size: String) -> String {
     v
 }
 
-/// AI 邦灵 用哪个形象（pet.json: avatar）：空串 = 内置默认视频(fde-avatar.mp4)；'sprite' = 卡通精灵；data:/http(s) = 用户自己的头像/视频。
+/// AI 邦灵 用哪个形象（pet.json: avatar）：空串 = 内置默认静态头像(fde-avatar.png + CSS 动画)；'sprite' = 卡通精灵；data:image/http(s) = 用户自己的头像。
+/// 2026-11-20：不再有视频形象 —— <video> 循环播放会让 WebView2 持 Video Wake Lock 导致系统不锁屏；历史 data:video/ 值由浮窗安全回退静态图。
 ///
 /// 为什么存 data URL 而不是头像链接：精灵窗是**独立 webview**，没有主窗的登录 token，
 /// MM 头像接口要 Bearer 才给图（主窗拿到的是 blob:，跨窗不可用）。所以由主窗把头像
@@ -6428,6 +6429,29 @@ fn parse_ver(s: &str) -> (u32, u32, u32) {
     (a, b, c)
 }
 
+/// 读 updating.json 里的 target ＝「正在升级中的目标版本」。
+/// 🔴 2026-11-20 连发四版事故：清理逻辑绝不能删掉计划任务正要 start 的包，
+/// 删了 cmd 的 `start ""` 就弹 Windows「找不到文件」。所有删包处必须先问它。
+#[cfg(windows)]
+pub(crate) fn upgrade_inflight_target() -> Option<String> {
+    let p = upgrade_marker_path()?;
+    let s = std::fs::read_to_string(p).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&s).ok()?;
+    let t = v.get("target")?.as_str()?;
+    if t.is_empty() { None } else { Some(t.to_string()) }
+}
+
+/// 从升级包名解析版本号：BangXin_1.7.27_x64-setup.exe / -portable.zip → 1.7.27
+#[cfg(windows)]
+pub(crate) fn package_ver_of(name: &str) -> Option<String> {
+    let base = name.strip_prefix("BangXin_")?;
+    let ver = base.split('_').next()?;
+    if ver.is_empty() || !ver.as_bytes()[0].is_ascii_digit() {
+        return None;
+    }
+    Some(ver.to_string())
+}
+
 /// 触发静默安装**之前**落标记：目标版本 + 第几次尝试。只增不减，成功才清。
 #[cfg(windows)]
 fn upgrade_mark_start(updates: &std::path::Path) {
@@ -6474,6 +6498,10 @@ fn upgrade_selfcheck(app: &tauri::AppHandle) {
     let target = v.get("target").and_then(|x| x.as_str()).unwrap_or("").to_string();
     let attempts = v.get("attempts").and_then(|x| x.as_u64()).unwrap_or(0);
     let (c, t) = (parse_ver(&cur), parse_ver(&target));
+    // 🔴 2026-11-20 修复：inflight 目标必须在删 marker **之前**读。
+    //   upgrade_inflight_target() 就是读同一个 updating.json——先删后读必然返回 None，
+    //   保护逻辑形同虚设（我上一版把读取放在了 remove_file(&marker) 之后）。
+    let inflight = upgrade_inflight_target();
     if t.0 == 0 {
         let _ = std::fs::remove_file(&marker);
         return;
@@ -6492,6 +6520,11 @@ fn upgrade_selfcheck(app: &tauri::AppHandle) {
                 for e in rd.flatten() {
                     let n = e.file_name().to_string_lossy().to_string();
                     if n.starts_with("BangXin_") && (n.ends_with(".exe") || n.ends_with(".zip")) {
+                        // 🔴 2026-11-20：别删正在被计划任务引用的目标包（连发多版时
+                        //   另一条链路可能刚落盘更新版、旧包仍是本次 start 的目标）。
+                        if package_ver_of(&n).as_deref() == inflight.as_deref() {
+                            continue;
+                        }
                         let _ = std::fs::remove_file(e.path());
                     }
                 }
@@ -6520,8 +6553,151 @@ fn upgrade_selfcheck(app: &tauri::AppHandle) {
 /// 100% 升不了级，表现＝发版了但客户端永远停在老版本。
 /// 现在预检失败**只降级、不放弃**：包照样下载、验签、落盘；最后一公里改用提权直跑，
 /// 最差情况也只是弹一次 UAC，而不是白下几十 MB 后报「请手动更新」。
+/// 进程级「触发补丁」重入闸门。两条升级链路（updater.rs 的 BUSY 只管它自己 +
+/// main.rs 的 win_auto/win_patch）此前互不设防，可能同时走到这里、对同一个包
+/// 连发两次 schtasks /Run / 降级提权 → 两个 updater-task.cmd 抢同一个包，一个
+/// start 完就删、另一个 start 死路径弹「找不到文件」。锁必须跨这两条链路。
+#[cfg(windows)]
+static APPLY_PATCH_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 离开作用域必释放闸门，覆盖所有 early return / `?` 分支。
+#[cfg(windows)]
+struct ApplyPatchGuard;
+#[cfg(windows)]
+impl Drop for ApplyPatchGuard {
+    fn drop(&mut self) {
+        APPLY_PATCH_BUSY.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// 🔴 2026-11-20：跨进程升级触发闸门。APPLY_PATCH_BUSY 只挡同一进程的两条链路；
+///   旧进程残留 + 新进程、或计划任务已在跑而降级提权通道又要直跑时，仍可能两个 cmd
+///   抢同一个包——一个 start 完就删、另一个 start 死路径弹「找不到文件」。
+///   用 updates 目录里的时间戳锁文件挡这种跨进程重入：15s 内已有人触发就跳过。
+///   schtasks /Run 对运行中的任务本身会拒绝第二次，这里主要补降级通道的漏。
+#[cfg(windows)]
+fn claim_update_trigger(updates: &std::path::Path) -> bool {
+    let lock = updates.join("task-trigger.lock");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Ok(s) = std::fs::read_to_string(&lock) {
+        if let Ok(prev) = s.trim().parse::<u64>() {
+            // 时钟回拨 / 未来时间都当「刚触发过」，宁可跳过也不并发
+            if now.saturating_sub(prev) < 15 {
+                upd_log(&format!("跨进程升级闸门: 15s 内已触发（lock={prev}），跳过"));
+                return false;
+            }
+        }
+    }
+    let _ = std::fs::create_dir_all(updates);
+    let _ = std::fs::write(&lock, now.to_string());
+    true
+}
+
+/// 2026-11-20：内置「带守卫」升级 cmd（全 ASCII），供存量机热替换。
+///   与 installer.nsh 的 NSIS_HOOK_POSTINSTALL 模板同步，关键三点：
+///     X8FRESH2026 标记 / 包不存在就跳过（goto gone）/ 绝不二次 start 已用过的路径。
+#[cfg(windows)]
+const FRESH_UPDATER_CMD: &str = concat!(
+    "@echo off\r\n",
+    "rem X8FRESH2026 guarded updater - no dead-path re-start\r\n",
+    "setlocal EnableExtensions\r\n",
+    "set UPD=%ProgramData%\\BangXin\\updates\r\n",
+    "set INSTDIR=C:\\Program Files\\BangXin\r\n",
+    "for /f \"delims=\" %%f in ('dir /b /o-d \"%UPD%\\BangXin_*_x64-portable.zip\" 2^>nul') do (\r\n",
+    "  if not exist \"%UPD%\\%%f\" goto gone\r\n",
+    "  echo %DATE% %TIME% > \"%UPD%\\task-started.txt\"\r\n",
+    "  taskkill /F /IM x8im.exe\r\n",
+    "  timeout /t 1 >nul\r\n",
+    "  powershell -NoProfile -ExecutionPolicy Bypass -Command \"Expand-Archive -Force -Path '%UPD%\\%%f' -DestinationPath '%INSTDIR%'\"\r\n",
+    "  del /q \"%UPD%\\%%f\" >nul 2>&1\r\n",
+    "  goto applied\r\n",
+    ")\r\n",
+    "for /f \"delims=\" %%f in ('dir /b /o-d \"%UPD%\\BangXin_*_x64-setup.exe\" 2^>nul') do (\r\n",
+    "  if not exist \"%UPD%\\%%f\" goto gone\r\n",
+    "  echo %DATE% %TIME% > \"%UPD%\\task-started.txt\"\r\n",
+    "  taskkill /F /IM x8im.exe\r\n",
+    "  timeout /t 1 >nul\r\n",
+    "  start \"\" /wait \"%UPD%\\%%f\" /S /UPDATE /R\r\n",
+    "  del /q \"%UPD%\\%%f\" >nul 2>&1\r\n",
+    "  goto applied\r\n",
+    ")\r\n",
+    "goto gone\r\n",
+    ":applied\r\n",
+    "set X8N=0\r\n",
+    ":waitloop\r\n",
+    "if exist \"%INSTDIR%\\x8im.exe\" goto ok\r\n",
+    "set /a X8N+=1\r\n",
+    "if %X8N% GEQ 60 goto fail\r\n",
+    "timeout /t 3 >nul\r\n",
+    "goto waitloop\r\n",
+    ":ok\r\n",
+    "if exist \"%INSTDIR%\\post-update.cmd\" call \"%INSTDIR%\\post-update.cmd\"\r\n",
+    "start \"\" \"%INSTDIR%\\x8im.exe\"\r\n",
+    "exit /b 0\r\n",
+    ":fail\r\n",
+    "echo %DATE% %TIME% upgrade failed: x8im.exe missing >> \"%UPD%\\task-failed.txt\"\r\n",
+    "wscript.exe //B //Nologo \"%ProgramData%\\BangXin\\upgrade-failed.vbs\"\r\n",
+    "exit /b 1\r\n",
+    ":gone\r\n",
+    "echo %DATE% %TIME% package gone before start >> \"%UPD%\\task-skipped.txt\"\r\n",
+    "exit /b 0\r\n",
+);
+
+/// 存量机热替换：旧 updater-task.cmd 无守卫 + 有二次 start，连发多版会弹「找不到文件」。
+///   ProgramData 普通权限不可写，故不改原文件，而是把内置新 cmd + 隐藏启动 vbs 落到
+///   updates（可写）目录，再用 schtasks /Change 把计划任务 /TR 指过去——改自己名下任务
+///   不需 UAC，符合「零 UAC 静默升级」铁律。下次装新版 installer 会把 /TR 复原到正式路径。
+#[cfg(windows)]
+fn redirect_task_to_fresh_script(ctx: &TaskCtx) {
+    if ctx.prefix != "BangXin" {
+        return; // 旧 X8.IM 品牌目录留给历史机自然淘汰
+    }
+    let installed = match ctx.updates.parent() {
+        Some(p) => p.join("updater-task.cmd"),
+        None => return,
+    };
+    // 已是带标记的新版 cmd：无需重定向，也避免每次升级反复 /Change
+    if std::fs::read_to_string(&installed)
+        .map(|s| s.contains("X8FRESH2026"))
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let fresh_cmd = ctx.updates.join("updater-task.fresh.cmd");
+    let fresh_vbs = ctx.updates.join("updater-fresh.vbs");
+    if std::fs::write(&fresh_cmd, FRESH_UPDATER_CMD).is_err() {
+        return;
+    }
+    let vbs = format!(
+        "Set sh = CreateObject(\"WScript.Shell\")\r\nsh.Run \"cmd /c \"\"{}\"\"\", 0, False\r\n",
+        fresh_cmd.display()
+    );
+    if std::fs::write(&fresh_vbs, vbs).is_err() {
+        return;
+    }
+    let tr = format!("wscript.exe //B //Nologo {}", fresh_vbs.display());
+    let (code, out) = win_run_capture("schtasks", &["/Change", "/TN", ctx.name, "/TR", &tr]);
+    upd_log(&format!(
+        "存量机 cmd 热替换: schtasks /Change code={code} out={out}"
+    ));
+}
+
 #[cfg(windows)]
 pub(crate) fn apply_patch_task(ctx: &TaskCtx) -> Result<(), String> {
+    if APPLY_PATCH_BUSY.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        upd_log("触发补丁应用: 忽略重入（另一条升级链路正在触发同一任务）");
+        return Ok(());
+    }
+    let _guard = ApplyPatchGuard;
+    // B② 跨进程闸门：另一进程 15s 内刚触发过就跳过，避免两个 cmd 抢同一个包
+    if !claim_update_trigger(&ctx.updates) {
+        return Ok(());
+    }
+    // C 存量机热替换：旧 cmd 无守卫时，把计划任务指向内置带守卫的新 cmd
+    redirect_task_to_fresh_script(ctx);
     // 2026-11-17 C：动手之前先落「升级中」标记。之后本进程多半会被 taskkill 带走，
     // 标记是唯一能把「上次升级到哪个版本、试了几次」带到下一次启动的载体。
     upgrade_mark_start(&ctx.updates);
@@ -6530,10 +6706,16 @@ pub(crate) fn apply_patch_task(ctx: &TaskCtx) -> Result<(), String> {
     if code == 0 {
         return Ok(());
     }
-    // 降级通道：提权直跑 updater-task.cmd（内容与计划任务的 /TR 等价，只是这次要 UAC）
-    let script = match ctx.updates.parent() {
-        Some(p) => p.join("updater-task.cmd"),
-        None => return Err(format!("触发自动升级任务失败: {out}")),
+    // 降级通道：提权直跑升级脚本。C 热替换若已落 fresh cmd，优先用它（带守卫、无二次
+    // start），避免 schtasks 被企业策略禁用时回落旧 cmd 的死路径弹窗。
+    let fresh_script = ctx.updates.join("updater-task.fresh.cmd");
+    let script = if fresh_script.exists() {
+        fresh_script
+    } else {
+        match ctx.updates.parent() {
+            Some(p) => p.join("updater-task.cmd"),
+            None => return Err(format!("触发自动升级任务失败: {out}")),
+        }
     };
     if !script.exists() {
         return Err(format!(
@@ -6553,7 +6735,13 @@ pub(crate) fn apply_patch_task(ctx: &TaskCtx) -> Result<(), String> {
         .ok()
         .and_then(|e| e.parent().map(|p| p.join("elevate.exe")))
         .unwrap_or_else(|| std::path::PathBuf::from("elevate.exe"));
-    let silent = ctx.updates.parent().map(|p| p.join("updater-silent.vbs"));
+    // 隐藏启动器同理：fresh vbs 存在就用它（指向 fresh cmd），否则回落旧的。
+    let fresh_vbs = ctx.updates.join("updater-fresh.vbs");
+    let silent = if fresh_vbs.exists() {
+        Some(fresh_vbs)
+    } else {
+        ctx.updates.parent().map(|p| p.join("updater-silent.vbs"))
+    };
     let (c2, o2) = if elevate.exists() {
         match silent.as_ref().filter(|p| p.exists()) {
             Some(vbs) => win_run_capture(
@@ -6922,6 +7110,10 @@ async fn win_auto_update_inner(
         std::fs::write(&part_path, &bytes).map_err(|e| format!("写入更新包失败: {e}"))?;
         std::fs::rename(&part_path, &final_path).map_err(|e| format!("更新包就位失败: {e}"))?;
         upd_log(&format!("④更新包就位 {}", final_path.display()));
+        // 🔴 2026-11-20：清旧包前先读「升级中目标版本」。连发多版时，计划任务
+        //   可能正拿着一个稍早的包去 start；这里若无差别删除，cmd 就会 start 一个
+        //   已不存在的路径 → Windows 弹「找不到文件」。目标是活的就保留，等它自己装完删。
+        let inflight = upgrade_inflight_target();
         if let Ok(rd) = std::fs::read_dir(&dir) {
             for ent in rd.flatten() {
                 let p = ent.path();
@@ -6933,6 +7125,11 @@ async fn win_auto_update_inner(
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_default();
                 if name.starts_with(ctx.prefix) && name.ends_with("_x64-setup.exe") {
+                    // 正被计划任务引用的目标包：跳过，绝不删
+                    if package_ver_of(&name).as_deref() == inflight.as_deref() {
+                        upd_log(&format!("④清旧包跳过 in-flight 目标: {name}"));
+                        continue;
+                    }
                     let _ = std::fs::remove_file(&p);
                 }
             }

@@ -117,5 +117,29 @@ schtasks /Change /TN "BangXin AutoUpdate" /TR "wscript.exe //B //Nologo C:\Progr
 if errorlevel 1 schtasks /Change /TN "X8.IM AutoUpdate" /TR "wscript.exe //B //Nologo C:\ProgramData\BangXin\updater-silent.vbs" >nul 2>&1
 :SKIPHIDE
 
+rem 11) 2026-11-20 (user report: "every upgrade pops a web version of BangXin, and it is
+rem     not an error site"). Root cause lived in the LEGACY setup branch of
+rem     updater-task.cmd: it judged failure after a fixed 3s + 5s nap, which the NSIS
+rem     wizard can never beat, so :X8FAIL fired on every machine while the install was
+rem     still running - and upgrade-failed.vbs then opened https://im.x8fde.com/app/ in
+rem     the default browser. installer.nsh now waits for the installer process instead
+rem     of a timer, and its vbs no longer launches anything.
+rem     This block only refreshes the vbs for machines already on disk: the vbs is never
+rem     running when post-update runs, so overwriting it is safe. (updater-task.cmd
+rem     itself is NOT rewritten here on purpose - a batch file must not be rewritten
+rem     while cmd.exe is reading it; the fresh copy comes from the installer.)
+set UF=%PD%\upgrade-failed.vbs
+> "%UF%" echo ' BangXin update notice - intentionally opens NOTHING.
+>> "%UF%" echo ' 2026-11-20: used to open https://im.x8fde.com/app/ in the browser.
+>> "%UF%" echo Set sh = CreateObject("WScript.Shell")
+>> "%UF%" echo msg = Join(Array( _
+>> "%UF%" echo   "BangXin is still finishing an update in the background.", _
+>> "%UF%" echo   "", _
+>> "%UF%" echo   "Please wait a minute, then open BangXin again from the desktop shortcut.", _
+>> "%UF%" echo   "If it still does not start, download the installer from:", _
+>> "%UF%" echo   "", _
+>> "%UF%" echo   "https://im.x8fde.com/app/"), vbCrLf)
+>> "%UF%" echo sh.Popup msg, 60, "BangXin - finishing update", 64
+
 endlocal
 exit /b 0

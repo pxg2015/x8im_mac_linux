@@ -641,10 +641,19 @@ fn sweep_updates(app: &tauri::AppHandle) {
         });
 
         let stale = ver_in_name
-            .map(|v| !matches!(cmp_ver(&v, &cur), std::cmp::Ordering::Greater))
+            .as_ref()
+            .map(|v| !matches!(cmp_ver(v, &cur), std::cmp::Ordering::Greater))
             .unwrap_or(false);
 
-        if (always || stale) && std::fs::remove_file(&p).is_ok() {
+        // 🔴 2026-11-20：连发多版时，若某包是「升级中目标」（计划任务正要去 start），
+        //   即使版本号看着旧了也绝不能删——删了 cmd 就 start 一个不存在的路径弹错误框。
+        let inflight = crate::upgrade_inflight_target();
+        let is_inflight = ver_in_name
+            .as_ref()
+            .map(|v| inflight.as_deref() == Some(v.as_str()))
+            .unwrap_or(false);
+
+        if (always || stale) && !is_inflight && std::fs::remove_file(&p).is_ok() {
             n += 1;
             freed += size;
         }
